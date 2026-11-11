@@ -19,8 +19,9 @@ const audio = await resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
 - `YtrustError` — error class with a stable `code`.
 - `errorCode(message)` — classify an error message.
 
-Every format includes `http_headers` and `expires_at`. See the root README for
-the full option table.
+Every format includes `http_headers` and `expires_at`. The module bundles
+yt-dlp's EJS solver and transparently rewrites `n`-challenge URLs before
+returning results. See the root README for the full option table.
 
 ## Build
 

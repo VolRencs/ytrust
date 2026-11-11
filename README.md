@@ -1,8 +1,8 @@
 # ytrust
 
 Fast, modern YouTube downloader and resolver written in Rust. It supports
-videos, Shorts, live streams, playlists, search, separate audio/video streams,
-cookies and proxies.
+videos, Shorts, live streams, regular and inline/radio playlists, search,
+separate audio/video streams, cookies and proxies.
 
 `ytrust` is used as both a CLI and an in-process Node.js module (napi-rs), so
 applications can resolve YouTube metadata and media URLs without spawning an
@@ -25,7 +25,8 @@ pnpm build        # produces ytrust.linux-x64-gnu.node
 ```
 
 The Node addon ships as a prebuilt `.node` binary; consumers do not need a Rust
-toolchain.
+toolchain. It bundles yt-dlp's EJS challenge solver so `n`-challenge URLs are
+returned ready for ffmpeg or another downloader.
 
 ## CLI
 

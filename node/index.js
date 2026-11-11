@@ -57,6 +57,90 @@ export function version() {
   return requireNative().version();
 }
 
+const PLAYER_JS_CACHE = new Map();
+const SOLVED_N_CACHE = new Map();
+const PLAYER_JS_CACHE_LIMIT = 4;
+
+function challengeValue(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.searchParams.get("n");
+  } catch {
+    return null;
+  }
+}
+
+async function playerSource(url) {
+  const solveUrl = url.replace("/player_embed_es6.", "/player_es6.").replace("/player_embed_ias.", "/player_ias.");
+  const cached = PLAYER_JS_CACHE.get(solveUrl);
+  if (cached) return cached;
+  const pending = fetch(solveUrl, {
+    headers: {
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+      accept: "*/*",
+    },
+  }).then(async response => {
+    if (!response.ok) throw new Error(`player JS HTTP ${response.status}`);
+    return response.text();
+  }).catch(error => {
+    PLAYER_JS_CACHE.delete(solveUrl);
+    throw error;
+  });
+  if (PLAYER_JS_CACHE.size >= PLAYER_JS_CACHE_LIMIT) {
+    const oldest = PLAYER_JS_CACHE.keys().next().value;
+    if (oldest !== undefined) PLAYER_JS_CACHE.delete(oldest);
+  }
+  PLAYER_JS_CACHE.set(solveUrl, pending);
+  return pending;
+}
+
+async function applyChallenges(result) {
+  const playerUrl = result?.player_js_url;
+  if (!playerUrl) return result;
+  const formats = [];
+  if (result.best_audio) formats.push(result.best_audio);
+  if (Array.isArray(result.formats)) formats.push(...result.formats);
+  const challenges = new Set();
+  for (const format of formats) {
+    if (typeof format?.url !== "string") continue;
+    const value = challengeValue(format.url);
+    if (value && !SOLVED_N_CACHE.has(value)) challenges.add(value);
+  }
+  if (!challenges.size && !formats.some(format => typeof format?.url === "string" && SOLVED_N_CACHE.has(challengeValue(format.url)))) {
+    return result;
+  }
+  let solved = {};
+  if (challenges.size) {
+    try {
+      const player = await playerSource(playerUrl);
+      const { solve } = await import("./solver/index.js");
+      const output = solve(player, [{ type: "n", challenges: [...challenges] }]);
+      const data = output?.responses?.[0]?.data;
+      if (data && typeof data === "object") {
+        solved = data;
+        for (const [challenge, value] of Object.entries(data)) {
+          if (typeof value === "string") SOLVED_N_CACHE.set(challenge, value);
+        }
+      }
+    } catch {
+      solved = {};
+    }
+  }
+  for (const format of formats) {
+    if (typeof format?.url !== "string") continue;
+    try {
+      const parsed = new URL(format.url);
+      const value = parsed.searchParams.get("n");
+      const replacement = value ? solved[value] ?? SOLVED_N_CACHE.get(value) : undefined;
+      if (replacement) {
+        parsed.searchParams.set("n", replacement);
+        format.url = parsed.toString();
+      }
+    } catch { }
+  }
+  return result;
+}
+
 export async function resolve(input, options = {}) {
   let raw;
   try {
@@ -64,11 +148,13 @@ export async function resolve(input, options = {}) {
   } catch (error) {
     throw toYtrustError(error);
   }
+  let result;
   try {
-    return JSON.parse(raw);
+    result = JSON.parse(raw);
   } catch (error) {
     throw new YtrustError("INVALID_RESPONSE", "ytrust returned invalid JSON", { cause: error });
   }
+  return applyChallenges(result);
 }
 
 /**

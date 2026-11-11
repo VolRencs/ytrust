@@ -27,6 +27,7 @@ pub fn video_json(info: &VideoInfo, original_url: &str) -> Value {
         "epoch": unix_time(),
         "formats": info.formats.iter().map(format_json).collect::<Vec<_>>(),
         "best_audio": best_audio(info).map(format_json),
+        "player_js_url": info.player_js_url,
         "subtitles": subtitles_json(&info.subtitles),
         "automatic_captions": subtitles_json(&info.automatic_captions),
     })
@@ -216,6 +217,7 @@ mod tests {
             automatic_captions: Vec::new(),
             formats,
             hls_manifest_url: None,
+            player_js_url: None,
         }
     }
 

@@ -1,26 +1,41 @@
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha1::{Digest, Sha1};
 use url::Url;
 
 use crate::error::{Result, YtrustError};
 
 const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+const WEB_EMBEDDED_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestConfig {
     pub proxy: Option<String>,
     pub cookies: Option<String>,
+    pub sapisid: Option<String>,
+    pub sapisid1p: Option<String>,
+    pub sapisid3p: Option<String>,
     pub timeout: u64,
 }
 
 #[derive(Debug, Clone)]
 pub enum Target {
-    Video { id: String },
-    Playlist { id: String },
-    Search { query: String, limit: u64 },
+    Video {
+        id: String,
+    },
+    Playlist {
+        id: String,
+        video_id: Option<String>,
+    },
+    Search {
+        query: String,
+        limit: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +72,7 @@ pub struct VideoInfo {
     pub automatic_captions: Vec<SubtitleTrack>,
     pub formats: Vec<Format>,
     pub hls_manifest_url: Option<String>,
+    pub player_js_url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -146,7 +162,10 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
     if let Some(ref list) = list
         && !no_playlist
     {
-        return Ok(Target::Playlist { id: list.clone() });
+        return Ok(Target::Playlist {
+            id: list.clone(),
+            video_id: video,
+        });
     }
 
     if let Some(video_id) = video {
@@ -155,7 +174,10 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
 
     if path.starts_with("/playlist") {
         let list = list.ok_or_else(|| YtrustError::msg("playlist URL has no list parameter"))?;
-        return Ok(Target::Playlist { id: list });
+        return Ok(Target::Playlist {
+            id: list,
+            video_id: None,
+        });
     }
 
     if let Some(id) = video_id_from_url(&parsed) {
@@ -221,8 +243,8 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
     let mut last_error = None;
 
     for client_kind in clients {
-        match fetch_player_response(&client, video_id, client_kind, config).await {
-            Ok(response) => match parse_video_info(video_id, response, client_kind) {
+        match fetch_player_response(&client, video_id, client_kind, None, config).await {
+            Ok(response) => match parse_video_info(video_id, response, client_kind, None) {
                 Ok(info) if !info.formats.is_empty() => return Ok(info),
                 Ok(_) => last_error = Some(YtrustError::msg("YouTube returned no formats")),
                 Err(err) => last_error = Some(err),
@@ -231,8 +253,152 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
         }
     }
 
+    if config.cookies.is_some() {
+        match fetch_web_embedded_video(video_id, config).await {
+            Ok(info) if !info.formats.is_empty() => return Ok(info),
+            Ok(_) => last_error = Some(YtrustError::msg("YouTube returned no formats")),
+            Err(err) => last_error = Some(err),
+        }
+    }
+
     Err(last_error
         .unwrap_or_else(|| YtrustError::msg("YouTube did not return a playable response")))
+}
+
+static SIGNATURE_TIMESTAMPS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Result<VideoInfo> {
+    let client = build_client(config)?;
+    let embed_url = format!("https://www.youtube.com/embed/{video_id}?html5=1");
+    let html = fetch_text(
+        &client,
+        &embed_url,
+        config,
+        WEB_EMBEDDED_UA,
+        Some("https://www.reddit.com/"),
+    )
+    .await?;
+    let ytcfg =
+        extract_ytcfg(&html).ok_or_else(|| YtrustError::msg("YouTube embed page has no ytcfg"))?;
+    let mut context = ytcfg
+        .get("INNERTUBE_CONTEXT")
+        .cloned()
+        .ok_or_else(|| YtrustError::msg("YouTube embed ytcfg has no context"))?;
+    context["client"]["hl"] = json!("en");
+    context["client"]["timeZone"] = json!("UTC");
+    context["client"]["utcOffsetMinutes"] = json!(0);
+    context["client"]["originalUrl"] = json!(embed_url);
+    if context.get("thirdParty").is_some() {
+        context["thirdParty"]["embedUrl"] = json!("https://www.reddit.com/");
+    } else {
+        context["thirdParty"] = json!({"embedUrl": "https://www.reddit.com/"});
+    }
+
+    let visitor_data = ytcfg
+        .pointer("/INNERTUBE_CONTEXT/client/visitorData")
+        .and_then(Value::as_str)
+        .or_else(|| ytcfg.get("VISITOR_DATA").and_then(Value::as_str));
+    let player_js_url = ytcfg
+        .pointer("/WEB_PLAYER_CONTEXT_CONFIGS/WEB_PLAYER_CONTEXT_CONFIG_ID_EMBEDDED_PLAYER/jsUrl")
+        .and_then(Value::as_str)
+        .map(|url| {
+            if url.starts_with("http") {
+                url.to_string()
+            } else {
+                format!("https://www.youtube.com{url}")
+            }
+        })
+        .ok_or_else(|| YtrustError::msg("YouTube embed ytcfg has no player JS URL"))?;
+    let signature_timestamp = signature_timestamp(&client, &player_js_url, config).await?;
+    let encrypted_flags = ytcfg
+        .pointer("/WEB_PLAYER_CONTEXT_CONFIGS/WEB_PLAYER_CONTEXT_CONFIG_ID_EMBEDDED_PLAYER/encryptedHostFlags")
+        .and_then(Value::as_str);
+    let mut playback = json!({
+        "html5Preference": "HTML5_PREF_WANTS",
+        "signatureTimestamp": signature_timestamp,
+    });
+    if let Some(flags) = encrypted_flags {
+        playback["encryptedHostFlags"] = json!(flags);
+    }
+    let client_version = ytcfg
+        .pointer("/INNERTUBE_CONTEXT/client/clientVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("2.20261110.01.00");
+    let body = json!({
+        "context": context,
+        "videoId": video_id,
+        "playbackContext": {"contentPlaybackContext": playback},
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+    });
+    let response = post_innertube(
+        &client,
+        "player",
+        &body,
+        "56",
+        client_version,
+        WEB_EMBEDDED_UA,
+        visitor_data,
+        ytcfg.get("USER_SESSION_ID").and_then(Value::as_str),
+        true,
+        config,
+    )
+    .await?;
+    let response: PlayerResponse = serde_json::from_value(response)?;
+    parse_video_info(
+        video_id,
+        response,
+        ClientKind::WebEmbedded,
+        Some(player_js_url),
+    )
+}
+
+async fn signature_timestamp(
+    client: &reqwest::Client,
+    player_js_url: &str,
+    config: &RequestConfig,
+) -> Result<u64> {
+    if let Some(cached) = SIGNATURE_TIMESTAMPS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(player_js_url).copied())
+    {
+        return Ok(cached);
+    }
+    let source = fetch_text(client, player_js_url, config, WEB_EMBEDDED_UA, None).await?;
+    let marker = "signatureTimestamp";
+    let at = source
+        .find(marker)
+        .ok_or_else(|| YtrustError::msg("player JS has no signatureTimestamp"))?;
+    let digits = source[at + marker.len()..]
+        .trim_start_matches([':', '=', ' '])
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let value = digits
+        .parse::<u64>()
+        .map_err(|_| YtrustError::msg("player JS signatureTimestamp is invalid"))?;
+    if let Ok(mut cache) = SIGNATURE_TIMESTAMPS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.insert(player_js_url.to_string(), value);
+    }
+    Ok(value)
+}
+
+fn extract_ytcfg(html: &str) -> Option<Value> {
+    let mut rest = html;
+    while let Some(at) = rest.find("ytcfg.set") {
+        if let Ok(value) = extract_json_assignment(&rest[at..], "ytcfg.set")
+            && value.get("INNERTUBE_CONTEXT").is_some()
+        {
+            return Some(value);
+        }
+        rest = &rest[at + "ytcfg.set".len()..];
+    }
+    None
 }
 
 pub async fn fetch_playlist(
@@ -271,6 +437,9 @@ pub async fn fetch_playlist(
             "1",
             "2.20260707.01.00",
             WEB_UA,
+            None,
+            None,
+            false,
             config,
         )
         .await?;
@@ -301,6 +470,268 @@ pub async fn fetch_playlist(
     })
 }
 
+/// Inline playlists (radio/mix and `watch?...&list=...`) live in the watch
+/// page. yt-dlp paginates them through `next` using the last item's
+/// navigation endpoint; we do the same.
+pub async fn fetch_inline_playlist(
+    video_id: &str,
+    playlist_id: &str,
+    config: &RequestConfig,
+    limit: u64,
+) -> Result<PlaylistInfo> {
+    let client = build_client(config)?;
+    let radio = if playlist_id.starts_with("RD") {
+        "&start_radio=1"
+    } else {
+        ""
+    };
+    let watch_url =
+        format!("https://www.youtube.com/watch?v={video_id}&list={playlist_id}{radio}&hl=en&gl=US");
+    let html = fetch_text(&client, &watch_url, config, WEB_UA, None).await?;
+    let data = extract_json_assignment(&html, "ytInitialData")?;
+    let mut playlist = data
+        .pointer("/contents/twoColumnWatchNextResults/playlist/playlist")
+        .cloned()
+        .ok_or_else(|| YtrustError::msg("YouTube returned no inline playlist"))?;
+    let title = playlist
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("Playlist")
+        .to_string();
+
+    let mut entries = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..40 {
+        let (page_entries, endpoint) = extract_inline_entries(&playlist);
+        if page_entries.is_empty() {
+            break;
+        }
+        for mut entry in page_entries {
+            if !seen.insert(entry.id.clone()) {
+                continue;
+            }
+            entry.index = entries.len() + 1;
+            entries.push(entry);
+            if entries.len() >= limit as usize {
+                break;
+            }
+        }
+        if entries.len() >= limit as usize {
+            break;
+        }
+        let Some(endpoint) = endpoint else { break };
+        let body = json!({
+            "context": web_context(),
+            "playlistId": playlist_id,
+            "videoId": endpoint.video_id,
+            "index": endpoint.index.unwrap_or(entries.len() as u64),
+            "params": endpoint.params.unwrap_or_else(|| "OAE%3D".to_string()),
+        });
+        let response = post_innertube(
+            &client,
+            "next",
+            &body,
+            "1",
+            "2.20260707.01.00",
+            WEB_UA,
+            None,
+            None,
+            false,
+            config,
+        )
+        .await?;
+        let Some(next) = response
+            .pointer("/contents/twoColumnWatchNextResults/playlist/playlist")
+            .cloned()
+        else {
+            break;
+        };
+        playlist = next;
+    }
+
+    Ok(PlaylistInfo {
+        id: playlist_id.to_string(),
+        title,
+        entries,
+    })
+}
+
+async fn fetch_text(
+    client: &reqwest::Client,
+    url: &str,
+    config: &RequestConfig,
+    user_agent: &str,
+    referer: Option<&str>,
+) -> Result<String> {
+    let mut request = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, user_agent)
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-us,en;q=0.5")
+        .header("Sec-Fetch-Mode", "navigate");
+    if let Some(referer) = referer {
+        request = request.header(reqwest::header::REFERER, referer);
+    }
+    if let Some(cookies) = &config.cookies {
+        request = request.header(reqwest::header::COOKIE, cookies);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        return Err(YtrustError::msg(format!(
+            "HTTP {} for {url}",
+            response.status()
+        )));
+    }
+    Ok(response.text().await?)
+}
+
+fn extract_json_assignment(html: &str, marker: &str) -> Result<Value> {
+    let marker_at = html
+        .find(marker)
+        .ok_or_else(|| YtrustError::msg(format!("{marker} not found in YouTube page")))?;
+    let start = html[marker_at..]
+        .find('{')
+        .map(|offset| marker_at + offset)
+        .ok_or_else(|| YtrustError::msg(format!("{marker} has no JSON object")))?;
+    let bytes = html.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in bytes[start..].iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + 1;
+                    return Ok(serde_json::from_str(&html[start..end])?);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(YtrustError::msg(format!(
+        "unterminated JSON object after {marker}"
+    )))
+}
+
+struct InlineEndpoint {
+    video_id: String,
+    index: Option<u64>,
+    params: Option<String>,
+}
+
+fn extract_inline_entries(playlist: &Value) -> (Vec<PlaylistEntry>, Option<InlineEndpoint>) {
+    let mut entries = Vec::new();
+    let mut endpoint = None;
+    let Some(contents) = playlist.get("contents").and_then(Value::as_array) else {
+        return (entries, endpoint);
+    };
+    for content in contents {
+        let Some(renderer) = content
+            .get("playlistPanelVideoRenderer")
+            .or_else(|| content.get("playlistVideoRenderer"))
+        else {
+            continue;
+        };
+        let Some(id) = renderer.get("videoId").and_then(Value::as_str) else {
+            continue;
+        };
+        let title = renderer
+            .get("title")
+            .and_then(text_of)
+            .unwrap_or_else(|| id.to_string());
+        let duration = renderer
+            .get("lengthText")
+            .and_then(text_of)
+            .and_then(|text| parse_time_text(&text))
+            .or_else(|| {
+                renderer
+                    .get("lengthSeconds")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse().ok())
+            });
+        entries.push(PlaylistEntry {
+            index: 0,
+            id: id.to_string(),
+            title,
+            duration,
+            thumbnails: thumbnails_from(renderer),
+        });
+        if let Some(watch) = renderer.pointer("/navigationEndpoint/watchEndpoint") {
+            endpoint = Some(InlineEndpoint {
+                video_id: watch
+                    .get("videoId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_string(),
+                index: watch.get("index").and_then(Value::as_u64),
+                params: watch
+                    .get("params")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+    }
+    (entries, endpoint)
+}
+
+fn text_of(value: &Value) -> Option<String> {
+    if let Some(text) = value.get("simpleText").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    let text = value
+        .get("runs")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|run| run.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
+
+fn thumbnails_from(renderer: &Value) -> Vec<Thumbnail> {
+    renderer
+        .pointer("/thumbnail/thumbnails")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(Thumbnail {
+                        url: item.get("url")?.as_str()?.to_string(),
+                        width: item.get("width").and_then(Value::as_u64),
+                        height: item.get("height").and_then(Value::as_u64),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_time_text(text: &str) -> Option<u64> {
+    let mut total = 0u64;
+    for part in text.trim().split(':') {
+        total = total
+            .checked_mul(60)?
+            .checked_add(part.trim().parse::<u64>().ok()?)?;
+    }
+    Some(total)
+}
+
 pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Result<PlaylistInfo> {
     let client = build_client(config)?;
     let body = json!({
@@ -314,6 +745,9 @@ pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Re
         "1",
         "2.20260707.01.00",
         WEB_UA,
+        None,
+        None,
+        false,
         config,
     )
     .await?;
@@ -411,6 +845,7 @@ pub fn parse_item_ranges(expression: &str, total: usize) -> Result<Vec<usize>> {
 
 #[derive(Debug, Clone, Copy)]
 enum ClientKind {
+    WebEmbedded,
     VisionOs,
     Tv,
 }
@@ -418,6 +853,17 @@ enum ClientKind {
 impl ClientKind {
     fn context(self) -> (Value, &'static str, &'static str) {
         match self {
+            Self::WebEmbedded => (
+                json!({
+                    "clientName": "WEB_EMBEDDED_PLAYER",
+                    "clientVersion": "2.20261110.01.00",
+                    "userAgent": WEB_EMBEDDED_UA,
+                    "hl": "en",
+                    "gl": "US",
+                }),
+                "56",
+                "2.20261110.01.00",
+            ),
             Self::VisionOs => (
                 json!({
                     "clientName": "VISIONOS",
@@ -450,6 +896,7 @@ impl ClientKind {
     fn user_agent(self) -> &'static str {
         match self {
             Self::VisionOs => VISIONOS_UA,
+            Self::WebEmbedded => WEB_EMBEDDED_UA,
             Self::Tv => {
                 "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)"
             }
@@ -473,9 +920,13 @@ async fn fetch_player_response(
     client: &reqwest::Client,
     video_id: &str,
     client_kind: ClientKind,
+    visitor_data: Option<&str>,
     config: &RequestConfig,
 ) -> Result<PlayerResponse> {
-    let (context, client_name, client_version) = client_kind.context();
+    let (mut context, client_name, client_version) = client_kind.context();
+    if let Some(visitor_data) = visitor_data {
+        context["visitorData"] = json!(visitor_data);
+    }
     let body = json!({
         "context": {"client": context},
         "videoId": video_id,
@@ -490,6 +941,9 @@ async fn fetch_player_response(
         client_name,
         client_version,
         client_kind.user_agent(),
+        visitor_data,
+        None,
+        false,
         config,
     )
     .await?;
@@ -497,6 +951,33 @@ async fn fetch_player_response(
     serde_json::from_value(response).map_err(YtrustError::from)
 }
 
+fn authorization_header(config: &RequestConfig, user_session_id: Option<&str>) -> Option<String> {
+    let user_session_id = user_session_id?;
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let origin = "https://www.youtube.com";
+    let hash = |sid: &str| {
+        let mut hasher = Sha1::new();
+        hasher.update(format!("{user_session_id} {timestamp} {sid} {origin}"));
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let mut parts = Vec::new();
+    if let Some(sid) = &config.sapisid {
+        parts.push(format!("SAPISIDHASH {timestamp}_{}_u", hash(sid)));
+    }
+    if let Some(sid) = &config.sapisid1p {
+        parts.push(format!("SAPISID1PHASH {timestamp}_{}_u", hash(sid)));
+    }
+    if let Some(sid) = &config.sapisid3p {
+        parts.push(format!("SAPISID3PHASH {timestamp}_{}_u", hash(sid)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn post_innertube(
     client: &reqwest::Client,
     endpoint: &str,
@@ -504,6 +985,9 @@ async fn post_innertube(
     client_name: &str,
     client_version: &str,
     user_agent: &str,
+    visitor_data: Option<&str>,
+    user_session_id: Option<&str>,
+    browser: bool,
     config: &RequestConfig,
 ) -> Result<Value> {
     tracing::debug!("innertube {endpoint} request: {}", body);
@@ -517,13 +1001,39 @@ async fn post_innertube(
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ORIGIN, "https://www.youtube.com")
             .header(reqwest::header::USER_AGENT, user_agent)
-            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .header(
+                reqwest::header::ACCEPT_LANGUAGE,
+                if browser {
+                    "en-us,en;q=0.5"
+                } else {
+                    "en-US,en;q=0.9"
+                },
+            )
             .header("X-YouTube-Client-Name", client_name)
-            .header("X-YouTube-Client-Version", client_version)
-            .json(body);
+            .header("X-YouTube-Client-Version", client_version);
+        if browser {
+            request = request
+                .header(
+                    reqwest::header::ACCEPT,
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                .header(reqwest::header::REFERER, "https://www.youtube.com/")
+                .header("Sec-Fetch-Mode", "navigate");
+        }
+        let mut request = request.json(body);
 
         if let Some(cookies) = &config.cookies {
             request = request.header(reqwest::header::COOKIE, cookies);
+        }
+        if let Some(visitor_data) = visitor_data {
+            request = request.header("X-Goog-Visitor-Id", visitor_data);
+        }
+        if let Some(auth) = authorization_header(config, user_session_id) {
+            request = request
+                .header(reqwest::header::AUTHORIZATION, auth)
+                .header("X-Origin", "https://www.youtube.com")
+                .header("X-Goog-AuthUser", "0")
+                .header("X-Youtube-Bootstrap-Logged-In", "true");
         }
 
         match tokio::time::timeout(Duration::from_secs(config.timeout.max(5)), request.send()).await
@@ -706,6 +1216,7 @@ fn parse_video_info(
     requested_id: &str,
     response: PlayerResponse,
     client_kind: ClientKind,
+    player_js_url: Option<String>,
 ) -> Result<VideoInfo> {
     if let Some(status) = &response.playability_status {
         tracing::debug!(
@@ -835,6 +1346,7 @@ fn parse_video_info(
         automatic_captions,
         formats,
         hls_manifest_url,
+        player_js_url,
     })
 }
 
@@ -1196,6 +1708,58 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(target, Target::Video { id, .. } if id == "dQw4w9WgXcQ"));
+    }
+
+    #[test]
+    fn classifies_watch_with_playlist_as_inline() {
+        let target = classify(
+            "https://www.youtube.com/watch?v=nJqkWDFTK-Y&list=RDnJqkWDFTK-Y&start_radio=1",
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            target,
+            Target::Playlist { id, video_id }
+                if id == "RDnJqkWDFTK-Y" && video_id.as_deref() == Some("nJqkWDFTK-Y")
+        ));
+    }
+
+    #[test]
+    fn extracts_inline_playlist_entries() {
+        let playlist = json!({
+            "title": "Mix",
+            "contents": [
+                {"playlistPanelVideoRenderer": {
+                    "videoId": "aaaaaaaaaaa",
+                    "title": {"simpleText": "one"},
+                    "lengthText": {"simpleText": "3:13"},
+                    "thumbnail": {"thumbnails": [{"url": "https://i.ytimg.com/vi/a/hq.jpg", "width": 480, "height": 360}]},
+                    "navigationEndpoint": {"watchEndpoint": {"videoId": "aaaaaaaaaaa", "index": 0, "params": "OAE%3D"}}
+                }},
+                {"playlistPanelVideoRenderer": {
+                    "videoId": "bbbbbbbbbbb",
+                    "title": {"runs": [{"text": "two"}]},
+                    "lengthSeconds": "125",
+                    "navigationEndpoint": {"watchEndpoint": {"videoId": "bbbbbbbbbbb", "index": 1, "params": "OAE%3D"}}
+                }}
+            ]
+        });
+        let (entries, endpoint) = extract_inline_entries(&playlist);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].duration, Some(193));
+        assert_eq!(entries[0].thumbnails[0].width, Some(480));
+        assert_eq!(entries[1].title, "two");
+        assert_eq!(entries[1].duration, Some(125));
+        let endpoint = endpoint.unwrap();
+        assert_eq!(endpoint.video_id, "bbbbbbbbbbb");
+        assert_eq!(endpoint.index, Some(1));
+    }
+
+    #[test]
+    fn extracts_json_assignment_with_braces_in_strings() {
+        let html = r#"<script>var ytInitialData = {"a":"}","b":{"c":1}};</script>"#;
+        let value = extract_json_assignment(html, "ytInitialData").unwrap();
+        assert_eq!(value["b"]["c"], 1);
     }
 
     #[test]

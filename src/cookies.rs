@@ -62,6 +62,33 @@ impl CookieJar {
         }
     }
 
+    fn all_header_for(&self, host: &str) -> Option<String> {
+        let now = unix_time();
+        let mut matched: Vec<&Cookie> = self
+            .cookies
+            .iter()
+            .filter(|cookie| {
+                (cookie.expiry == 0 || cookie.expiry >= now)
+                    && domain_matches(host, &cookie.domain)
+                    && path_matches("/", &cookie.path)
+            })
+            .collect();
+        matched.sort_by(|a, b| {
+            b.path
+                .len()
+                .cmp(&a.path.len())
+                .then_with(|| b.expiry.cmp(&a.expiry))
+        });
+        let mut seen = std::collections::BTreeSet::new();
+        let mut values = Vec::new();
+        for cookie in matched {
+            if seen.insert(cookie.name.as_str()) {
+                values.push(format!("{}={}", cookie.name, cookie.value));
+            }
+        }
+        (!values.is_empty()).then(|| values.join("; "))
+    }
+
     fn insert(&mut self, domain: &str, path: &str, name: &str, value: &str, expiry: i64) {
         if name.is_empty() {
             return;
@@ -78,9 +105,26 @@ impl CookieJar {
     pub fn merge(&mut self, mut other: CookieJar) {
         self.cookies.append(&mut other.cookies);
     }
+
+    fn value(&self, name: &str) -> Option<String> {
+        let now = unix_time();
+        self.cookies
+            .iter()
+            .filter(|cookie| cookie.name == name && (cookie.expiry == 0 || cookie.expiry >= now))
+            .max_by_key(|cookie| (cookie.path.len(), cookie.expiry))
+            .map(|cookie| cookie.value.clone())
+    }
 }
 
-pub fn load(cookie_file: Option<&Path>, from_browser: Option<&str>) -> Result<Option<String>> {
+#[derive(Debug, Clone, Default)]
+pub struct LoadedCookies {
+    pub header: Option<String>,
+    pub sapisid: Option<String>,
+    pub sapisid1p: Option<String>,
+    pub sapisid3p: Option<String>,
+}
+
+pub fn load(cookie_file: Option<&Path>, from_browser: Option<&str>) -> Result<LoadedCookies> {
     let mut jar = CookieJar::default();
 
     if let Some(path) = cookie_file {
@@ -90,7 +134,12 @@ pub fn load(cookie_file: Option<&Path>, from_browser: Option<&str>) -> Result<Op
         jar.merge(load_browser(spec)?);
     }
 
-    Ok(jar.header_for("www.youtube.com"))
+    Ok(LoadedCookies {
+        header: jar.all_header_for("www.youtube.com"),
+        sapisid: jar.value("SAPISID"),
+        sapisid1p: jar.value("__Secure-1PAPISID"),
+        sapisid3p: jar.value("__Secure-3PAPISID"),
+    })
 }
 
 fn load_netscape(path: &Path) -> Result<CookieJar> {

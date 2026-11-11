@@ -25,6 +25,7 @@
     "native.js",
     "native.d.ts",
     "*.node",
+    "solver/*.js",
     "README.md",
     "LICENSE"
   ],

@@ -14,8 +14,8 @@ use ytrust::format::{FormatSelection, print_formats, select};
 use ytrust::json;
 use ytrust::output::{TemplateContext, format_duration, format_ext, merged_ext, render_path};
 use ytrust::youtube::{
-    self, RequestConfig, Target, classify, fetch_playlist, fetch_search, fetch_video,
-    filter_playlist_entries, max_playlist_item, parse_item_ranges,
+    self, RequestConfig, Target, classify, fetch_inline_playlist, fetch_playlist, fetch_search,
+    fetch_video, filter_playlist_entries, max_playlist_item, parse_item_ranges,
 };
 
 use crate::cli::Cli;
@@ -32,22 +32,25 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let cookie_header = cookies::load(cli.cookies.as_deref(), cli.cookies_from_browser.as_deref())?;
-    if cookie_header.is_some() {
+    let cookies = cookies::load(cli.cookies.as_deref(), cli.cookies_from_browser.as_deref())?;
+    if cookies.header.is_some() {
         debug!("loaded cookies");
     }
 
     let timeout = cli.socket_timeout.unwrap_or(cli.timeout);
     let request_config = RequestConfig {
         proxy: cli.proxy.clone(),
-        cookies: cookie_header.clone(),
+        cookies: cookies.header.clone(),
+        sapisid: cookies.sapisid.clone(),
+        sapisid1p: cookies.sapisid1p.clone(),
+        sapisid3p: cookies.sapisid3p.clone(),
         timeout,
     };
     let downloader = Downloader::new(DownloadConfig {
         retries: cli.retries,
         timeout,
         proxy: cli.proxy.clone(),
-        cookies: cookie_header,
+        cookies: cookies.header,
         ffmpeg: cli.ffmpeg_location.clone(),
         force_overwrites: cli.force_overwrites,
     })?;
@@ -70,12 +73,17 @@ async fn run(cli: Cli) -> Result<()> {
             Target::Video { id } => {
                 process_video(&id, None, &context).await?;
             }
-            Target::Playlist { id } => {
+            Target::Playlist { id, video_id } => {
                 debug!("fetching playlist {id}");
                 let fetch_limit = max_playlist_item(&cli.playlist_items)
                     .map(|limit| (limit as u64).min(cli.playlist_limit))
                     .unwrap_or(cli.playlist_limit);
-                let mut playlist = fetch_playlist(&id, &request_config, fetch_limit).await?;
+                let mut playlist = match video_id {
+                    Some(video_id) => {
+                        fetch_inline_playlist(&video_id, &id, &request_config, fetch_limit).await?
+                    }
+                    None => fetch_playlist(&id, &request_config, fetch_limit).await?,
+                };
                 if dump_json {
                     filter_playlist_entries(&mut playlist, &cli.playlist_items)?;
                     println!(

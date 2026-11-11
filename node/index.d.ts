@@ -57,6 +57,7 @@ export interface VideoResult {
   is_live?: boolean;
   formats: Format[];
   best_audio?: Format | null;
+  player_js_url?: string | null;
   subtitles?: Record<string, unknown>;
   automatic_captions?: Record<string, unknown>;
 }

@@ -3,8 +3,8 @@ use napi_derive::napi;
 use ytrust::cookies;
 use ytrust::json;
 use ytrust::youtube::{
-    RequestConfig, Target, classify, fetch_playlist, fetch_search, fetch_video,
-    filter_playlist_entries, max_playlist_item,
+    RequestConfig, Target, classify, fetch_inline_playlist, fetch_playlist, fetch_search,
+    fetch_video, filter_playlist_entries, max_playlist_item,
 };
 
 #[napi(object)]
@@ -50,13 +50,16 @@ pub async fn resolve(input: String, options: Option<ResolveOptions>) -> Result<S
 }
 
 async fn resolve_inner(input: String, options: ResolveOptions) -> ytrust::error::Result<String> {
-    let cookie_header = cookies::load(
+    let cookies = cookies::load(
         options.cookies_path.as_deref().map(std::path::Path::new),
         options.cookies_from_browser.as_deref(),
     )?;
     let config = RequestConfig {
         proxy: options.proxy.clone(),
-        cookies: cookie_header,
+        cookies: cookies.header,
+        sapisid: cookies.sapisid,
+        sapisid1p: cookies.sapisid1p,
+        sapisid3p: cookies.sapisid3p,
         timeout: u64::from(options.timeout.unwrap_or(30)),
     };
     let playlist_limit = u64::from(options.playlist_limit.unwrap_or(500));
@@ -71,11 +74,16 @@ async fn resolve_inner(input: String, options: ResolveOptions) -> ytrust::error:
             let info = fetch_video(&id, &config).await?;
             json::video_json(&info, &info.webpage_url)
         }
-        Target::Playlist { id } => {
+        Target::Playlist { id, video_id } => {
             let fetch_limit = max_playlist_item(&playlist_items)
                 .map(|limit| (limit as u64).min(playlist_limit))
                 .unwrap_or(playlist_limit);
-            let mut playlist = fetch_playlist(&id, &config, fetch_limit).await?;
+            let mut playlist = match video_id {
+                Some(video_id) => {
+                    fetch_inline_playlist(&video_id, &id, &config, fetch_limit).await?
+                }
+                None => fetch_playlist(&id, &config, fetch_limit).await?,
+            };
             filter_playlist_entries(&mut playlist, &playlist_items)?;
             json::playlist_json(&playlist, &input)
         }
