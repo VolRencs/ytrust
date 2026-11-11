@@ -329,6 +329,86 @@ pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Re
     })
 }
 
+pub fn max_playlist_item(expression: &str) -> Option<usize> {
+    let mut max = None;
+    for part in expression
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if let Some((start, end)) = part.split_once('-') {
+            if start.trim().is_empty() || end.trim().is_empty() {
+                return None;
+            }
+            let end = end.trim().parse::<usize>().ok()?;
+            max = Some(max.map_or(end, |current: usize| current.max(end)));
+        } else {
+            let index = part.parse::<usize>().ok()?;
+            max = Some(max.map_or(index, |current: usize| current.max(index)));
+        }
+    }
+    max
+}
+
+pub fn filter_playlist_entries(playlist: &mut PlaylistInfo, selection: &str) -> Result<()> {
+    let selected = parse_item_ranges(selection, playlist.entries.len())?;
+    if selected.is_empty() {
+        playlist.entries.clear();
+        return Ok(());
+    }
+    let selected: std::collections::BTreeSet<usize> = selected.into_iter().collect();
+    playlist
+        .entries
+        .retain(|entry| selected.contains(&entry.index));
+    Ok(())
+}
+
+pub fn parse_item_ranges(expression: &str, total: usize) -> Result<Vec<usize>> {
+    let mut selected = std::collections::BTreeSet::new();
+
+    for part in expression
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some((start, end)) = part.split_once('-') {
+            let start = if start.trim().is_empty() {
+                1
+            } else {
+                start
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| YtrustError::msg(format!("invalid playlist range: {part}")))?
+            };
+            let end = if end.trim().is_empty() {
+                total
+            } else {
+                end.trim()
+                    .parse::<usize>()
+                    .map_err(|_| YtrustError::msg(format!("invalid playlist range: {part}")))?
+            };
+            if start == 0 || end == 0 || start > end {
+                return Err(YtrustError::msg(format!("invalid playlist range: {part}")));
+            }
+            for index in start..=end.min(total) {
+                selected.insert(index);
+            }
+        } else {
+            let index = part
+                .parse::<usize>()
+                .map_err(|_| YtrustError::msg(format!("invalid playlist item: {part}")))?;
+            if index == 0 {
+                return Err(YtrustError::msg("playlist items start at 1"));
+            }
+            if index <= total {
+                selected.insert(index);
+            }
+        }
+    }
+
+    Ok(selected.into_iter().collect())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ClientKind {
     VisionOs,

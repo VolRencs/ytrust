@@ -1,0 +1,63 @@
+{
+  "name": "ytrust",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@12.18.0",
+  "description": "Native ytrust bindings for Node.js",
+  "license": "Unlicense",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VolRencs/ytrust.git"
+  },
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "native.js",
+    "native.d.ts",
+    "*.node",
+    "LICENSE"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "napi": {
+    "binaryName": "ytrust",
+    "targets": [
+      "x86_64-unknown-linux-gnu"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release --esm --strip --js native.js --dts native.d.ts",
+    "build:debug": "napi build --platform --esm --js native.js --dts native.d.ts",
+    "test": "node --test test/*.test.ts",
+    "test:integration": "YTRUST_INTEGRATION=1 node --test test/*.test.ts",
+    "bench": "node bench/resolve.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && pnpm typecheck",
+    "prepack": "pnpm build && pnpm test && pnpm typecheck"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.10.12",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}

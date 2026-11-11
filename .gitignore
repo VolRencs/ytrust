@@ -2,6 +2,14 @@
 **/*.rs.bk
 *.pdb
 
+# Node module build output
+/node/node_modules/
+/node/native.js
+/node/native.d.ts
+/node/*.node
+/node/*.tgz
+/node/dist/
+
 # Local configuration and secrets
 .env
 .env.*

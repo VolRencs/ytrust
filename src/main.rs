@@ -1,11 +1,4 @@
 mod cli;
-mod cookies;
-mod download;
-mod error;
-mod format;
-mod json;
-mod output;
-mod youtube;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -14,12 +7,18 @@ use clap::Parser;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use ytrust::cookies;
+use ytrust::download::{DownloadConfig, Downloader};
+use ytrust::error::{Result, YtrustError};
+use ytrust::format::{FormatSelection, print_formats, select};
+use ytrust::json;
+use ytrust::output::{TemplateContext, format_duration, format_ext, merged_ext, render_path};
+use ytrust::youtube::{
+    self, RequestConfig, Target, classify, fetch_playlist, fetch_search, fetch_video,
+    filter_playlist_entries, max_playlist_item, parse_item_ranges,
+};
+
 use crate::cli::Cli;
-use crate::download::{DownloadConfig, Downloader};
-use crate::error::{Result, YtrustError};
-use crate::format::{FormatSelection, print_formats, select};
-use crate::output::{TemplateContext, format_duration, format_ext, merged_ext, render_path};
-use crate::youtube::{RequestConfig, Target, classify, fetch_playlist, fetch_search, fetch_video};
 
 #[tokio::main]
 async fn main() {
@@ -682,40 +681,6 @@ fn intermediate_path(destination: &Path, kind: &str, itag: u64, ext: &str) -> Pa
     destination.with_file_name(format!(".{name}.{kind}.{itag}.{ext}"))
 }
 
-fn max_playlist_item(expression: &str) -> Option<usize> {
-    let mut max = None;
-    for part in expression
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        if let Some((start, end)) = part.split_once('-') {
-            if start.trim().is_empty() || end.trim().is_empty() {
-                return None;
-            }
-            let end = end.trim().parse::<usize>().ok()?;
-            max = Some(max.map_or(end, |current: usize| current.max(end)));
-        } else {
-            let index = part.parse::<usize>().ok()?;
-            max = Some(max.map_or(index, |current: usize| current.max(index)));
-        }
-    }
-    max
-}
-
-fn filter_playlist_entries(playlist: &mut youtube::PlaylistInfo, selection: &str) -> Result<()> {
-    let selected = parse_item_ranges(selection, playlist.entries.len())?;
-    if selected.is_empty() {
-        playlist.entries.clear();
-        return Ok(());
-    }
-    let selected: BTreeSet<usize> = selected.into_iter().collect();
-    playlist
-        .entries
-        .retain(|entry| selected.contains(&entry.index));
-    Ok(())
-}
-
 fn parse_section_start(value: Option<&str>) -> Result<Option<u64>> {
     let Some(value) = value else {
         return Ok(None);
@@ -733,52 +698,6 @@ fn parse_section_start(value: Option<&str>) -> Result<Option<u64>> {
         .parse::<f64>()
         .map_err(|_| YtrustError::msg(format!("invalid download section start: {start}")))?;
     Ok((seconds > 0.0).then_some(seconds.floor() as u64))
-}
-
-fn parse_item_ranges(expression: &str, total: usize) -> Result<Vec<usize>> {
-    let mut selected = BTreeSet::new();
-
-    for part in expression
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if let Some((start, end)) = part.split_once('-') {
-            let start = if start.trim().is_empty() {
-                1
-            } else {
-                start
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| YtrustError::msg(format!("invalid playlist range: {part}")))?
-            };
-            let end = if end.trim().is_empty() {
-                total
-            } else {
-                end.trim()
-                    .parse::<usize>()
-                    .map_err(|_| YtrustError::msg(format!("invalid playlist range: {part}")))?
-            };
-            if start == 0 || end == 0 || start > end {
-                return Err(YtrustError::msg(format!("invalid playlist range: {part}")));
-            }
-            for index in start..=end.min(total) {
-                selected.insert(index);
-            }
-        } else {
-            let index = part
-                .parse::<usize>()
-                .map_err(|_| YtrustError::msg(format!("invalid playlist item: {part}")))?;
-            if index == 0 {
-                return Err(YtrustError::msg("playlist items start at 1"));
-            }
-            if index <= total {
-                selected.insert(index);
-            }
-        }
-    }
-
-    Ok(selected.into_iter().collect())
 }
 
 fn init_logging(cli: &Cli) {

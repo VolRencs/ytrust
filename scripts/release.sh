@@ -22,12 +22,14 @@ if [[ "$branch" != "main" ]]; then
 fi
 
 sed -i "s/^version = \".*\"/version = \"$version\"/" Cargo.toml
+sed -i "s/^version = \".*\"/version = \"$version\"/" node/Cargo.toml
+perl -0pi -e 's/"version": "\d+\.\d+\.\d+"/"version": "'"$version"'"/' node/package.json
 cargo check >/dev/null
 cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock node/Cargo.toml node/package.json node/pnpm-lock.yaml
 git commit -m "Release v$version"
 git tag "v$version"
 git push origin main

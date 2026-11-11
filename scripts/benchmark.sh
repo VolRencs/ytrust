@@ -44,6 +44,12 @@ measure "ytrust startup (--version)" "$YTRUST" --version
 measure "ytrust scan single video (-J)" "$YTRUST" --skip-download -J "$VIDEO"
 measure "ytrust scan playlist 1-$ITEMS (-J)" "$YTRUST" --skip-download --flat-playlist --playlist-items "1-$ITEMS" -J "$PLAYLIST"
 
+if [[ -f "$ROOT/node/native.js" && -d "$ROOT/node/node_modules" ]]; then
+  echo
+  echo "NAPI module:"
+  (cd "$ROOT/node" && RUNS="$RUNS" pnpm bench)
+fi
+
 if command -v "$YTDLP" >/dev/null 2>&1; then
   YTDLP_CMD=("$YTDLP" --ignore-config --js-runtimes node --remote-components ejs:github)
   "${YTDLP_CMD[@]}" --skip-download -J "$VIDEO" >/dev/null 2>&1 || true
