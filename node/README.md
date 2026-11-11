@@ -33,3 +33,7 @@ pnpm test:integration   # network tests against YouTube
 
 The release build uses the `napi` Cargo profile, which unwinds panics so napi-rs
 can reject the JavaScript promise instead of aborting the host process.
+
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE).

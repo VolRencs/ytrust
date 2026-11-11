@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Fixed the Node package `LICENSE` file to contain the GPL-3.0 text.
+
 ## 0.1.2
 
 - Relicensed under GPL-3.0.
