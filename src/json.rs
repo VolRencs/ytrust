@@ -73,6 +73,8 @@ fn format_json(format: &Format) -> Value {
         "format_id": format.itag.to_string(),
         "format": format.itag.to_string(),
         "url": format.url,
+        "signature_cipher": format.signature_cipher,
+        "cipher": format.cipher,
         "ext": ext,
         "protocol": if format.is_hls { "m3u8_native" } else { "https" },
         "vcodec": format.video_codec.clone().unwrap_or_else(|| "none".to_string()),
@@ -86,7 +88,9 @@ fn format_json(format: &Format) -> Value {
         "format_note": format.quality_label,
         "is_live": format.is_live,
         "http_headers": http_headers(format),
-        "expires_at": format_expires_at(&format.url),
+        "expires_at": format_expires_at(&format.url)
+            .or_else(|| format.signature_cipher.as_deref().and_then(cipher_expires_at))
+            .or_else(|| format.cipher.as_deref().and_then(cipher_expires_at)),
     });
 
     if let Some(abr) = format.audio_bitrate {
@@ -112,6 +116,15 @@ fn http_headers(format: &Format) -> Value {
 
 /// `expire` in a googlevideo URL is a Unix timestamp. Clients can use it to
 /// refresh a resolved media URL before it starts returning HTTP 403.
+fn cipher_expires_at(cipher: &str) -> Option<u64> {
+    let parsed = url::Url::parse(&format!("https://www.youtube.com/?{cipher}")).ok()?;
+    let url = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "url")
+        .map(|(_, value)| value.into_owned())?;
+    format_expires_at(&url)
+}
+
 fn format_expires_at(raw: &str) -> Option<u64> {
     let url = url::Url::parse(raw).ok()?;
     url.query_pairs()
@@ -173,6 +186,8 @@ mod tests {
             url: format!(
                 "https://rr1---sn-test.googlevideo.com/videoplayback?itag={itag}&expire=1794413769"
             ),
+            signature_cipher: None,
+            cipher: None,
             container: if audio_codec == Some("opus") {
                 "webm".to_string()
             } else {
@@ -245,6 +260,19 @@ mod tests {
             value["formats"][0]["http_headers"]["Referer"],
             "https://www.youtube.com/"
         );
+    }
+
+    #[test]
+    fn format_json_exposes_signature_cipher() {
+        let mut value = format(251, Some("opus"), false, 136_000, Some(136_000));
+        value.url = String::new();
+        value.signature_cipher = Some(
+            "s=abc&sp=sig&url=https%3A%2F%2Frr1---sn-test.googlevideo.com%2Fvideoplayback%3Fexpire%3D42".to_string(),
+        );
+        let json = format_json(&value);
+        assert_eq!(json["url"], "");
+        assert!(json["signature_cipher"].as_str().unwrap().contains("s=abc"));
+        assert_eq!(json["expires_at"], 42);
     }
 
     #[test]

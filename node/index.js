@@ -59,7 +59,17 @@ export function version() {
 
 const PLAYER_JS_CACHE = new Map();
 const SOLVED_N_CACHE = new Map();
+const SOLVED_SIG_CACHE = new Map();
 const PLAYER_JS_CACHE_LIMIT = 4;
+const CHALLENGE_CACHE_LIMIT = 1000;
+
+function remember(cache, key, value) {
+  if (cache.size >= CHALLENGE_CACHE_LIMIT) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+}
 
 function challengeValue(url) {
   try {
@@ -68,6 +78,15 @@ function challengeValue(url) {
   } catch {
     return null;
   }
+}
+
+function cipherParams(format) {
+  const raw = format?.signature_cipher ?? format?.cipher;
+  if (typeof raw !== "string" || !raw) return null;
+  const params = new URLSearchParams(raw);
+  const url = params.get("url");
+  if (!url) return null;
+  return { url, s: params.get("s"), sp: params.get("sp") || "signature" };
 }
 
 async function playerSource(url) {
@@ -100,43 +119,82 @@ async function applyChallenges(result) {
   const formats = [];
   if (result.best_audio) formats.push(result.best_audio);
   if (Array.isArray(result.formats)) formats.push(...result.formats);
-  const challenges = new Set();
+
+  const sigChallenges = new Set();
+  const nChallenges = new Set();
+  let needsWork = false;
   for (const format of formats) {
-    if (typeof format?.url !== "string") continue;
-    const value = challengeValue(format.url);
-    if (value && !SOLVED_N_CACHE.has(value)) challenges.add(value);
+    if (!format) continue;
+    const cipher = cipherParams(format);
+    if (cipher) needsWork = true;
+    if (cipher?.s && !SOLVED_SIG_CACHE.has(cipher.s)) sigChallenges.add(cipher.s);
+    const url = typeof format.url === "string" && format.url ? format.url : cipher?.url;
+    const value = typeof url === "string" ? challengeValue(url) : null;
+    if (value) {
+      needsWork = true;
+      if (!SOLVED_N_CACHE.has(value)) nChallenges.add(value);
+    }
   }
-  if (!challenges.size && !formats.some(format => typeof format?.url === "string" && SOLVED_N_CACHE.has(challengeValue(format.url)))) {
-    return result;
-  }
-  let solved = {};
-  if (challenges.size) {
+  if (!needsWork) return result;
+
+  let sigData = {};
+  let nData = {};
+  if (sigChallenges.size || nChallenges.size) {
     try {
       const player = await playerSource(playerUrl);
       const { solve } = await import("./solver/index.js");
-      const output = solve(player, [{ type: "n", challenges: [...challenges] }]);
-      const data = output?.responses?.[0]?.data;
-      if (data && typeof data === "object") {
-        solved = data;
-        for (const [challenge, value] of Object.entries(data)) {
-          if (typeof value === "string") SOLVED_N_CACHE.set(challenge, value);
+      const requests = [];
+      if (sigChallenges.size) requests.push({ type: "sig", challenges: [...sigChallenges] });
+      if (nChallenges.size) requests.push({ type: "n", challenges: [...nChallenges] });
+      const responses = solve(player, requests)?.responses ?? [];
+      let at = 0;
+      if (sigChallenges.size) {
+        const response = responses[at++];
+        if (response?.type === "result" && response.data) {
+          sigData = response.data;
+          for (const [challenge, value] of Object.entries(response.data)) {
+            if (typeof value === "string") remember(SOLVED_SIG_CACHE, challenge, value);
+          }
+        }
+      }
+      if (nChallenges.size) {
+        const response = responses[at++];
+        if (response?.type === "result" && response.data) {
+          nData = response.data;
+          for (const [challenge, value] of Object.entries(response.data)) {
+            if (typeof value === "string") remember(SOLVED_N_CACHE, challenge, value);
+          }
         }
       }
     } catch {
-      solved = {};
+      // Keep plain URLs; ciphered formats stay without url.
     }
   }
+
   for (const format of formats) {
-    if (typeof format?.url !== "string") continue;
-    try {
-      const parsed = new URL(format.url);
-      const value = parsed.searchParams.get("n");
-      const replacement = value ? solved[value] ?? SOLVED_N_CACHE.get(value) : undefined;
-      if (replacement) {
-        parsed.searchParams.set("n", replacement);
-        format.url = parsed.toString();
+    if (!format) continue;
+    const cipher = cipherParams(format);
+    if (cipher) {
+      const sig = cipher.s ? sigData[cipher.s] ?? SOLVED_SIG_CACHE.get(cipher.s) : null;
+      if (sig) {
+        try {
+          const parsed = new URL(cipher.url);
+          parsed.searchParams.set(cipher.sp, sig);
+          format.url = parsed.toString();
+        } catch { }
       }
-    } catch { }
+    }
+    if (typeof format.url === "string" && format.url) {
+      const value = challengeValue(format.url);
+      const replacement = value ? nData[value] ?? SOLVED_N_CACHE.get(value) : null;
+      if (replacement) {
+        try {
+          const parsed = new URL(format.url);
+          parsed.searchParams.set("n", replacement);
+          format.url = parsed.toString();
+        } catch { }
+      }
+    }
   }
   return result;
 }

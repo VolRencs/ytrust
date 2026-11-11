@@ -17,6 +17,8 @@ export interface Format {
   format_id: string;
   format: string;
   url: string;
+  signature_cipher?: string | null;
+  cipher?: string | null;
   ext: string;
   protocol: string;
   vcodec: string;

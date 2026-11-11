@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0
+
+- Ciphered formats (`signatureCipher`/`cipher`) are no longer discarded.
+  `url` remains empty for them and the raw cipher is included in JSON.
+- The Node module now solves both `sig` and `n` challenges with the bundled
+  EJS solver and rebuilds ciphered URLs before returning results.
+- `best_audio` falls back to HLS for live streams when no progressive audio
+  format exists.
+- Unified cookie header construction; the full YouTube cookie set is used for
+  API/player requests.
+- Added JSON and solver tests for ciphered formats.
+
+## 0.2.0
+
 ## 0.2.0
 
 - `watch?v=...&list=...` URLs are now resolved as inline playlists (including

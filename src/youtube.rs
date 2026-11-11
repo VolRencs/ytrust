@@ -94,6 +94,8 @@ pub struct SubtitleTrack {
 pub struct Format {
     pub itag: u64,
     pub url: String,
+    pub signature_cipher: Option<String>,
+    pub cipher: Option<String>,
     pub container: String,
     pub mime_type: String,
     pub video_codec: Option<String>,
@@ -1264,6 +1266,8 @@ fn parse_video_info(
         formats.push(Format {
             itag: 0,
             url: url.clone(),
+            signature_cipher: None,
+            cipher: None,
             container: "mp4".to_string(),
             mime_type: "application/vnd.apple.mpegurl".to_string(),
             video_codec: None,
@@ -1351,11 +1355,8 @@ fn parse_video_info(
 }
 
 fn parse_format(raw: RawFormat, client_kind: ClientKind) -> Option<Format> {
-    let url = raw.url?;
-    if raw.signature_cipher.is_some() || raw.cipher.is_some() {
-        return None;
-    }
-    if url.is_empty() {
+    let url = raw.url.unwrap_or_default();
+    if url.is_empty() && raw.signature_cipher.is_none() && raw.cipher.is_none() {
         return None;
     }
 
@@ -1365,6 +1366,8 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind) -> Option<Format> {
     Some(Format {
         itag: raw.itag,
         url,
+        signature_cipher: raw.signature_cipher,
+        cipher: raw.cipher,
         container,
         mime_type: raw.mime_type,
         video_codec,

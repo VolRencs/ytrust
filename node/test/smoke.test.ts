@@ -61,6 +61,19 @@ test(
 );
 
 test(
+  "resolveAudio solves signatureCipher formats",
+  { skip: !process.env.YTRUST_INTEGRATION },
+  async () => {
+    const audio = await resolveAudio("https://www.youtube.com/watch?v=0t9dU9iNyYo", {
+      cookiesPath: process.env.YTRUST_COOKIES,
+    });
+    assert.match(audio.url, /^https:\/\/.+googlevideo\.com\//);
+    assert.ok(audio.url.includes("sig="));
+    assert.ok(new URL(audio.url).searchParams.has("n"));
+  },
+);
+
+test(
   "resolveAudio ignores an attached playlist",
   { skip: !process.env.YTRUST_INTEGRATION },
   async () => {

@@ -60,6 +60,9 @@ struct Filter {
 
 impl Filter {
     fn matches(&self, value: &Format) -> bool {
+        if value.url.is_empty() {
+            return false;
+        }
         if let Some(limit) = self.height_lte
             && value.height.unwrap_or(0) > limit
         {
@@ -476,15 +479,22 @@ fn format_matches_audio_kind(format: &Format, component: &Component) -> bool {
 /// excluded because callers cannot seek in them like a regular media URL.
 pub fn best_audio(info: &VideoInfo) -> Option<&Format> {
     let rate = |format: &Format| format.audio_bitrate.unwrap_or(format.bitrate);
+    let key = |format: &Format| {
+        (
+            u8::from(!format.has_video),
+            u8::from(is_opus(format)),
+            rate(format),
+        )
+    };
     info.formats
         .iter()
         .filter(|format| format.has_audio && !format.is_hls)
-        .max_by_key(|format| {
-            (
-                u8::from(!format.has_video),
-                u8::from(is_opus(format)),
-                rate(format),
-            )
+        .max_by_key(|format| key(format))
+        .or_else(|| {
+            info.formats
+                .iter()
+                .filter(|format| format.has_audio)
+                .max_by_key(|format| key(format))
         })
 }
 

@@ -27,6 +27,14 @@ pub struct CookieJar {
 
 impl CookieJar {
     pub fn header_for(&self, host: &str) -> Option<String> {
+        self.header(host, true)
+    }
+
+    fn all_header_for(&self, host: &str) -> Option<String> {
+        self.header(host, false)
+    }
+
+    fn header(&self, host: &str, essential_only: bool) -> Option<String> {
         let now = unix_time();
         let mut matched: Vec<&Cookie> = self
             .cookies
@@ -35,7 +43,7 @@ impl CookieJar {
                 (cookie.expiry == 0 || cookie.expiry >= now)
                     && domain_matches(host, &cookie.domain)
                     && path_matches("/", &cookie.path)
-                    && essential_cookie(&cookie.name)
+                    && (!essential_only || essential_cookie(&cookie.name))
             })
             .collect();
 
@@ -55,38 +63,11 @@ impl CookieJar {
             }
         }
 
-        if values.is_empty() {
-            None
-        } else {
-            Some(values.join("; "))
-        }
+        (!values.is_empty()).then(|| values.join("; "))
     }
 
-    fn all_header_for(&self, host: &str) -> Option<String> {
-        let now = unix_time();
-        let mut matched: Vec<&Cookie> = self
-            .cookies
-            .iter()
-            .filter(|cookie| {
-                (cookie.expiry == 0 || cookie.expiry >= now)
-                    && domain_matches(host, &cookie.domain)
-                    && path_matches("/", &cookie.path)
-            })
-            .collect();
-        matched.sort_by(|a, b| {
-            b.path
-                .len()
-                .cmp(&a.path.len())
-                .then_with(|| b.expiry.cmp(&a.expiry))
-        });
-        let mut seen = std::collections::BTreeSet::new();
-        let mut values = Vec::new();
-        for cookie in matched {
-            if seen.insert(cookie.name.as_str()) {
-                values.push(format!("{}={}", cookie.name, cookie.value));
-            }
-        }
-        (!values.is_empty()).then(|| values.join("; "))
+    pub fn merge(&mut self, mut other: CookieJar) {
+        self.cookies.append(&mut other.cookies);
     }
 
     fn insert(&mut self, domain: &str, path: &str, name: &str, value: &str, expiry: i64) {
@@ -100,10 +81,6 @@ impl CookieJar {
             value: value.to_string(),
             expiry,
         });
-    }
-
-    pub fn merge(&mut self, mut other: CookieJar) {
-        self.cookies.append(&mut other.cookies);
     }
 
     fn value(&self, name: &str) -> Option<String> {
