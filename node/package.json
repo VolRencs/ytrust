@@ -25,6 +25,7 @@
     "native.js",
     "native.d.ts",
     "*.node",
+    "README.md",
     "LICENSE"
   ],
   "os": [
@@ -46,7 +47,7 @@
     ]
   },
   "scripts": {
-    "build": "napi build --platform --release --esm --strip --js native.js --dts native.d.ts",
+    "build": "napi build --platform --profile napi --esm --strip --js native.js --dts native.d.ts",
     "build:debug": "napi build --platform --esm --js native.js --dts native.d.ts",
     "test": "node --test test/*.test.ts",
     "test:integration": "YTRUST_INTEGRATION=1 node --test test/*.test.ts",

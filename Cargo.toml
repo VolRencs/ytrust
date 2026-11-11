@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "Fast, modern YouTube downloader"
 repository = "https://github.com/VolRencs/ytrust"
+readme = "README.md"
 license = "Unlicense"
 
 [workspace]
@@ -41,3 +42,9 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# The native Node addon must unwind Rust panics so napi-rs can turn them into
+# JavaScript errors instead of aborting the whole host process.
+[profile.napi]
+inherits = "release"
+panic = "unwind"

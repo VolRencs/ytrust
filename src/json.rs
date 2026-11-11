@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 
+use crate::format::best_audio;
 use crate::output::format_ext;
 use crate::youtube::{Format, PlaylistEntry, PlaylistInfo, SubtitleTrack, Thumbnail, VideoInfo};
 
@@ -25,6 +26,7 @@ pub fn video_json(info: &VideoInfo, original_url: &str) -> Value {
         "extractor_key": "Youtube",
         "epoch": unix_time(),
         "formats": info.formats.iter().map(format_json).collect::<Vec<_>>(),
+        "best_audio": best_audio(info).map(format_json),
         "subtitles": subtitles_json(&info.subtitles),
         "automatic_captions": subtitles_json(&info.automatic_captions),
     })
@@ -82,6 +84,8 @@ fn format_json(format: &Format) -> Value {
         "resolution": resolution,
         "format_note": format.quality_label,
         "is_live": format.is_live,
+        "http_headers": http_headers(format),
+        "expires_at": format_expires_at(&format.url),
     });
 
     if let Some(abr) = format.audio_bitrate {
@@ -96,6 +100,22 @@ fn format_json(format: &Format) -> Value {
     }
 
     value
+}
+
+fn http_headers(format: &Format) -> Value {
+    json!({
+        "User-Agent": format.user_agent,
+        "Referer": "https://www.youtube.com/",
+    })
+}
+
+/// `expire` in a googlevideo URL is a Unix timestamp. Clients can use it to
+/// refresh a resolved media URL before it starts returning HTTP 403.
+fn format_expires_at(raw: &str) -> Option<u64> {
+    let url = url::Url::parse(raw).ok()?;
+    url.query_pairs()
+        .find(|(key, _)| key == "expire")
+        .and_then(|(_, value)| value.parse::<u64>().ok())
 }
 
 fn thumbnails_json(thumbnails: &[Thumbnail]) -> Vec<Value> {
@@ -134,4 +154,114 @@ fn unix_time() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn format(
+        itag: u64,
+        audio_codec: Option<&str>,
+        has_video: bool,
+        bitrate: u64,
+        audio_bitrate: Option<u64>,
+    ) -> Format {
+        Format {
+            itag,
+            url: format!(
+                "https://rr1---sn-test.googlevideo.com/videoplayback?itag={itag}&expire=1794413769"
+            ),
+            container: if audio_codec == Some("opus") {
+                "webm".to_string()
+            } else {
+                "mp4".to_string()
+            },
+            mime_type: "audio/mp4".to_string(),
+            video_codec: has_video.then(|| "avc1.640028".to_string()),
+            audio_codec: audio_codec.map(str::to_string),
+            has_video,
+            has_audio: audio_codec.is_some(),
+            width: has_video.then_some(1920),
+            height: has_video.then_some(1080),
+            fps: has_video.then_some(30),
+            bitrate,
+            audio_bitrate,
+            content_length: Some(1_000_000),
+            quality_label: None,
+            is_hls: false,
+            is_live: false,
+            audio_track_name: None,
+            audio_track_id: None,
+            audio_is_default: false,
+            user_agent: "test-agent".to_string(),
+        }
+    }
+
+    fn video_info(formats: Vec<Format>) -> VideoInfo {
+        VideoInfo {
+            id: "dQw4w9WgXcQ".to_string(),
+            title: "test".to_string(),
+            uploader: String::new(),
+            channel: String::new(),
+            channel_id: String::new(),
+            webpage_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            description: String::new(),
+            duration_secs: Some(213),
+            view_count: None,
+            upload_date: String::new(),
+            is_live: false,
+            thumbnails: Vec::new(),
+            subtitles: Vec::new(),
+            automatic_captions: Vec::new(),
+            formats,
+            hls_manifest_url: None,
+        }
+    }
+
+    #[test]
+    fn video_json_exposes_audio_headers_and_expiry() {
+        let info = video_info(vec![
+            format(18, Some("mp4a.40.2"), true, 500_000, None),
+            format(140, Some("mp4a.40.2"), false, 130_000, Some(130_000)),
+            format(251, Some("opus"), false, 136_000, Some(136_000)),
+        ]);
+
+        let value = video_json(&info, &info.webpage_url);
+        assert_eq!(value["best_audio"]["format_id"], "251");
+        assert_eq!(value["best_audio"]["acodec"], "opus");
+        assert_eq!(
+            value["best_audio"]["http_headers"]["User-Agent"],
+            "test-agent"
+        );
+        assert_eq!(
+            value["best_audio"]["http_headers"]["Referer"],
+            "https://www.youtube.com/"
+        );
+        assert_eq!(value["best_audio"]["expires_at"], 1_794_413_769);
+        assert_eq!(
+            value["formats"][0]["http_headers"]["Referer"],
+            "https://www.youtube.com/"
+        );
+    }
+
+    #[test]
+    fn video_json_has_no_best_audio_for_video_only_formats() {
+        let info = video_info(vec![format(137, None, true, 4_000_000, None)]);
+        let value = video_json(&info, &info.webpage_url);
+        assert!(value["best_audio"].is_null());
+    }
+
+    #[test]
+    fn format_expires_at_reads_googlevideo_expire() {
+        assert_eq!(
+            format_expires_at("https://x.googlevideo.com/videoplayback?expire=42&itag=251"),
+            Some(42)
+        );
+        assert_eq!(
+            format_expires_at("https://x.googlevideo.com/no-expire"),
+            None
+        );
+        assert_eq!(format_expires_at("not a url"), None);
+    }
 }

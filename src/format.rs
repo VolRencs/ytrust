@@ -471,6 +471,30 @@ fn format_matches_audio_kind(format: &Format, component: &Component) -> bool {
     }
 }
 
+/// Pick the best playable audio stream: Opus audio-only first, then any
+/// audio-only stream, then the loudest muxed stream. HLS manifests are
+/// excluded because callers cannot seek in them like a regular media URL.
+pub fn best_audio(info: &VideoInfo) -> Option<&Format> {
+    let rate = |format: &Format| format.audio_bitrate.unwrap_or(format.bitrate);
+    info.formats
+        .iter()
+        .filter(|format| format.has_audio && !format.is_hls)
+        .max_by_key(|format| {
+            (
+                u8::from(!format.has_video),
+                u8::from(is_opus(format)),
+                rate(format),
+            )
+        })
+}
+
+fn is_opus(format: &Format) -> bool {
+    format
+        .audio_codec
+        .as_deref()
+        .is_some_and(|codec| codec.to_ascii_lowercase().starts_with("opus"))
+}
+
 fn is_audio_only(format: &Format) -> bool {
     format.has_audio && !format.has_video
 }
