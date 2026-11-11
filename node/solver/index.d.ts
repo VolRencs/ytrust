@@ -11,6 +11,15 @@ export type SolverOutput =
   | { type: "result"; responses: SolverResponse[]; preprocessed_player?: string }
   | { type: "error"; error?: string; preprocessed_player?: string };
 
-export function solve(player: string, requests: SolverRequest[]): SolverOutput;
+export type SolverOptions = {
+  preprocessed?: string;
+};
 
-export function solveWithContext(player: string, requests: SolverRequest[], context: object): SolverOutput;
+export function solve(player: string, requests: SolverRequest[], options?: SolverOptions): SolverOutput;
+
+export function solveWithContext(
+  player: string,
+  requests: SolverRequest[],
+  context: object,
+  options?: SolverOptions
+): SolverOutput;

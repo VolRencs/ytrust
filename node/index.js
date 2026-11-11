@@ -128,6 +128,7 @@ function normalizeOptions(options) {
 }
 
 const PLAYER_JS_CACHE = new Map();
+const PREPROCESSED_PLAYER_CACHE = new Map();
 const SOLVED_N_CACHE = new Map();
 const SOLVED_SIG_CACHE = new Map();
 const PLAYER_JS_CACHE_LIMIT = 4;
@@ -179,9 +180,27 @@ async function playerSource(url, options) {
   return pending;
 }
 
-async function solveInWorker(player, requests) {
+async function solveInWorker(player, requests, playerUrl) {
+  const preprocessed = playerUrl ? PREPROCESSED_PLAYER_CACHE.get(playerUrl) : undefined;
   const { solve } = await import("./solver/pool.js");
-  return solve(player, requests);
+  let output;
+  let usedPreprocessed = false;
+
+  if (preprocessed) {
+    try {
+      output = await solve("", requests, { preprocessed });
+      usedPreprocessed = true;
+    } catch {
+      PREPROCESSED_PLAYER_CACHE.delete(playerUrl);
+    }
+  }
+  if (!output) output = await solve(player, requests);
+
+  if (!usedPreprocessed && playerUrl && typeof output?.preprocessed_player === "string") {
+    remember(PREPROCESSED_PLAYER_CACHE, playerUrl, output.preprocessed_player, PLAYER_JS_CACHE_LIMIT);
+    delete output.preprocessed_player;
+  }
+  return output;
 }
 
 function responseData(responses, requests) {
@@ -210,11 +229,14 @@ async function ensurePlayerUrl(result, options) {
   return null;
 }
 
-async function applyChallenges(result, options) {
+function collectFormats(result) {
   const formats = [];
   if (result?.best_audio) formats.push(result.best_audio);
   if (Array.isArray(result?.formats)) formats.push(...result.formats);
+  return formats;
+}
 
+async function applyChallenges(result, options, formats = collectFormats(result)) {
   const knownPlayerUrl = typeof result?.player_js_url === "string" ? result.player_js_url : "";
   const sigChallenges = new Set();
   const nChallenges = new Set();
@@ -245,6 +267,15 @@ async function applyChallenges(result, options) {
     return result;
   }
 
+  if (knownPlayerUrl !== playerUrl) {
+    for (const challenge of sigChallenges) {
+      if (SOLVED_SIG_CACHE.has(cacheKey(playerUrl, challenge))) sigChallenges.delete(challenge);
+    }
+    for (const challenge of nChallenges) {
+      if (SOLVED_N_CACHE.has(cacheKey(playerUrl, challenge))) nChallenges.delete(challenge);
+    }
+  }
+
   let sigData = {};
   let nData = {};
   if (sigChallenges.size || nChallenges.size) {
@@ -253,7 +284,7 @@ async function applyChallenges(result, options) {
       const requests = [];
       if (sigChallenges.size) requests.push({ type: "sig", challenges: [...sigChallenges] });
       if (nChallenges.size) requests.push({ type: "n", challenges: [...nChallenges] });
-      const output = await solveInWorker(player, requests);
+      const output = await solveInWorker(player, requests, playerUrl);
       const responses = Array.isArray(output?.responses) ? output.responses : [];
       const solved = responseData(responses, requests);
       sigData = solved.sig ?? {};
@@ -358,6 +389,46 @@ function compareKeys(a, b) {
   return 0;
 }
 
+function formatKey(format) {
+  const track = format?.audio_track?.id ?? "";
+  if (typeof format?.format_id === "string" && format.format_id) {
+    return `id:${format.format_id}:${track}`;
+  }
+  return `${format?.url ?? ""}\u0000${format?.signature_cipher ?? format?.cipher ?? ""}`;
+}
+
+function audioKey(format) {
+  return [
+    format.vcodec === "none" ? 1 : 0,
+    format.audio_track?.audio_is_default ? 1 : 0,
+    isOpus(format) ? 1 : 0,
+    audioRate(format),
+  ];
+}
+
+function compareAudioCandidates(a, b) {
+  return compareKeys(audioKey(b), audioKey(a));
+}
+
+function audioCandidates(result) {
+  const candidates = [];
+  const seen = new Set();
+  const add = (format) => {
+    if (!format) return;
+    const hasAudio = typeof format.acodec === "string" && format.acodec !== "none";
+    if (!hasAudio && format.protocol !== "m3u8_native") return;
+    const key = formatKey(format);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(format);
+  };
+  add(result?.best_audio);
+  const formats = Array.isArray(result?.formats) ? [...result.formats] : [];
+  formats.sort(compareAudioCandidates);
+  for (const format of formats) add(format);
+  return candidates;
+}
+
 export async function resolve(input, options = {}) {
   let result;
   try {
@@ -379,24 +450,52 @@ export async function resolve(input, options = {}) {
  * with the HTTP headers required to fetch it.
  */
 export async function resolveAudio(input, options = {}) {
-  const normalized = normalizeOptions(options);
-  const result = await resolve(input, { ...normalized, noPlaylist: true });
-  const audio = result?.best_audio;
-  const chosen = audio && typeof audio.url === "string" && audio.url ? audio : pickPlayableAudio(result?.formats);
-  if (result?._type !== "video" || !chosen) {
-    const code = audio ? "CHALLENGE_FAILED" : "NO_AUDIO";
-    throw new YtrustError(code, `no playable audio format found for ${input}`);
+  try {
+    const normalized = normalizeOptions(options);
+    const result = await requireNative().resolve(String(input), {
+      ...normalized,
+      noPlaylist: true,
+    });
+    if (result?._type !== "video") {
+      throw new YtrustError("NO_AUDIO", `no audio format found for ${input}`);
+    }
+
+    const candidates = audioCandidates(result);
+    let chosen = null;
+
+    // Solve only the most likely audio formats first. The full solve below is
+    // a safety net for unusual players where the preferred format is unusable.
+    for (const candidate of candidates.slice(0, 3)) {
+      await applyChallenges(result, normalized, [candidate]);
+      if (typeof candidate.url === "string" && candidate.url) {
+        chosen = candidate;
+        break;
+      }
+    }
+
+    if (!chosen) {
+      await applyChallenges(result, normalized);
+      chosen = pickPlayableAudio(candidates) ?? pickPlayableAudio(result.formats);
+    }
+
+    if (!chosen) {
+      const code = result.best_audio ? "CHALLENGE_FAILED" : "NO_AUDIO";
+      throw new YtrustError(code, `no playable audio format found for ${input}`);
+    }
+
+    return {
+      ...chosen,
+      id: result.id,
+      title: result.title,
+      duration: result.duration,
+      thumbnail: result.thumbnail,
+      webpage_url: result.webpage_url,
+      uploader: result.uploader,
+      channel: result.channel,
+      upload_date: result.upload_date,
+      is_live: result.is_live,
+    };
+  } catch (error) {
+    throw toYtrustError(error);
   }
-  return {
-    ...chosen,
-    id: result.id,
-    title: result.title,
-    duration: result.duration,
-    thumbnail: result.thumbnail,
-    webpage_url: result.webpage_url,
-    uploader: result.uploader,
-    channel: result.channel,
-    upload_date: result.upload_date,
-    is_live: result.is_live,
-  };
 }

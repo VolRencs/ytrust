@@ -62,6 +62,20 @@ test("resolve maps missing cookies files to COOKIES", async () => {
   );
 });
 
+test("resolveAudio maps missing cookies files to COOKIES", async () => {
+  await assert.rejects(
+    () =>
+      resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ", {
+        cookiesPath: "/definitely/not/a/cookies.txt",
+      }),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "COOKIES");
+      return true;
+    },
+  );
+});
+
 test("resolve maps missing playlist list to INVALID_INPUT", async () => {
   await assert.rejects(
     () => resolve("https://www.youtube.com/playlist"),

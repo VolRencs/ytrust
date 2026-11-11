@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -331,8 +332,36 @@ fn url_has_n(url: &str) -> bool {
         .is_some_and(|url| url.query_pairs().any(|(key, _)| key == "n"))
 }
 
+const PLAYER_JS_URL_TTL: Duration = Duration::from_secs(30 * 60);
+
+static PLAYER_JS_URL_CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+
+fn cached_player_js_url() -> Option<String> {
+    let cache = PLAYER_JS_URL_CACHE.get_or_init(|| Mutex::new(None));
+    let guard = cache.lock().ok()?;
+    let (cached_at, url) = guard.as_ref()?;
+    (cached_at.elapsed() < PLAYER_JS_URL_TTL).then(|| url.clone())
+}
+
+fn remember_player_js_url(url: &str) {
+    let cache = PLAYER_JS_URL_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), url.to_string()));
+    }
+}
+
 /// Resolve the current player JS URL from the watch or embed page.
 pub async fn player_js_url(video_id: &str, config: &RequestConfig) -> Result<String> {
+    if let Some(url) = cached_player_js_url() {
+        return Ok(url);
+    }
+
+    let url = fetch_player_js_url(video_id, config).await?;
+    remember_player_js_url(&url);
+    Ok(url)
+}
+
+async fn fetch_player_js_url(video_id: &str, config: &RequestConfig) -> Result<String> {
     let client = build_client(config)?;
     let watch_url = format!("https://www.youtube.com/watch?v={video_id}&hl=en&gl=US");
     let watch_error = match fetch_text(&client, &watch_url, config, WEB_UA, None).await {
@@ -455,6 +484,7 @@ async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Res
             "YouTube embed ytcfg has no player JS URL",
         )
     })?;
+    remember_player_js_url(&player_js_url);
     let signature_timestamp = signature_timestamp(&client, &player_js_url, config).await?;
     let encrypted_flags = ytcfg
         .pointer("/WEB_PLAYER_CONTEXT_CONFIGS/WEB_PLAYER_CONTEXT_CONFIG_ID_EMBEDDED_PLAYER/encryptedHostFlags")

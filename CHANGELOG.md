@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.3
+
+- Cached the player JS URL for 30 minutes in the native addon, avoiding a
+  watch-page request for every video.
+- Cached the EJS-preprocessed player source in the Node module, cutting
+  challenge-solving overhead from roughly 0.8 s to 0.1 s on subsequent videos.
+- `resolveAudio()` now solves challenges for the preferred audio formats first
+  and only falls back to a full solve when none of them becomes playable.
+- Added solver tests for preprocessed player input.
+
 ## 0.4.2
 
 - Fixed the Node challenge solver passing a JSON string instead of an object to

@@ -26,7 +26,9 @@ pnpm build        # produces ytrust.linux-x64-gnu.node and native.cjs
 
 The Node addon ships as a prebuilt `.node` binary; consumers do not need a Rust
 toolchain. It bundles yt-dlp's EJS challenge solver so `n`-challenge URLs are
-returned ready for ffmpeg or another downloader.
+returned ready for ffmpeg or another downloader. Player JS URLs are cached for
+30 minutes, and the preprocessed player is reused across videos to keep
+subsequent resolves fast.
 
 ## CLI
 

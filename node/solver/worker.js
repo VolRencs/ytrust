@@ -5,9 +5,9 @@ if (!parentPort) {
   throw new Error("ytrust solver worker must run inside a worker thread");
 }
 
-parentPort.on("message", ({ id, player, requests }) => {
+parentPort.on("message", ({ id, player, requests, preprocessed }) => {
   try {
-    const output = solve(player, requests);
+    const output = solve(player, requests, { preprocessed });
     parentPort.postMessage({ id, ok: true, output });
   } catch (error) {
     const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);

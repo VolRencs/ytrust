@@ -28,7 +28,9 @@ const { resolveAudio } = require("ytrust");
 Every format includes `http_headers`, `expires_at` and `is_hls`. Ciphered
 formats are solved with yt-dlp's EJS bundle in a bounded worker pool, and
 player JS is fetched through the same proxy/timeout/cookies configuration as
-the API requests. This keeps challenge solving off the Node event loop.
+the API requests. This keeps challenge solving off the Node event loop. Player
+JS URLs are cached for 30 minutes, and the preprocessed EJS player is reused
+across videos, so subsequent resolves skip most of the solver warm-up cost.
 
 ## Browser cookies
 

@@ -28,17 +28,26 @@ function solverContext() {
  * into a script string, so remote player code cannot break out of a template
  * literal and the VM timeout still applies.
  */
-export function solve(player, requests) {
-  return solveWithContext(player, requests, solverContext());
+export function solve(player, requests, options = {}) {
+  return solveWithContext(player, requests, solverContext(), options);
 }
 
-export function solveWithContext(player, requests, ctx) {
-  ctx.__ytrust_input = JSON.stringify({
-    type: "player",
-    player,
-    requests,
-    output_preprocessed: false,
-  });
+export function solveWithContext(player, requests, ctx, options = {}) {
+  const preprocessed = typeof options.preprocessed === "string" ? options.preprocessed : "";
+  const input = preprocessed
+    ? {
+        type: "preprocessed",
+        preprocessed_player: preprocessed,
+        requests,
+        output_preprocessed: false,
+      }
+    : {
+        type: "player",
+        player,
+        requests,
+        output_preprocessed: true,
+      };
+  ctx.__ytrust_input = JSON.stringify(input);
   let output;
   try {
     output = vm.runInContext("jsc(JSON.parse(__ytrust_input))", ctx, {

@@ -84,6 +84,7 @@ function dispatch() {
         id: task.id,
         player: task.player,
         requests: task.requests,
+        preprocessed: task.preprocessed,
       });
     } catch (error) {
       failSlot(slot, error);
@@ -91,12 +92,13 @@ function dispatch() {
   }
 }
 
-export function solve(player, requests) {
+export function solve(player, requests, options = {}) {
   return new Promise((resolveTask, rejectTask) => {
     queue.push({
       id: nextId++,
       player,
       requests,
+      preprocessed: options.preprocessed,
       resolve: resolveTask,
       reject: rejectTask,
     });
