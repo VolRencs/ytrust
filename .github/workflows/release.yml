@@ -112,7 +112,7 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/ytrust.exe", "LICENSE" `
             -DestinationPath "dist/ytrust-${tag}-${{ matrix.target }}.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: dist/*
@@ -178,7 +178,7 @@ jobs:
         working-directory: node
         run: pnpm pack --pack-destination dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: node-package
           path: node/dist/*
