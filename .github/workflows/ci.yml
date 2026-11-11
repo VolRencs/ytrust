@@ -38,13 +38,9 @@ jobs:
         run: cargo test --workspace --locked
 
   node:
-    name: Node module (Node ${{ matrix.node }})
+    name: Node module (Node 26.x)
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [24.x, 26.x]
     steps:
       - uses: actions/checkout@v6
 
@@ -54,7 +50,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 26.x
           cache: pnpm
           cache-dependency-path: node/pnpm-lock.yaml
 
@@ -64,6 +60,8 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: node-addon-ubuntu-22.04
 
       - name: Install dependencies
         working-directory: node
@@ -72,6 +70,12 @@ jobs:
       - name: Build native addon
         working-directory: node
         run: pnpm build
+
+      - name: Smoke-load native addon
+        working-directory: node
+        run: |
+          file ytrust.linux-x64-gnu.node
+          node -e 'const { version } = require("./native.cjs"); console.log("native addon", version())'
 
       - name: Typecheck
         working-directory: node

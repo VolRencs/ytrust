@@ -2,7 +2,7 @@
 
 Native napi-rs bindings for [ytrust](https://github.com/VolRencs/ytrust). The
 package ships a prebuilt Linux x64 glibc addon (glibc 2.35+), so no Rust
-toolchain is required at install time. Node.js 24+ is supported; both ESM and
+toolchain is required at install time. Node.js 26+ is supported; both ESM and
 CommonJS consumers are supported.
 
 ```js

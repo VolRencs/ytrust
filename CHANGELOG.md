@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+- Node.js 26 is now the only supported runtime.
+- The Node addon CI/release build uses an isolated Rust cache key on Ubuntu
+  22.04, so cached artifacts built on newer glibc cannot leak into the shipped
+  addon and break loading on glibc 2.35.
+- Added a CI smoke-load step for `native.cjs` to fail fast if the addon cannot
+  be loaded.
+
 ## 0.4.0
 
 ### Added
@@ -22,7 +31,7 @@
   audio extraction.
 - HLS and section downloads pass User-Agent/Referer/Cookie headers to ffmpeg.
 - YouTube cookies are no longer sent to googlevideo/i.ytimg hosts.
-- Node.js 24+ and both ESM/CommonJS are supported; the addon is built against
+- Node.js 26+ and both ESM/CommonJS are supported; the addon is built against
   glibc 2.35 for modern Linux distributions.
 - `best_audio` prefers the default audio track and playable URLs.
 - CLI `--quiet` hides progress and informational status; `--simulate` no longer

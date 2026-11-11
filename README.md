@@ -11,7 +11,7 @@ external binary.
 ## Requirements
 
 - Rust 1.99+ to build from source
-- Node.js 24+ for the native module (prebuilt addon targets `linux-x64-gnu`, glibc 2.35+)
+- Node.js 26+ for the native module (prebuilt addon targets `linux-x64-gnu`, glibc 2.35+)
 - ffmpeg with the codecs you need when converting or merging media
 
 ## Build
