@@ -29,7 +29,10 @@ function solverContext() {
  * literal and the VM timeout still applies.
  */
 export function solve(player, requests) {
-  const ctx = solverContext();
+  return solveWithContext(player, requests, solverContext());
+}
+
+export function solveWithContext(player, requests, ctx) {
   ctx.__ytrust_input = JSON.stringify({
     type: "player",
     player,
@@ -38,7 +41,7 @@ export function solve(player, requests) {
   });
   let output;
   try {
-    output = vm.runInContext("jsc(__ytrust_input)", ctx, {
+    output = vm.runInContext("jsc(JSON.parse(__ytrust_input))", ctx, {
       filename: "yt.solver.run.js",
       timeout: SOLVE_TIMEOUT_MS,
     });

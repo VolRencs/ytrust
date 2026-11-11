@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.2
+
+- Fixed the Node challenge solver passing a JSON string instead of an object to
+  the EJS `jsc` entrypoint, which made `resolve()` and `resolveAudio()` fail
+  with `CHALLENGE_FAILED` for ciphered formats.
+- Added a regression test for the solver input contract.
+
 ## 0.4.1
 
 - Node.js 26 is now the only supported runtime.
