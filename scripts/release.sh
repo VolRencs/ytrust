@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+version="${1:-}"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "usage: scripts/release.sh MAJOR.MINOR.PATCH" >&2
+  exit 2
+fi
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "working tree is not clean" >&2
+  exit 1
+fi
+
+branch="$(git branch --show-current)"
+if [[ "$branch" != "main" ]]; then
+  echo "release must be created from main (current: $branch)" >&2
+  exit 1
+fi
+
+sed -i "s/^version = \".*\"/version = \"$version\"/" Cargo.toml
+cargo check >/dev/null
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+
+git add Cargo.toml Cargo.lock
+git commit -m "Release v$version"
+git tag "v$version"
+git push origin main
+git push origin "v$version"
+
+echo "Released v$version"
