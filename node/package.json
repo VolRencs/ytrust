@@ -4,7 +4,7 @@
   "private": true,
   "packageManager": "pnpm@12.18.0",
   "description": "Native ytrust bindings for Node.js",
-  "license": "Unlicense",
+  "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/VolRencs/ytrust.git"

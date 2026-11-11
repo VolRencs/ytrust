@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Relicensed under GPL-3.0.
+
 ## 0.1.1
 
 - Added `http_headers` (`User-Agent`, `Referer`) and `expires_at` to every

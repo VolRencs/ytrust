@@ -97,4 +97,4 @@ Errors thrown by the module are `YtrustError` instances with a stable `code`:
 
 ## License
 
-Unlicense — public domain. See [LICENSE](LICENSE).
+GPL-3.0 — see [LICENSE](LICENSE).

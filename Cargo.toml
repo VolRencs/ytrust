@@ -6,7 +6,7 @@ rust-version = "1.89"
 description = "Fast, modern YouTube downloader"
 repository = "https://github.com/VolRencs/ytrust"
 readme = "README.md"
-license = "Unlicense"
+license = "GPL-3.0-only"
 
 [workspace]
 members = ["node"]
