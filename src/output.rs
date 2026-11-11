@@ -63,6 +63,11 @@ impl TemplateContext {
         self.playlist_index = index.map(|v| v.to_string()).unwrap_or_default();
         self
     }
+
+    pub fn with_ext(mut self, ext: impl Into<String>) -> Self {
+        self.ext = ext.into();
+        self
+    }
 }
 
 pub fn render_path(
@@ -152,7 +157,7 @@ pub fn sanitize_component(value: &str, restrict: bool) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         let allowed = if restrict {
-            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ' ')
+            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
         } else {
             !matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !ch.is_control()
         };
@@ -164,16 +169,55 @@ pub fn sanitize_component(value: &str, restrict: bool) -> String {
         }
     }
 
-    let trimmed = out.trim().trim_matches('.').trim();
-    let mut trimmed = trimmed.to_string();
-    if trimmed.len() > 180 {
-        trimmed.truncate(180);
-        while trimmed.ends_with(' ') {
-            trimmed.pop();
-        }
+    let mut trimmed = out.trim().trim_matches('.').trim().to_string();
+    if is_windows_reserved(&trimmed) {
+        trimmed.insert(0, '_');
     }
-
+    truncate_utf8(&mut trimmed, 180);
+    while trimmed.ends_with(' ') {
+        trimmed.pop();
+    }
     trimmed
+}
+
+fn is_windows_reserved(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or(value).trim();
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
 }
 
 pub fn format_ext(format: &Format) -> &'static str {
@@ -183,6 +227,7 @@ pub fn format_ext(format: &Format) -> &'static str {
         "webm" => "webm",
         "3gpp" => "3gp",
         "x-matroska" | "matroska" => "mkv",
+        "mpeg" if format.has_video => "mpg",
         "mpeg" => "mp3",
         "ogg" => "ogg",
         "quicktime" => "mov",
@@ -192,7 +237,7 @@ pub fn format_ext(format: &Format) -> &'static str {
 
 pub fn merged_ext(video_ext: &str, audio_ext: &str, override_ext: Option<&str>) -> String {
     if let Some(ext) = override_ext {
-        return ext.trim_start_matches('.').to_string();
+        return ext.trim_start_matches('.').to_ascii_lowercase();
     }
     if video_ext == audio_ext {
         return video_ext.to_string();
@@ -247,12 +292,28 @@ mod tests {
     }
 
     #[test]
+    fn truncates_multibyte_titles_without_panicking() {
+        let title = "漢".repeat(59) + "🎬🎬";
+        let sanitized = sanitize_component(&title, false);
+        assert!(sanitized.len() <= 180);
+        assert!(std::str::from_utf8(sanitized.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn prefixes_windows_reserved_names() {
+        assert_eq!(sanitize_component("A B", true), "A_B");
+        assert_eq!(sanitize_component("CON", false), "_CON");
+        assert_eq!(sanitize_component("nul.txt", false), "_nul.txt");
+        assert_eq!(sanitize_component("normal", false), "normal");
+    }
+
+    #[test]
     fn blocks_parent_traversal() {
         let ctx = TemplateContext {
             title: "evil".into(),
             ..Default::default()
         };
         let path = render_path("../{title}", &ctx, None, false).unwrap();
-        assert_eq!(path, PathBuf::from("_/evil"));
+        assert_eq!(path, PathBuf::from("_").join("evil"));
     }
 }

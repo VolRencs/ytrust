@@ -1,27 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha1::{Digest, Sha1};
 use url::Url;
 
-use crate::error::{Result, YtrustError};
+use crate::constants::{
+    TV_CLIENT_NAME, TV_CLIENT_VERSION, TV_UA, VISIONOS_CLIENT_NAME, VISIONOS_CLIENT_VERSION,
+    VISIONOS_UA, WEB_CLIENT_NAME, WEB_CLIENT_VERSION, WEB_EMBEDDED_CLIENT_NAME,
+    WEB_EMBEDDED_CLIENT_VERSION, WEB_EMBEDDED_UA, WEB_UA,
+};
+use crate::error::{ErrorCode, Result, YtrustError};
+use crate::http::{InnertubeRequest, client as build_client, fetch_text, post_innertube};
 
-const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
-const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
-const WEB_EMBEDDED_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
-
-#[derive(Debug, Clone, Default)]
-pub struct RequestConfig {
-    pub proxy: Option<String>,
-    pub cookies: Option<String>,
-    pub sapisid: Option<String>,
-    pub sapisid1p: Option<String>,
-    pub sapisid3p: Option<String>,
-    pub timeout: u64,
-}
+pub use crate::http::RequestConfig;
 
 #[derive(Debug, Clone)]
 pub enum Target {
@@ -54,7 +46,7 @@ pub struct PlaylistInfo {
     pub entries: Vec<PlaylistEntry>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct VideoInfo {
     pub id: String,
     pub title: String,
@@ -75,14 +67,14 @@ pub struct VideoInfo {
     pub player_js_url: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct Thumbnail {
     pub url: String,
     pub width: Option<u64>,
     pub height: Option<u64>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct SubtitleTrack {
     pub language: String,
     pub name: String,
@@ -90,7 +82,7 @@ pub struct SubtitleTrack {
     pub is_auto: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct Format {
     pub itag: u64,
     pub url: String,
@@ -120,17 +112,26 @@ pub struct Format {
 pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
     if let Some(rest) = url.strip_prefix("ytsearch") {
         let (count, query) = rest.split_once(':').ok_or_else(|| {
-            YtrustError::msg("search syntax is ytsearchN:query or ytsearch:query")
+            YtrustError::coded(
+                ErrorCode::InvalidInput,
+                "search syntax is ytsearchN:query or ytsearch:query",
+            )
         })?;
         let limit = if count.is_empty() {
             1
         } else {
-            count
-                .parse::<u64>()
-                .map_err(|_| YtrustError::msg(format!("invalid search count: {count}")))?
+            count.parse::<u64>().map_err(|_| {
+                YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    format!("invalid search count: {count}"),
+                )
+            })?
         };
         if query.trim().is_empty() {
-            return Err(YtrustError::msg("search query is empty"));
+            return Err(YtrustError::coded(
+                ErrorCode::InvalidInput,
+                "search query is empty",
+            ));
         }
         return Ok(Target::Search {
             query: query.to_string(),
@@ -138,7 +139,8 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
         });
     }
 
-    let parsed = Url::parse(url).map_err(|_| YtrustError::msg(format!("invalid URL: {url}")))?;
+    let parsed = Url::parse(url)
+        .map_err(|_| YtrustError::coded(ErrorCode::InvalidInput, format!("invalid URL: {url}")))?;
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let host = host.trim_start_matches("www.").trim_start_matches("m.");
 
@@ -146,20 +148,23 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
         host,
         "youtube.com" | "youtu.be" | "music.youtube.com" | "youtube-nocookie.com"
     ) {
-        return Err(YtrustError::msg(format!(
-            "not a YouTube URL: {url}\nOnly YouTube is supported."
-        )));
+        return Err(YtrustError::coded(
+            ErrorCode::UnsupportedUrl,
+            format!("not a YouTube URL: {url}\nOnly YouTube is supported."),
+        ));
     }
 
     let path = parsed.path();
     let list = parsed
         .query_pairs()
         .find(|(key, _)| key == "list")
-        .map(|(_, value)| value.to_string());
+        .map(|(_, value)| value.to_string())
+        .filter(|value| !value.is_empty());
     let video = parsed
         .query_pairs()
         .find(|(key, _)| key == "v")
-        .map(|(_, value)| value.to_string());
+        .map(|(_, value)| value.to_string())
+        .filter(|value| !value.is_empty());
 
     if let Some(ref list) = list
         && !no_playlist
@@ -171,11 +176,22 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
     }
 
     if let Some(video_id) = video {
+        let video_id = valid_id(&video_id).ok_or_else(|| {
+            YtrustError::coded(
+                ErrorCode::InvalidInput,
+                format!("invalid video ID: {video_id}"),
+            )
+        })?;
         return Ok(Target::Video { id: video_id });
     }
 
     if path.starts_with("/playlist") {
-        let list = list.ok_or_else(|| YtrustError::msg("playlist URL has no list parameter"))?;
+        let list = list.ok_or_else(|| {
+            YtrustError::coded(
+                ErrorCode::InvalidInput,
+                "playlist URL has no list parameter",
+            )
+        })?;
         return Ok(Target::Playlist {
             id: list,
             video_id: None,
@@ -191,12 +207,16 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
         || path.starts_with("/user/")
         || path.starts_with("/c/")
     {
-        return Err(YtrustError::msg(
+        return Err(YtrustError::coded(
+            ErrorCode::UnsupportedUrl,
             "channel URLs are not supported yet; use a video or playlist URL",
         ));
     }
 
-    Err(YtrustError::msg(format!("unsupported YouTube URL: {url}")))
+    Err(YtrustError::coded(
+        ErrorCode::UnsupportedUrl,
+        format!("unsupported YouTube URL: {url}"),
+    ))
 }
 
 pub fn video_id_from_url(url: &Url) -> Option<String> {
@@ -241,30 +261,141 @@ fn valid_id(id: &str) -> Option<String> {
 
 pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<VideoInfo> {
     let client = build_client(config)?;
-    let clients = [ClientKind::VisionOs, ClientKind::Tv];
-    let mut last_error = None;
+    let mut errors = Vec::new();
+    let mut fallback = None;
 
-    for client_kind in clients {
-        match fetch_player_response(&client, video_id, client_kind, None, config).await {
+    for client_kind in [ClientKind::VisionOs, ClientKind::Tv] {
+        match fetch_player_response(&client, video_id, client_kind, config).await {
             Ok(response) => match parse_video_info(video_id, response, client_kind, None) {
-                Ok(info) if !info.formats.is_empty() => return Ok(info),
-                Ok(_) => last_error = Some(YtrustError::msg("YouTube returned no formats")),
-                Err(err) => last_error = Some(err),
+                Ok(mut info) if !info.formats.is_empty() => {
+                    if !needs_player_js(&info) {
+                        return Ok(info);
+                    }
+                    match player_js_url(video_id, config).await {
+                        Ok(url) => {
+                            info.player_js_url = Some(url);
+                            return Ok(info);
+                        }
+                        Err(error) => errors.push(error),
+                    }
+                    fallback = Some(info);
+                }
+                Ok(_) => {
+                    errors.push(YtrustError::coded(
+                        ErrorCode::Unavailable,
+                        "YouTube returned no formats",
+                    ));
+                }
+                Err(error) => errors.push(error),
             },
-            Err(err) => last_error = Some(err),
+            Err(error) => errors.push(error),
         }
     }
 
-    if config.cookies.is_some() {
-        match fetch_web_embedded_video(video_id, config).await {
-            Ok(info) if !info.formats.is_empty() => return Ok(info),
-            Ok(_) => last_error = Some(YtrustError::msg("YouTube returned no formats")),
-            Err(err) => last_error = Some(err),
+    match fetch_web_embedded_video(video_id, config).await {
+        Ok(info) if !info.formats.is_empty() => return Ok(info),
+        Ok(_) => {
+            errors.push(YtrustError::coded(
+                ErrorCode::Unavailable,
+                "YouTube returned no formats",
+            ));
         }
+        Err(error) => errors.push(error),
     }
 
-    Err(last_error
-        .unwrap_or_else(|| YtrustError::msg("YouTube did not return a playable response")))
+    if let Some(info) = fallback
+        && info.formats.iter().any(|format| !format.url.is_empty())
+    {
+        return Ok(info);
+    }
+
+    Err(errors.pop().unwrap_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::Unavailable,
+            "YouTube did not return a playable response",
+        )
+    }))
+}
+
+fn needs_player_js(info: &VideoInfo) -> bool {
+    info.formats.iter().any(|format| {
+        format.signature_cipher.is_some()
+            || format.cipher.is_some()
+            || (!format.url.is_empty() && url_has_n(&format.url))
+    })
+}
+
+fn url_has_n(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .is_some_and(|url| url.query_pairs().any(|(key, _)| key == "n"))
+}
+
+/// Resolve the current player JS URL from the watch or embed page.
+pub async fn player_js_url(video_id: &str, config: &RequestConfig) -> Result<String> {
+    let client = build_client(config)?;
+    let watch_url = format!("https://www.youtube.com/watch?v={video_id}&hl=en&gl=US");
+    let watch_error = match fetch_text(&client, &watch_url, config, WEB_UA, None).await {
+        Ok(html) => match extract_player_js_url(&html) {
+            Some(url) => return Ok(url),
+            None => YtrustError::coded(
+                ErrorCode::InvalidResponse,
+                "YouTube watch page has no player JS URL",
+            ),
+        },
+        Err(error) => error,
+    };
+
+    let embed_url = format!("https://www.youtube.com/embed/{video_id}?html5=1");
+    match fetch_text(
+        &client,
+        &embed_url,
+        config,
+        WEB_EMBEDDED_UA,
+        Some("https://www.reddit.com/"),
+    )
+    .await
+    {
+        Ok(html) => extract_player_js_url(&html).ok_or_else(|| {
+            YtrustError::coded(
+                ErrorCode::InvalidResponse,
+                "YouTube embed page has no player JS URL",
+            )
+        }),
+        Err(_) => Err(watch_error),
+    }
+}
+
+/// Fetch the player JavaScript source through the configured proxy/timeout.
+pub async fn fetch_player_source(url: &str, config: &RequestConfig) -> Result<String> {
+    let client = build_client(config)?;
+    fetch_text(&client, url, config, WEB_UA, None).await
+}
+
+fn extract_player_js_url(html: &str) -> Option<String> {
+    let ytcfg = extract_ytcfg(html)?;
+    player_js_url_from_cfg(&ytcfg)
+}
+
+fn player_js_url_from_cfg(ytcfg: &Value) -> Option<String> {
+    ytcfg
+        .get("PLAYER_JS_URL")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            ytcfg
+                .pointer("/WEB_PLAYER_CONTEXT_CONFIGS/WEB_PLAYER_CONTEXT_CONFIG_ID_EMBEDDED_PLAYER/jsUrl")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| ytcfg.get("JS_URL").and_then(Value::as_str))
+        .map(|url| {
+            if url.starts_with("http") {
+                url.to_string()
+            } else if url.starts_with("//") {
+                format!("https:{url}")
+            } else {
+                format!("https://www.youtube.com{url}")
+            }
+        })
 }
 
 static SIGNATURE_TIMESTAMPS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
@@ -280,37 +411,50 @@ async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Res
         Some("https://www.reddit.com/"),
     )
     .await?;
-    let ytcfg =
-        extract_ytcfg(&html).ok_or_else(|| YtrustError::msg("YouTube embed page has no ytcfg"))?;
-    let mut context = ytcfg
-        .get("INNERTUBE_CONTEXT")
-        .cloned()
-        .ok_or_else(|| YtrustError::msg("YouTube embed ytcfg has no context"))?;
-    context["client"]["hl"] = json!("en");
-    context["client"]["timeZone"] = json!("UTC");
-    context["client"]["utcOffsetMinutes"] = json!(0);
-    context["client"]["originalUrl"] = json!(embed_url);
-    if context.get("thirdParty").is_some() {
-        context["thirdParty"]["embedUrl"] = json!("https://www.reddit.com/");
-    } else {
-        context["thirdParty"] = json!({"embedUrl": "https://www.reddit.com/"});
+    let ytcfg = extract_ytcfg(&html).ok_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::InvalidResponse,
+            "YouTube embed page has no ytcfg",
+        )
+    })?;
+    let mut context = ytcfg.get("INNERTUBE_CONTEXT").cloned().ok_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::InvalidResponse,
+            "YouTube embed ytcfg has no context",
+        )
+    })?;
+    let client_context = context
+        .get_mut("client")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            YtrustError::coded(
+                ErrorCode::InvalidResponse,
+                "YouTube embed context has no client object",
+            )
+        })?;
+    client_context.insert("hl".to_string(), json!("en"));
+    client_context.insert("timeZone".to_string(), json!("UTC"));
+    client_context.insert("utcOffsetMinutes".to_string(), json!(0));
+    client_context.insert("originalUrl".to_string(), json!(embed_url));
+    match context.get_mut("thirdParty") {
+        Some(Value::Object(third_party)) => {
+            third_party.insert("embedUrl".to_string(), json!("https://www.reddit.com/"));
+        }
+        _ => {
+            context["thirdParty"] = json!({"embedUrl": "https://www.reddit.com/"});
+        }
     }
 
     let visitor_data = ytcfg
         .pointer("/INNERTUBE_CONTEXT/client/visitorData")
         .and_then(Value::as_str)
         .or_else(|| ytcfg.get("VISITOR_DATA").and_then(Value::as_str));
-    let player_js_url = ytcfg
-        .pointer("/WEB_PLAYER_CONTEXT_CONFIGS/WEB_PLAYER_CONTEXT_CONFIG_ID_EMBEDDED_PLAYER/jsUrl")
-        .and_then(Value::as_str)
-        .map(|url| {
-            if url.starts_with("http") {
-                url.to_string()
-            } else {
-                format!("https://www.youtube.com{url}")
-            }
-        })
-        .ok_or_else(|| YtrustError::msg("YouTube embed ytcfg has no player JS URL"))?;
+    let player_js_url = player_js_url_from_cfg(&ytcfg).ok_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::InvalidResponse,
+            "YouTube embed ytcfg has no player JS URL",
+        )
+    })?;
     let signature_timestamp = signature_timestamp(&client, &player_js_url, config).await?;
     let encrypted_flags = ytcfg
         .pointer("/WEB_PLAYER_CONTEXT_CONFIGS/WEB_PLAYER_CONTEXT_CONFIG_ID_EMBEDDED_PLAYER/encryptedHostFlags")
@@ -325,7 +469,7 @@ async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Res
     let client_version = ytcfg
         .pointer("/INNERTUBE_CONTEXT/client/clientVersion")
         .and_then(Value::as_str)
-        .unwrap_or("2.20261110.01.00");
+        .unwrap_or(WEB_EMBEDDED_CLIENT_VERSION);
     let body = json!({
         "context": context,
         "videoId": video_id,
@@ -333,20 +477,21 @@ async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Res
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
-    let response = post_innertube(
+    let response: PlayerResponse = post_innertube(
         &client,
-        "player",
-        &body,
-        "56",
-        client_version,
-        WEB_EMBEDDED_UA,
-        visitor_data,
-        ytcfg.get("USER_SESSION_ID").and_then(Value::as_str),
-        true,
+        InnertubeRequest {
+            endpoint: "player",
+            body: &body,
+            client_name: WEB_EMBEDDED_CLIENT_NAME,
+            client_version,
+            user_agent: WEB_EMBEDDED_UA,
+            visitor_data,
+            user_session_id: ytcfg.get("USER_SESSION_ID").and_then(Value::as_str),
+            browser: true,
+        },
         config,
     )
     .await?;
-    let response: PlayerResponse = serde_json::from_value(response)?;
     parse_video_info(
         video_id,
         response,
@@ -370,17 +515,23 @@ async fn signature_timestamp(
     }
     let source = fetch_text(client, player_js_url, config, WEB_EMBEDDED_UA, None).await?;
     let marker = "signatureTimestamp";
-    let at = source
-        .find(marker)
-        .ok_or_else(|| YtrustError::msg("player JS has no signatureTimestamp"))?;
+    let at = source.find(marker).ok_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::InvalidResponse,
+            "player JS has no signatureTimestamp",
+        )
+    })?;
     let digits = source[at + marker.len()..]
         .trim_start_matches([':', '=', ' '])
         .chars()
         .take_while(char::is_ascii_digit)
         .collect::<String>();
-    let value = digits
-        .parse::<u64>()
-        .map_err(|_| YtrustError::msg("player JS signatureTimestamp is invalid"))?;
+    let value = digits.parse::<u64>().map_err(|_| {
+        YtrustError::coded(
+            ErrorCode::InvalidResponse,
+            "player JS signatureTimestamp is invalid",
+        )
+    })?;
     if let Ok(mut cache) = SIGNATURE_TIMESTAMPS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -416,37 +567,41 @@ pub async fn fetch_playlist(
     };
 
     let mut entries = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     let mut continuation = None;
     let mut title = String::from("Playlist");
 
-    for _ in 0..40 {
-        let mut body = json!({
-            "context": web_context(),
-            "browseId": browse_id,
-        });
-        if let Some(token) = &continuation {
-            body = json!({
+    for page in 0..40 {
+        let body = match &continuation {
+            Some(token) => json!({
                 "context": web_context(),
                 "continuation": token,
-            });
-        }
+            }),
+            None => json!({
+                "context": web_context(),
+                "browseId": browse_id,
+            }),
+        };
 
-        let response = post_innertube(
+        let response: Value = post_innertube(
             &client,
-            "browse",
-            &body,
-            "1",
-            "2.20260707.01.00",
-            WEB_UA,
-            None,
-            None,
-            false,
+            InnertubeRequest {
+                endpoint: "browse",
+                body: &body,
+                client_name: WEB_CLIENT_NAME,
+                client_version: WEB_CLIENT_VERSION,
+                user_agent: WEB_UA,
+                visitor_data: None,
+                user_session_id: None,
+                browser: false,
+            },
             config,
         )
         .await?;
 
-        if let Some(found_title) = find_playlist_title(&response) {
+        if page == 0
+            && let Some(found_title) = find_playlist_title(&response)
+        {
             title = found_title;
         }
         collect_playlist_videos(&response, &mut entries, &mut seen, limit as usize);
@@ -494,7 +649,12 @@ pub async fn fetch_inline_playlist(
     let mut playlist = data
         .pointer("/contents/twoColumnWatchNextResults/playlist/playlist")
         .cloned()
-        .ok_or_else(|| YtrustError::msg("YouTube returned no inline playlist"))?;
+        .ok_or_else(|| {
+            YtrustError::coded(
+                ErrorCode::InvalidResponse,
+                "YouTube returned no inline playlist",
+            )
+        })?;
     let title = playlist
         .get("title")
         .and_then(Value::as_str)
@@ -502,7 +662,7 @@ pub async fn fetch_inline_playlist(
         .to_string();
 
     let mut entries = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for _ in 0..40 {
         let (page_entries, endpoint) = extract_inline_entries(&playlist);
         if page_entries.is_empty() {
@@ -529,16 +689,18 @@ pub async fn fetch_inline_playlist(
             "index": endpoint.index.unwrap_or(entries.len() as u64),
             "params": endpoint.params.unwrap_or_else(|| "OAE%3D".to_string()),
         });
-        let response = post_innertube(
+        let response: Value = post_innertube(
             &client,
-            "next",
-            &body,
-            "1",
-            "2.20260707.01.00",
-            WEB_UA,
-            None,
-            None,
-            false,
+            InnertubeRequest {
+                endpoint: "next",
+                body: &body,
+                client_name: WEB_CLIENT_NAME,
+                client_version: WEB_CLIENT_VERSION,
+                user_agent: WEB_UA,
+                visitor_data: None,
+                user_session_id: None,
+                browser: false,
+            },
             config,
         )
         .await?;
@@ -558,46 +720,22 @@ pub async fn fetch_inline_playlist(
     })
 }
 
-async fn fetch_text(
-    client: &reqwest::Client,
-    url: &str,
-    config: &RequestConfig,
-    user_agent: &str,
-    referer: Option<&str>,
-) -> Result<String> {
-    let mut request = client
-        .get(url)
-        .header(reqwest::header::USER_AGENT, user_agent)
-        .header(
-            reqwest::header::ACCEPT,
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header(reqwest::header::ACCEPT_LANGUAGE, "en-us,en;q=0.5")
-        .header("Sec-Fetch-Mode", "navigate");
-    if let Some(referer) = referer {
-        request = request.header(reqwest::header::REFERER, referer);
-    }
-    if let Some(cookies) = &config.cookies {
-        request = request.header(reqwest::header::COOKIE, cookies);
-    }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        return Err(YtrustError::msg(format!(
-            "HTTP {} for {url}",
-            response.status()
-        )));
-    }
-    Ok(response.text().await?)
-}
-
 fn extract_json_assignment(html: &str, marker: &str) -> Result<Value> {
-    let marker_at = html
-        .find(marker)
-        .ok_or_else(|| YtrustError::msg(format!("{marker} not found in YouTube page")))?;
+    let marker_at = html.find(marker).ok_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::InvalidResponse,
+            format!("{marker} not found in YouTube page"),
+        )
+    })?;
     let start = html[marker_at..]
         .find('{')
         .map(|offset| marker_at + offset)
-        .ok_or_else(|| YtrustError::msg(format!("{marker} has no JSON object")))?;
+        .ok_or_else(|| {
+            YtrustError::coded(
+                ErrorCode::InvalidResponse,
+                format!("{marker} has no JSON object"),
+            )
+        })?;
     let bytes = html.as_bytes();
     let mut depth = 0usize;
     let mut in_string = false;
@@ -626,9 +764,10 @@ fn extract_json_assignment(html: &str, marker: &str) -> Result<Value> {
             _ => {}
         }
     }
-    Err(YtrustError::msg(format!(
-        "unterminated JSON object after {marker}"
-    )))
+    Err(YtrustError::coded(
+        ErrorCode::InvalidResponse,
+        format!("unterminated JSON object after {marker}"),
+    ))
 }
 
 struct InlineEndpoint {
@@ -709,18 +848,7 @@ fn thumbnails_from(renderer: &Value) -> Vec<Thumbnail> {
     renderer
         .pointer("/thumbnail/thumbnails")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    Some(Thumbnail {
-                        url: item.get("url")?.as_str()?.to_string(),
-                        width: item.get("width").and_then(Value::as_u64),
-                        height: item.get("height").and_then(Value::as_u64),
-                    })
-                })
-                .collect()
-        })
+        .map(|items| parse_thumbnail_array(items))
         .unwrap_or_default()
 }
 
@@ -736,27 +864,45 @@ fn parse_time_text(text: &str) -> Option<u64> {
 
 pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Result<PlaylistInfo> {
     let client = build_client(config)?;
-    let body = json!({
-        "context": web_context(),
-        "query": query,
-    });
-    let response = post_innertube(
-        &client,
-        "search",
-        &body,
-        "1",
-        "2.20260707.01.00",
-        WEB_UA,
-        None,
-        None,
-        false,
-        config,
-    )
-    .await?;
-
     let mut entries = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    collect_playlist_videos(&response, &mut entries, &mut seen, limit as usize);
+    let mut seen = BTreeSet::new();
+    let mut continuation = None;
+
+    for _ in 0..40 {
+        let body = match &continuation {
+            Some(token) => json!({
+                "context": web_context(),
+                "continuation": token,
+            }),
+            None => json!({
+                "context": web_context(),
+                "query": query,
+            }),
+        };
+        let response: Value = post_innertube(
+            &client,
+            InnertubeRequest {
+                endpoint: "search",
+                body: &body,
+                client_name: WEB_CLIENT_NAME,
+                client_version: WEB_CLIENT_VERSION,
+                user_agent: WEB_UA,
+                visitor_data: None,
+                user_session_id: None,
+                browser: false,
+            },
+            config,
+        )
+        .await?;
+        collect_playlist_videos(&response, &mut entries, &mut seen, limit as usize);
+        if entries.len() >= limit as usize {
+            break;
+        }
+        continuation = find_continuation_token(&response);
+        if continuation.is_none() {
+            break;
+        }
+    }
 
     Ok(PlaylistInfo {
         id: format!("search:{query}"),
@@ -792,7 +938,7 @@ pub fn filter_playlist_entries(playlist: &mut PlaylistInfo, selection: &str) -> 
         playlist.entries.clear();
         return Ok(());
     }
-    let selected: std::collections::BTreeSet<usize> = selected.into_iter().collect();
+    let selected: BTreeSet<usize> = selected.into_iter().collect();
     playlist
         .entries
         .retain(|entry| selected.contains(&entry.index));
@@ -800,41 +946,61 @@ pub fn filter_playlist_entries(playlist: &mut PlaylistInfo, selection: &str) -> 
 }
 
 pub fn parse_item_ranges(expression: &str, total: usize) -> Result<Vec<usize>> {
-    let mut selected = std::collections::BTreeSet::new();
+    let mut selected = BTreeSet::new();
 
     for part in expression
         .split(',')
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|part| !part.is_empty())
     {
         if let Some((start, end)) = part.split_once('-') {
-            let start = if start.trim().is_empty() {
+            let start_raw = start.trim();
+            let end_raw = end.trim();
+            let start = if start_raw.is_empty() {
                 1
             } else {
-                start
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| YtrustError::msg(format!("invalid playlist range: {part}")))?
+                start_raw.parse::<usize>().map_err(|_| {
+                    YtrustError::coded(
+                        ErrorCode::InvalidInput,
+                        format!("invalid playlist range: {part}"),
+                    )
+                })?
             };
-            let end = if end.trim().is_empty() {
+            let open_ended = end_raw.is_empty();
+            let end = if open_ended {
                 total
             } else {
-                end.trim()
-                    .parse::<usize>()
-                    .map_err(|_| YtrustError::msg(format!("invalid playlist range: {part}")))?
+                end_raw.parse::<usize>().map_err(|_| {
+                    YtrustError::coded(
+                        ErrorCode::InvalidInput,
+                        format!("invalid playlist range: {part}"),
+                    )
+                })?
             };
-            if start == 0 || end == 0 || start > end {
-                return Err(YtrustError::msg(format!("invalid playlist range: {part}")));
+            if start == 0 || (!open_ended && (end == 0 || start > end)) {
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    format!("invalid playlist range: {part}"),
+                ));
             }
-            for index in start..=end.min(total) {
-                selected.insert(index);
+            let upper = end.min(total);
+            if start <= upper {
+                for index in start..=upper {
+                    selected.insert(index);
+                }
             }
         } else {
-            let index = part
-                .parse::<usize>()
-                .map_err(|_| YtrustError::msg(format!("invalid playlist item: {part}")))?;
+            let index = part.parse::<usize>().map_err(|_| {
+                YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    format!("invalid playlist item: {part}"),
+                )
+            })?;
             if index == 0 {
-                return Err(YtrustError::msg("playlist items start at 1"));
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    "playlist items start at 1",
+                ));
             }
             if index <= total {
                 selected.insert(index);
@@ -858,18 +1024,18 @@ impl ClientKind {
             Self::WebEmbedded => (
                 json!({
                     "clientName": "WEB_EMBEDDED_PLAYER",
-                    "clientVersion": "2.20261110.01.00",
+                    "clientVersion": WEB_EMBEDDED_CLIENT_VERSION,
                     "userAgent": WEB_EMBEDDED_UA,
                     "hl": "en",
                     "gl": "US",
                 }),
-                "56",
-                "2.20261110.01.00",
+                WEB_EMBEDDED_CLIENT_NAME,
+                WEB_EMBEDDED_CLIENT_VERSION,
             ),
             Self::VisionOs => (
                 json!({
                     "clientName": "VISIONOS",
-                    "clientVersion": "1.02",
+                    "clientVersion": VISIONOS_CLIENT_VERSION,
                     "deviceMake": "Apple",
                     "deviceModel": "RealityDevice17,1",
                     "userAgent": VISIONOS_UA,
@@ -878,19 +1044,19 @@ impl ClientKind {
                     "hl": "en",
                     "gl": "US",
                 }),
-                "101",
-                "1.02",
+                VISIONOS_CLIENT_NAME,
+                VISIONOS_CLIENT_VERSION,
             ),
             Self::Tv => (
                 json!({
                     "clientName": "TVHTML5",
-                    "clientVersion": "7.20260707.07.00",
-                    "userAgent": "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)",
+                    "clientVersion": TV_CLIENT_VERSION,
+                    "userAgent": TV_UA,
                     "hl": "en",
                     "gl": "US",
                 }),
-                "7",
-                "7.20260707.07.00",
+                TV_CLIENT_NAME,
+                TV_CLIENT_VERSION,
             ),
         }
     }
@@ -899,9 +1065,7 @@ impl ClientKind {
         match self {
             Self::VisionOs => VISIONOS_UA,
             Self::WebEmbedded => WEB_EMBEDDED_UA,
-            Self::Tv => {
-                "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)"
-            }
+            Self::Tv => TV_UA,
         }
     }
 }
@@ -910,7 +1074,7 @@ fn web_context() -> Value {
     json!({
         "client": {
             "clientName": "WEB",
-            "clientVersion": "2.20260707.01.00",
+            "clientVersion": WEB_CLIENT_VERSION,
             "userAgent": WEB_UA,
             "hl": "en",
             "gl": "US",
@@ -922,13 +1086,9 @@ async fn fetch_player_response(
     client: &reqwest::Client,
     video_id: &str,
     client_kind: ClientKind,
-    visitor_data: Option<&str>,
     config: &RequestConfig,
 ) -> Result<PlayerResponse> {
-    let (mut context, client_name, client_version) = client_kind.context();
-    if let Some(visitor_data) = visitor_data {
-        context["visitorData"] = json!(visitor_data);
-    }
+    let (context, client_name, client_version) = client_kind.context();
     let body = json!({
         "context": {"client": context},
         "videoId": video_id,
@@ -936,159 +1096,21 @@ async fn fetch_player_response(
         "racyCheckOk": true,
     });
 
-    let response = post_innertube(
+    post_innertube(
         client,
-        "player",
-        &body,
-        client_name,
-        client_version,
-        client_kind.user_agent(),
-        visitor_data,
-        None,
-        false,
+        InnertubeRequest {
+            endpoint: "player",
+            body: &body,
+            client_name,
+            client_version,
+            user_agent: client_kind.user_agent(),
+            visitor_data: None,
+            user_session_id: None,
+            browser: false,
+        },
         config,
     )
-    .await?;
-
-    serde_json::from_value(response).map_err(YtrustError::from)
-}
-
-fn authorization_header(config: &RequestConfig, user_session_id: Option<&str>) -> Option<String> {
-    let user_session_id = user_session_id?;
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let origin = "https://www.youtube.com";
-    let hash = |sid: &str| {
-        let mut hasher = Sha1::new();
-        hasher.update(format!("{user_session_id} {timestamp} {sid} {origin}"));
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
-    let mut parts = Vec::new();
-    if let Some(sid) = &config.sapisid {
-        parts.push(format!("SAPISIDHASH {timestamp}_{}_u", hash(sid)));
-    }
-    if let Some(sid) = &config.sapisid1p {
-        parts.push(format!("SAPISID1PHASH {timestamp}_{}_u", hash(sid)));
-    }
-    if let Some(sid) = &config.sapisid3p {
-        parts.push(format!("SAPISID3PHASH {timestamp}_{}_u", hash(sid)));
-    }
-    (!parts.is_empty()).then(|| parts.join(" "))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn post_innertube(
-    client: &reqwest::Client,
-    endpoint: &str,
-    body: &Value,
-    client_name: &str,
-    client_version: &str,
-    user_agent: &str,
-    visitor_data: Option<&str>,
-    user_session_id: Option<&str>,
-    browser: bool,
-    config: &RequestConfig,
-) -> Result<Value> {
-    tracing::debug!("innertube {endpoint} request: {}", body);
-    let mut last_error = None;
-
-    for attempt in 0..=2u32 {
-        let mut request = client
-            .post(format!(
-                "https://www.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false"
-            ))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ORIGIN, "https://www.youtube.com")
-            .header(reqwest::header::USER_AGENT, user_agent)
-            .header(
-                reqwest::header::ACCEPT_LANGUAGE,
-                if browser {
-                    "en-us,en;q=0.5"
-                } else {
-                    "en-US,en;q=0.9"
-                },
-            )
-            .header("X-YouTube-Client-Name", client_name)
-            .header("X-YouTube-Client-Version", client_version);
-        if browser {
-            request = request
-                .header(
-                    reqwest::header::ACCEPT,
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                )
-                .header(reqwest::header::REFERER, "https://www.youtube.com/")
-                .header("Sec-Fetch-Mode", "navigate");
-        }
-        let mut request = request.json(body);
-
-        if let Some(cookies) = &config.cookies {
-            request = request.header(reqwest::header::COOKIE, cookies);
-        }
-        if let Some(visitor_data) = visitor_data {
-            request = request.header("X-Goog-Visitor-Id", visitor_data);
-        }
-        if let Some(auth) = authorization_header(config, user_session_id) {
-            request = request
-                .header(reqwest::header::AUTHORIZATION, auth)
-                .header("X-Origin", "https://www.youtube.com")
-                .header("X-Goog-AuthUser", "0")
-                .header("X-Youtube-Bootstrap-Logged-In", "true");
-        }
-
-        match tokio::time::timeout(Duration::from_secs(config.timeout.max(5)), request.send()).await
-        {
-            Ok(Ok(response)) => {
-                let status = response.status();
-                let text = response.text().await?;
-                tracing::debug!(
-                    "innertube {endpoint} HTTP {status}: {}",
-                    text.chars().take(500).collect::<String>()
-                );
-
-                if status.is_success() {
-                    return serde_json::from_str(&text).map_err(YtrustError::from);
-                }
-
-                let message = format!(
-                    "YouTube API returned HTTP {status}: {}",
-                    text.chars().take(200).collect::<String>()
-                );
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    last_error = Some(YtrustError::msg(message));
-                } else {
-                    return Err(YtrustError::msg(message));
-                }
-            }
-            Ok(Err(err)) => {
-                last_error = Some(YtrustError::from(err));
-            }
-            Err(_) => {
-                last_error = Some(YtrustError::msg("YouTube request timed out"));
-            }
-        }
-
-        if attempt < 2 {
-            tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| YtrustError::msg("YouTube request failed")))
-}
-
-fn build_client(config: &RequestConfig) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(config.timeout.max(5)))
-        .user_agent(VISIONOS_UA);
-    if let Some(proxy) = &config.proxy {
-        builder = builder.proxy(
-            reqwest::Proxy::all(proxy)
-                .map_err(|err| YtrustError::msg(format!("invalid proxy: {err}")))?,
-        );
-    }
-    Ok(builder.build()?)
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -1214,6 +1236,28 @@ struct RawCaptionTrack {
     kind: Option<String>,
 }
 
+fn playability_code(reason: &str) -> ErrorCode {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("not a bot") {
+        ErrorCode::BotCheck
+    } else if reason.contains("age-restricted")
+        || reason.contains("age restricted")
+        || reason.contains("confirm your age")
+    {
+        ErrorCode::AgeRestricted
+    } else if reason.contains("private") {
+        ErrorCode::Private
+    } else if reason.contains("unavailable")
+        || reason.contains("does not exist")
+        || reason.contains("removed")
+        || reason.contains("terminated")
+    {
+        ErrorCode::Unavailable
+    } else {
+        ErrorCode::Unknown
+    }
+}
+
 fn parse_video_info(
     requested_id: &str,
     response: PlayerResponse,
@@ -1231,18 +1275,28 @@ fn parse_video_info(
                 .reason
                 .clone()
                 .unwrap_or_else(|| status.status.clone());
-            return Err(YtrustError::msg(format!("YouTube: {reason}")));
+            return Err(YtrustError::coded(
+                playability_code(&reason),
+                format!("YouTube: {reason}"),
+            ));
         }
     }
 
     let captions = response.captions;
     let microformat = response.microformat;
-    let details = response
-        .video_details
-        .ok_or_else(|| YtrustError::msg("YouTube response has no video details"))?;
-    let streaming = response
-        .streaming_data
-        .ok_or_else(|| YtrustError::msg("YouTube response has no streaming data"))?;
+    let details = response.video_details.ok_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::InvalidResponse,
+            "YouTube response has no video details",
+        )
+    })?;
+    let streaming = response.streaming_data.ok_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::InvalidResponse,
+            "YouTube response has no streaming data",
+        )
+    })?;
+    let is_live = details.is_live_content.unwrap_or(false);
 
     let hls_manifest_url = streaming.hls_manifest_url.clone();
     let format_count = streaming.formats.as_ref().map_or(0, Vec::len)
@@ -1256,7 +1310,7 @@ fn parse_video_info(
         .into_iter()
         .chain(streaming.adaptive_formats.unwrap_or_default())
     {
-        if let Some(format) = parse_format(raw, client_kind) {
+        if let Some(format) = parse_format(raw, client_kind, is_live) {
             formats.push(format);
         }
     }
@@ -1282,7 +1336,7 @@ fn parse_video_info(
             content_length: None,
             quality_label: Some("HLS".to_string()),
             is_hls: true,
-            is_live: details.is_live_content.unwrap_or(false),
+            is_live,
             audio_track_name: None,
             audio_track_id: None,
             audio_is_default: true,
@@ -1344,7 +1398,7 @@ fn parse_video_info(
             .as_deref()
             .and_then(|value| value.parse::<u64>().ok()),
         upload_date,
-        is_live: details.is_live_content.unwrap_or(false),
+        is_live,
         thumbnails,
         subtitles,
         automatic_captions,
@@ -1354,7 +1408,7 @@ fn parse_video_info(
     })
 }
 
-fn parse_format(raw: RawFormat, client_kind: ClientKind) -> Option<Format> {
+fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Option<Format> {
     let url = raw.url.unwrap_or_default();
     if url.is_empty() && raw.signature_cipher.is_none() && raw.cipher.is_none() {
         return None;
@@ -1362,6 +1416,11 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind) -> Option<Format> {
 
     let (container, video_codec, audio_codec, has_video, has_audio) =
         parse_mime_and_codecs(&raw.mime_type);
+    let audio_bitrate = if has_audio && !has_video {
+        raw.audio_quality.as_ref().map(|_| raw.bitrate.unwrap_or(0))
+    } else {
+        None
+    };
 
     Some(Format {
         itag: raw.itag,
@@ -1378,14 +1437,14 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind) -> Option<Format> {
         height: raw.height,
         fps: raw.fps,
         bitrate: raw.average_bitrate.or(raw.bitrate).unwrap_or(0),
-        audio_bitrate: raw.audio_quality.as_ref().map(|_| raw.bitrate.unwrap_or(0)),
+        audio_bitrate,
         content_length: raw
             .content_length
             .as_deref()
             .and_then(|value| value.parse::<u64>().ok()),
         quality_label: raw.quality_label,
         is_hls: false,
-        is_live: false,
+        is_live,
         audio_track_name: raw
             .audio_track
             .as_ref()
@@ -1517,7 +1576,7 @@ fn find_key_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
 fn collect_playlist_videos(
     value: &Value,
     entries: &mut Vec<PlaylistEntry>,
-    seen: &mut std::collections::BTreeSet<String>,
+    seen: &mut BTreeSet<String>,
     limit: usize,
 ) {
     if entries.len() >= limit {
@@ -1526,45 +1585,12 @@ fn collect_playlist_videos(
 
     match value {
         Value::Object(map) => {
-            if let Some(renderer) = map.get("videoRenderer")
-                && let Some(id) = renderer.get("videoId").and_then(Value::as_str)
+            if let Some(renderer) = map
+                .get("videoRenderer")
+                .or_else(|| map.get("playlistVideoRenderer"))
+                && let Some((id, title, duration, thumbnails)) = standard_renderer_entry(renderer)
             {
-                let title = renderer
-                    .pointer("/title/runs/0/text")
-                    .or_else(|| renderer.pointer("/title/simpleText"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let duration = renderer
-                    .pointer("/lengthText/simpleText")
-                    .and_then(Value::as_str)
-                    .and_then(parse_duration_text);
-                let thumbnails = renderer
-                    .pointer("/thumbnail/thumbnails")
-                    .and_then(Value::as_array)
-                    .map(|items| parse_thumbnail_array(items))
-                    .unwrap_or_default();
-                push_playlist_entry(entries, seen, limit, id, title, duration, thumbnails);
-            }
-            if let Some(renderer) = map.get("playlistVideoRenderer")
-                && let Some(id) = renderer.get("videoId").and_then(Value::as_str)
-            {
-                let title = renderer
-                    .pointer("/title/runs/0/text")
-                    .or_else(|| renderer.pointer("/title/simpleText"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let duration = renderer
-                    .pointer("/lengthText/simpleText")
-                    .and_then(Value::as_str)
-                    .and_then(parse_duration_text);
-                let thumbnails = renderer
-                    .pointer("/thumbnail/thumbnails")
-                    .and_then(Value::as_array)
-                    .map(|items| parse_thumbnail_array(items))
-                    .unwrap_or_default();
-                push_playlist_entry(entries, seen, limit, id, title, duration, thumbnails);
+                push_playlist_entry(entries, seen, limit, &id, title, duration, thumbnails);
             }
             if let Some(renderer) = map.get("lockupViewModel")
                 && renderer.get("contentType").and_then(Value::as_str)
@@ -1609,9 +1635,28 @@ fn collect_playlist_videos(
     }
 }
 
+fn standard_renderer_entry(
+    renderer: &Value,
+) -> Option<(String, String, Option<u64>, Vec<Thumbnail>)> {
+    let id = renderer.get("videoId").and_then(Value::as_str)?;
+    let title =
+        text_of(renderer.get("title").unwrap_or(&Value::Null)).unwrap_or_else(|| id.to_string());
+    let duration = renderer
+        .get("lengthSeconds")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            renderer
+                .get("lengthText")
+                .and_then(text_of)
+                .and_then(|text| parse_duration_text(&text))
+        });
+    Some((id.to_string(), title, duration, thumbnails_from(renderer)))
+}
+
 fn push_playlist_entry(
     entries: &mut Vec<PlaylistEntry>,
-    seen: &mut std::collections::BTreeSet<String>,
+    seen: &mut BTreeSet<String>,
     limit: usize,
     id: &str,
     title: String,
@@ -1643,32 +1688,37 @@ fn parse_thumbnail_array(items: &[Value]) -> Vec<Thumbnail> {
 }
 
 fn parse_duration_text(value: &str) -> Option<u64> {
-    let mut seconds = 0u64;
-    for part in value.trim().split(':') {
-        let part = part.trim().parse::<u64>().ok()?;
-        seconds = seconds.saturating_mul(60).saturating_add(part);
-    }
-    (seconds > 0).then_some(seconds)
+    parse_time_text(value).filter(|seconds| *seconds > 0)
 }
 
 fn find_continuation_token(value: &Value) -> Option<String> {
+    find_continuation_token_in(value, false).or_else(|| find_continuation_token_in(value, true))
+}
+
+fn find_continuation_token_in(value: &Value, in_playlist: bool) -> Option<String> {
     match value {
         Value::Object(map) => {
-            if let Some(token) = map
-                .get("continuationCommand")
-                .and_then(|command| command.get("token"))
-                .and_then(Value::as_str)
+            let in_playlist = in_playlist
+                || map.contains_key("playlistVideoListRenderer")
+                || map.contains_key("playlistPanelRenderer");
+            if in_playlist
+                && let Some(token) = map
+                    .get("continuationCommand")
+                    .and_then(|command| command.get("token"))
+                    .and_then(Value::as_str)
             {
                 return Some(token.to_string());
             }
             for child in map.values() {
-                if let Some(token) = find_continuation_token(child) {
+                if let Some(token) = find_continuation_token_in(child, in_playlist) {
                     return Some(token);
                 }
             }
             None
         }
-        Value::Array(items) => items.iter().find_map(find_continuation_token),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_continuation_token_in(child, in_playlist)),
         _ => None,
     }
 }
@@ -1763,6 +1813,54 @@ mod tests {
         let html = r#"<script>var ytInitialData = {"a":"}","b":{"c":1}};</script>"#;
         let value = extract_json_assignment(html, "ytInitialData").unwrap();
         assert_eq!(value["b"]["c"], 1);
+    }
+
+    #[test]
+    fn rejects_invalid_video_ids() {
+        assert!(classify("https://www.youtube.com/watch?v=short", false).is_err());
+        assert!(classify("https://www.youtube.com/playlist", false).is_err());
+        assert!(classify("https://example.com/watch?v=dQw4w9WgXcQ", false).is_err());
+    }
+
+    #[test]
+    fn open_ranges_beyond_the_playlist_are_empty() {
+        assert_eq!(parse_item_ranges("10-", 5).unwrap(), Vec::<usize>::new());
+        assert_eq!(parse_item_ranges("10-20", 5).unwrap(), Vec::<usize>::new());
+        assert!(parse_item_ranges("10-5", 5).is_err());
+    }
+
+    #[test]
+    fn classifies_playability_reasons() {
+        assert_eq!(
+            playability_code("Sign in to confirm you\'re not a bot"),
+            ErrorCode::BotCheck
+        );
+        assert_eq!(
+            playability_code("Sign in to confirm your age"),
+            ErrorCode::AgeRestricted
+        );
+        assert_eq!(
+            playability_code("This video is private"),
+            ErrorCode::Private
+        );
+        assert_eq!(
+            playability_code("This video is unavailable"),
+            ErrorCode::Unavailable
+        );
+    }
+
+    #[test]
+    fn resolves_relative_player_js_urls() {
+        let cfg = json!({"PLAYER_JS_URL": "/s/player/abc/player_ias.vflset/en_US/base.js"});
+        assert_eq!(
+            player_js_url_from_cfg(&cfg).as_deref(),
+            Some("https://www.youtube.com/s/player/abc/player_ias.vflset/en_US/base.js")
+        );
+        let cfg = json!({"PLAYER_JS_URL": "//www.youtube.com/s/player/abc/base.js"});
+        assert_eq!(
+            player_js_url_from_cfg(&cfg).as_deref(),
+            Some("https://www.youtube.com/s/player/abc/base.js")
+        );
     }
 
     #[test]

@@ -1,11 +1,11 @@
 import { performance } from "node:perf_hooks";
-import { resolve } from "../index.js";
+import { type ResolveOptions, resolve } from "../index.js";
 
 const VIDEO = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
 const PLAYLIST = "https://www.youtube.com/playlist?list=PL63F0C78739B09958";
 const RUNS = Number(process.env.RUNS ?? 5);
 
-async function measure(label: string, input: string, options: Record<string, unknown> = {}) {
+async function measure(label: string, input: string, options: ResolveOptions = {}) {
   const times: number[] = [];
   for (let i = 0; i < RUNS; i++) {
     const start = performance.now();
@@ -13,7 +13,7 @@ async function measure(label: string, input: string, options: Record<string, unk
     times.push(Math.round(performance.now() - start));
   }
   times.sort((a, b) => a - b);
-  const median = times[Math.floor(times.length / 2)];
+  const median = times[Math.floor(times.length / 2)] ?? 0;
   console.log(`${label.padEnd(34)} median ${String(median).padStart(5)} ms  runs ${times.join(" ")}`);
 }
 

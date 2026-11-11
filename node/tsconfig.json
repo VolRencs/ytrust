@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["index.d.ts", "native.d.ts", "test/**/*.ts"]
+  "include": ["index.d.ts", "native.d.ts", "bench/**/*.ts", "test/**/*.ts"]
 }

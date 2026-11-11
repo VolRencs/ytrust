@@ -9,12 +9,24 @@
     "type": "git",
     "url": "git+https://github.com/VolRencs/ytrust.git"
   },
+  "homepage": "https://github.com/VolRencs/ytrust#readme",
+  "bugs": {
+    "url": "https://github.com/VolRencs/ytrust/issues"
+  },
+  "keywords": [
+    "youtube",
+    "downloader",
+    "yt-dlp",
+    "napi"
+  ],
   "type": "module",
   "main": "./index.js",
   "types": "./index.d.ts",
   "exports": {
     ".": {
       "types": "./index.d.ts",
+      "import": "./index.js",
+      "require": "./index.js",
       "default": "./index.js"
     },
     "./package.json": "./package.json"
@@ -22,12 +34,13 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "native.js",
+    "native.cjs",
     "native.d.ts",
     "*.node",
     "solver/*.js",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "os": [
     "linux"
@@ -39,7 +52,7 @@
     "glibc"
   ],
   "engines": {
-    "node": ">=26.0.0"
+    "node": ">=24.0.0"
   },
   "napi": {
     "binaryName": "ytrust",
@@ -48,16 +61,19 @@
     ]
   },
   "scripts": {
-    "build": "napi build --platform --profile napi --esm --strip --js native.js --dts native.d.ts",
-    "build:debug": "napi build --platform --esm --js native.js --dts native.d.ts",
+    "build": "napi build --platform --profile napi --strip --js native.cjs --dts native.d.ts",
+    "build:debug": "napi build --platform --js native.cjs --dts native.d.ts",
     "test": "node --test test/*.test.ts",
     "test:integration": "YTRUST_INTEGRATION=1 node --test test/*.test.ts",
     "bench": "node bench/resolve.ts",
     "typecheck": "tsc --noEmit",
-    "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && pnpm typecheck",
-    "prepack": "pnpm build && pnpm test && pnpm typecheck"
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && pnpm typecheck && pnpm lint && pnpm test",
+    "prepack": "pnpm build && pnpm check"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.6.6",
     "@napi-rs/cli": "^3.10.12",
     "@types/node": "^26.6.6",
     "typescript": "^7.0.2"

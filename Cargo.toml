@@ -2,7 +2,7 @@
 name = "ytrust"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.99"
 description = "Fast, modern YouTube downloader"
 repository = "https://github.com/VolRencs/ytrust"
 readme = "README.md"

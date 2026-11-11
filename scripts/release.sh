@@ -26,9 +26,10 @@ sed -i "s/^version = \".*\"/version = \"$version\"/" node/Cargo.toml
 perl -0pi -e 's/"version": "\d+\.\d+\.\d+"/"version": "'"$version"'"/' node/package.json
 cp LICENSE node/LICENSE
 cargo check >/dev/null
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+(cd node && pnpm install --frozen-lockfile && pnpm build && pnpm check)
 
 git add Cargo.toml Cargo.lock node/Cargo.toml node/package.json node/pnpm-lock.yaml node/LICENSE
 git commit -m "Release v$version"

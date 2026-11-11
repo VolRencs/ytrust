@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::youtube::{Format, VideoInfo};
 
-use crate::error::{Result, YtrustError};
+use crate::error::{ErrorCode, Result, YtrustError};
 use crate::output::{format_bytes, format_duration, format_ext};
 
 #[derive(Debug, Clone)]
@@ -184,9 +184,10 @@ impl Component {
             _ if base.chars().all(|c| c.is_ascii_digit()) => (Kind::Exact, base.clone()),
             _ if is_known_ext(&base) => (Kind::BestExt, base.clone()),
             _ => {
-                return Err(YtrustError::msg(format!(
-                    "unsupported format selector component: {raw:?}"
-                )));
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    format!("unsupported format selector component: {raw:?}"),
+                ));
             }
         };
 
@@ -213,9 +214,10 @@ fn parse_filter(raw: &str) -> Result<(&str, Filter)> {
     while let Some(start) = rest.find('[') {
         let after = &rest[start + 1..];
         let Some(end) = after.find(']') else {
-            return Err(YtrustError::msg(format!(
-                "unclosed format filter in {raw:?}"
-            )));
+            return Err(YtrustError::coded(
+                ErrorCode::InvalidInput,
+                format!("unclosed format filter in {raw:?}"),
+            ));
         };
         apply_filter(&mut filter, &after[..end])?;
         rest = &after[end + 1..];
@@ -238,16 +240,22 @@ fn apply_filter(filter: &mut Filter, expression: &str) -> Result<()> {
     } else if let Some((name, value)) = expression.split_once('~') {
         (name.trim(), "~", value.trim())
     } else {
-        return Err(YtrustError::msg(format!(
-            "unsupported format filter: [{expression}]"
-        )));
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            format!("unsupported format filter: [{expression}]"),
+        ));
     };
 
     let number = || {
         value
             .trim_end_matches(['k', 'K', 'm', 'M'])
             .parse::<u64>()
-            .map_err(|_| YtrustError::msg(format!("invalid numeric filter value: {value}")))
+            .map_err(|_| {
+                YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    format!("invalid numeric filter value: {value}"),
+                )
+            })
     };
 
     match (name, op) {
@@ -266,9 +274,10 @@ fn apply_filter(filter: &mut Filter, expression: &str) -> Result<()> {
         ("acodec", "!=") => filter.acodec_not = Some(value.to_ascii_lowercase()),
         ("acodec", "^=") => filter.acodec_prefix = Some(value.to_ascii_lowercase()),
         _ => {
-            return Err(YtrustError::msg(format!(
-                "unsupported format filter: [{expression}]"
-            )));
+            return Err(YtrustError::coded(
+                ErrorCode::InvalidInput,
+                format!("unsupported format filter: [{expression}]"),
+            ));
         }
     }
 
@@ -302,13 +311,14 @@ fn select_alternative(formats: &[Format], alternative: &str) -> Result<FormatSel
         .filter(|s| !s.is_empty());
     let first = parts
         .next()
-        .ok_or_else(|| YtrustError::msg("empty format selector"))?;
+        .ok_or_else(|| YtrustError::coded(ErrorCode::InvalidInput, "empty format selector"))?;
     let second = parts.next();
 
     if parts.next().is_some() {
-        return Err(YtrustError::msg(format!(
-            "too many components in format selector: {alternative:?}"
-        )));
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            format!("too many components in format selector: {alternative:?}"),
+        ));
     }
 
     let first = Component::parse(first)?;
@@ -474,16 +484,19 @@ fn format_matches_audio_kind(format: &Format, component: &Component) -> bool {
     }
 }
 
-/// Pick the best playable audio stream: Opus audio-only first, then any
-/// audio-only stream, then the loudest muxed stream. HLS manifests are
-/// excluded because callers cannot seek in them like a regular media URL.
+/// Pick the best playable audio stream: the default audio track first,
+/// then audio-only over muxed, then Opus, then bitrate. HLS manifests are
+/// excluded from the first pass because callers cannot seek in them like a
+/// regular media URL.
 pub fn best_audio(info: &VideoInfo) -> Option<&Format> {
     let rate = |format: &Format| format.audio_bitrate.unwrap_or(format.bitrate);
     let key = |format: &Format| {
         (
             u8::from(!format.has_video),
+            u8::from(format.audio_is_default),
             u8::from(is_opus(format)),
             rate(format),
+            u8::from(!format.url.is_empty()),
         )
     };
     info.formats
@@ -595,6 +608,92 @@ mod tests {
         let (base, filter) = parse_filter("bestvideo[height<=1080]").unwrap();
         assert_eq!(base, "bestvideo");
         assert_eq!(filter.height_lte, Some(1080));
+    }
+
+    fn format(
+        itag: u64,
+        has_video: bool,
+        has_audio: bool,
+        height: Option<u64>,
+        audio_bitrate: Option<u64>,
+    ) -> Format {
+        Format {
+            itag,
+            url: format!("https://rr1.googlevideo.com/videoplayback?itag={itag}"),
+            signature_cipher: None,
+            cipher: None,
+            container: if has_video { "mp4" } else { "webm" }.to_string(),
+            mime_type: "video/mp4".to_string(),
+            video_codec: has_video.then(|| "avc1".to_string()),
+            audio_codec: has_audio.then(|| "opus".to_string()),
+            has_video,
+            has_audio,
+            width: height.map(|height| height * 16 / 9),
+            height,
+            fps: has_video.then_some(30),
+            bitrate: 1_000_000,
+            audio_bitrate,
+            content_length: Some(1_000),
+            quality_label: None,
+            is_hls: false,
+            is_live: false,
+            audio_track_name: None,
+            audio_track_id: None,
+            audio_is_default: false,
+            user_agent: "test".to_string(),
+        }
+    }
+
+    fn info(formats: Vec<Format>) -> VideoInfo {
+        VideoInfo {
+            id: "dQw4w9WgXcQ".to_string(),
+            title: "test".to_string(),
+            uploader: String::new(),
+            channel: String::new(),
+            channel_id: String::new(),
+            webpage_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            description: String::new(),
+            duration_secs: None,
+            view_count: None,
+            upload_date: String::new(),
+            is_live: false,
+            thumbnails: Vec::new(),
+            subtitles: Vec::new(),
+            automatic_captions: Vec::new(),
+            formats,
+            hls_manifest_url: None,
+            player_js_url: None,
+        }
+    }
+
+    #[test]
+    fn falls_back_to_muxed_audio() {
+        let info = info(vec![format(18, true, true, Some(360), None)]);
+        let selection = select(&info, "bestaudio/best").unwrap();
+        assert!(!selection.needs_merge());
+        assert_eq!(selection.single().unwrap().itag, 18);
+    }
+
+    #[test]
+    fn selects_separate_streams() {
+        let info = info(vec![
+            format(137, true, false, Some(1080), None),
+            format(251, false, true, None, Some(160_000)),
+        ]);
+        let selection = select(&info, "bestvideo+bestaudio").unwrap();
+        assert!(selection.needs_merge());
+        assert_eq!(selection.video.unwrap().itag, 137);
+        assert_eq!(selection.audio.unwrap().itag, 251);
+    }
+
+    #[test]
+    fn selects_exact_itag() {
+        let info = info(vec![
+            format(137, true, false, Some(1080), None),
+            format(251, false, true, None, Some(160_000)),
+        ]);
+        let selection = select(&info, "251").unwrap();
+        assert_eq!(selection.single().unwrap().itag, 251);
     }
 
     #[test]

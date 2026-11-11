@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import test from "node:test";
-import { probe, resolve, resolveAudio, version, errorCode, YtrustError } from "../index.js";
+import { errorCode, probe, resolve, resolveAudio, version, YtrustError } from "../index.js";
 
 test("probe and version", () => {
   assert.equal(probe(), version());
@@ -17,7 +18,20 @@ test("errorCode classifies common failures", () => {
   assert.equal(errorCode("invalid URL: "), "INVALID_INPUT");
   assert.equal(errorCode("YouTube: This video is unavailable"), "UNAVAILABLE");
   assert.equal(errorCode("YouTube request timed out"), "TIMEOUT");
+  assert.equal(errorCode("format not available: 137"), "FORMAT_NOT_FOUND");
+  assert.equal(errorCode("ffmpeg was not found"), "FFMPEG");
+  assert.equal(errorCode("I/O: No such file or directory"), "IO");
+  assert.equal(errorCode("challenge solving failed"), "CHALLENGE_FAILED");
+  assert.equal(errorCode("JSON: expected value"), "INVALID_RESPONSE");
   assert.equal(errorCode("something else"), "UNKNOWN");
+});
+
+test("CommonJS require() exposes the same API", () => {
+  const require = createRequire(import.meta.url);
+  const loaded = require("../index.js");
+  assert.equal(loaded.version(), version());
+  assert.equal(typeof loaded.resolve, "function");
+  assert.equal(typeof loaded.resolveAudio, "function");
 });
 
 test("resolve wraps native errors", async () => {
@@ -32,55 +46,75 @@ test("resolve wraps native errors", async () => {
   );
 });
 
-test(
-  "resolve single video",
-  { skip: !process.env.YTRUST_INTEGRATION },
-  async () => {
-    const result = await resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
-    assert.equal(result._type, "video");
-    assert.equal(result.id, "dQw4w9WgXcQ");
-    assert.ok(Array.isArray(result.formats));
-    assert.ok(result.best_audio);
-    assert.equal(typeof result.best_audio.http_headers["User-Agent"], "string");
-    assert.equal(result.best_audio.http_headers.Referer, "https://www.youtube.com/");
-    assert.equal(typeof result.best_audio.expires_at, "number");
-  },
-);
+test("resolve maps missing cookies files to COOKIES", async () => {
+  await assert.rejects(
+    () =>
+      resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", {
+        cookiesPath: "/definitely/not/a/cookies.txt",
+      }),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "COOKIES");
+      assert.match(error.message, /failed to load cookies file/);
+      assert.doesNotMatch(error.message, /^\[/);
+      return true;
+    },
+  );
+});
 
-test(
-  "resolveAudio single video",
-  { skip: !process.env.YTRUST_INTEGRATION },
-  async () => {
-    const audio = await resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
-    assert.equal(audio.id, "dQw4w9WgXcQ");
-    assert.match(audio.url, /^https:\/\/.+googlevideo\.com\//);
-    assert.match(audio.acodec, /^opus/);
-    assert.equal(typeof audio.http_headers["User-Agent"], "string");
-    assert.equal(typeof audio.expires_at, "number");
-  },
-);
+test("resolve maps missing playlist list to INVALID_INPUT", async () => {
+  await assert.rejects(
+    () => resolve("https://www.youtube.com/playlist"),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "INVALID_INPUT");
+      return true;
+    },
+  );
+});
 
-test(
-  "resolveAudio solves signatureCipher formats",
-  { skip: !process.env.YTRUST_INTEGRATION },
-  async () => {
-    const audio = await resolveAudio("https://www.youtube.com/watch?v=0t9dU9iNyYo", {
-      cookiesPath: process.env.YTRUST_COOKIES,
-    });
-    assert.match(audio.url, /^https:\/\/.+googlevideo\.com\//);
-    assert.ok(audio.url.includes("sig="));
-    assert.ok(new URL(audio.url).searchParams.has("n"));
-  },
-);
+test("resolve validates options before calling native code", async () => {
+  await assert.rejects(
+    () => resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", { timeout: -1 }),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "INVALID_INPUT");
+      return true;
+    },
+  );
+});
 
-test(
-  "resolveAudio ignores an attached playlist",
-  { skip: !process.env.YTRUST_INTEGRATION },
-  async () => {
-    const audio = await resolveAudio(
-      "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL63F0C78739B09958",
-    );
-    assert.equal(audio.id, "dQw4w9WgXcQ");
-    assert.match(audio.acodec, /^opus/);
-  },
-);
+test("resolve single video", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
+  const result = await resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  assert.equal(result._type, "video");
+  assert.equal(result.id, "dQw4w9WgXcQ");
+  assert.ok(Array.isArray(result.formats));
+  assert.ok(result.best_audio);
+  assert.equal(typeof result.best_audio.http_headers["User-Agent"], "string");
+  assert.equal(result.best_audio.http_headers.Referer, "https://www.youtube.com/");
+  assert.equal(typeof result.best_audio.expires_at, "number");
+});
+
+test("resolveAudio single video", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
+  const audio = await resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  assert.equal(audio.id, "dQw4w9WgXcQ");
+  assert.match(audio.url, /^https:\/\/.+googlevideo\.com\//);
+  assert.match(audio.acodec, /^opus/);
+  assert.equal(typeof audio.http_headers["User-Agent"], "string");
+  assert.equal(typeof audio.expires_at, "number");
+});
+
+test("resolveAudio solves signatureCipher formats", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
+  const audio = await resolveAudio("https://www.youtube.com/watch?v=0t9dU9iNyYo", {
+    cookiesPath: process.env.YTRUST_COOKIES,
+  });
+  assert.match(audio.url, /^https:\/\/.+googlevideo\.com\//);
+  assert.ok(audio.url.includes("sig="));
+  assert.ok(new URL(audio.url).searchParams.has("n"));
+});
+
+test("resolveAudio ignores an attached playlist", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
+  const audio = await resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL63F0C78739B09958");
+  assert.equal(audio.id, "dQw4w9WgXcQ");
+  assert.match(audio.acodec, /^opus/);
+});

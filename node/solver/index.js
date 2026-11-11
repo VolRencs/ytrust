@@ -7,11 +7,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const lib = readFileSync(join(here, "lib.min.js"), "utf8");
 const core = readFileSync(join(here, "core.min.js"), "utf8");
 
+const SOLVE_TIMEOUT_MS = 15_000;
+
 let context;
 
 function solverContext() {
   if (context) return context;
-  context = vm.createContext({ console });
+  context = vm.createContext({});
   vm.runInContext(lib, context, { filename: "yt.solver.lib.js" });
   vm.runInContext("Object.assign(globalThis, lib);", context);
   vm.runInContext(core, context, { filename: "yt.solver.core.js" });
@@ -21,15 +23,33 @@ function solverContext() {
 /**
  * Solve YouTube `n`/`sig` challenges with yt-dlp's EJS bundle.
  * `requests` is [{ type: "n" | "sig", challenges: string[] }].
+ *
+ * The player source is passed as a VM global instead of being interpolated
+ * into a script string, so remote player code cannot break out of a template
+ * literal and the VM timeout still applies.
  */
 export function solve(player, requests) {
-  const input = JSON.stringify({
+  const ctx = solverContext();
+  ctx.__ytrust_input = JSON.stringify({
     type: "player",
     player,
     requests,
     output_preprocessed: false,
   });
-  const output = vm.runInContext(`jsc(${input})`, solverContext(), { timeout: 60_000 });
-  if (output.type === "error") throw new Error(output.error);
+  let output;
+  try {
+    output = vm.runInContext("jsc(__ytrust_input)", ctx, {
+      filename: "yt.solver.run.js",
+      timeout: SOLVE_TIMEOUT_MS,
+    });
+  } finally {
+    delete ctx.__ytrust_input;
+  }
+  if (!output || typeof output !== "object") {
+    throw new Error("challenge solver returned an invalid result");
+  }
+  if (output.type === "error") {
+    throw new Error(String(output.error ?? "challenge solver failed"));
+  }
   return output;
 }

@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.0
+
+### Added
+
+- `--download-sections` now supports one time range for file downloads and
+  stdout, including `HH:MM:SS`, `inf` and `*` prefixes.
+- Stable structured error codes shared by Rust and the Node module:
+  `FORMAT_NOT_FOUND`, `FFMPEG`, `IO`, `CHALLENGE_FAILED` and the existing codes.
+- Node challenge solving runs in a bounded worker pool and player JS is fetched
+  through the native proxy/timeout/cookies configuration.
+- `--dump-json` now prints one object per playlist/search entry; `-J` still
+  prints one playlist object per URL.
+
+### Changed
+
+- Shared resolve pipeline between the CLI and Node addon.
+- Shared HTTP client cache, typed Innertube responses and request read timeouts.
+- Search pagination now honours `playlistLimit` and fetches continuations.
+- `-x` honours `-f`, falls back to muxed audio and `--audio-format` implies
+  audio extraction.
+- HLS and section downloads pass User-Agent/Referer/Cookie headers to ffmpeg.
+- YouTube cookies are no longer sent to googlevideo/i.ytimg hosts.
+- Node.js 24+ and both ESM/CommonJS are supported; the addon is built against
+  glibc 2.35 for modern Linux distributions.
+- `best_audio` prefers the default audio track and playable URLs.
+- CLI `--quiet` hides progress and informational status; `--simulate` no longer
+  writes thumbnails or subtitles.
+- Filenames are truncated on UTF-8 boundaries; Windows reserved names are
+  prefixed and `--restrict-filenames` replaces spaces.
+- Download retries/resume validate sizes, work on Windows and do not silently
+  accept stale partial files.
+
+### Fixed
+
+- Ciphered formats from the regular player clients now get `player_js_url`, so
+  the Node solver can rewrite `sig`/`n` challenges for the main resolve path.
+- `resolveAudio` never returns an empty URL; it falls back to a playable audio
+  format or throws `CHALLENGE_FAILED`.
+- Open-ended playlist ranges beyond the playlist length no longer fail.
+- `parse_item_ranges` and playlist/search item filtering are consistent between
+  CLI downloads and JSON output.
+- `original_url` now contains the caller's URL for videos.
+- Missing cookies files are reported as `COOKIES` instead of `UNKNOWN`.
+- `--write-thumbnail` cannot overwrite the media file; manual and automatic
+  subtitles no longer overwrite each other.
+- `--socket-timeout`/`--timeout` are applied to response bodies as well.
+- Redacted signed URLs in logs.
+- `--merge-output-format` and `--audio-format` are validated before downloading.
+- `--fragment-retries` is honoured as the download retry count.
+
 ## 0.3.0
 
 - Ciphered formats (`signatureCipher`/`cipher`) are no longer discarded.
@@ -11,8 +61,6 @@
 - Unified cookie header construction; the full YouTube cookie set is used for
   API/player requests.
 - Added JSON and solver tests for ciphered formats.
-
-## 0.2.0
 
 ## 0.2.0
 
@@ -28,8 +76,6 @@
   challenge URLs before returning formats or `resolveAudio`.
 - Cookie headers now include the full YouTube cookie set instead of only the
   essential names, matching yt-dlp.
-
-## 0.1.3
 
 ## 0.1.3
 

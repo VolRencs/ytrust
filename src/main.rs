@@ -7,18 +7,33 @@ use clap::Parser;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use ytrust::api::{self, ResolveOptions, Resolved};
+use ytrust::constants::DEFAULT_FORMAT;
 use ytrust::cookies;
-use ytrust::download::{DownloadConfig, Downloader};
-use ytrust::error::{Result, YtrustError};
+use ytrust::download::{DownloadConfig, DownloadRange, Downloader, audio_codec, parse_range};
+use ytrust::error::{ErrorCode, Result, YtrustError};
 use ytrust::format::{FormatSelection, print_formats, select};
+use ytrust::http::RequestConfig;
 use ytrust::json;
 use ytrust::output::{TemplateContext, format_duration, format_ext, merged_ext, render_path};
-use ytrust::youtube::{
-    self, RequestConfig, Target, classify, fetch_inline_playlist, fetch_playlist, fetch_search,
-    fetch_video, filter_playlist_entries, max_playlist_item, parse_item_ranges,
-};
+use ytrust::youtube::{self, Format, VideoInfo, fetch_video};
 
 use crate::cli::Cli;
+
+macro_rules! status {
+    ($cli:expr, $($arg:tt)*) => {
+        if !$cli.quiet {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonMode {
+    None,
+    PerVideo,
+    Single,
+}
 
 #[tokio::main]
 async fn main() {
@@ -36,7 +51,14 @@ async fn run(cli: Cli) -> Result<()> {
     if cookies.header.is_some() {
         debug!("loaded cookies");
     }
+    if let Some(audio_format) = &cli.audio_format {
+        audio_codec(audio_format.trim_start_matches('.'))?;
+    }
+    validate_merge_format(cli.merge_output_format.as_deref())?;
 
+    if cli.flat_playlist {
+        debug!("--flat-playlist is the default behavior; playlists are always resolved flat");
+    }
     let timeout = cli.socket_timeout.unwrap_or(cli.timeout);
     let request_config = RequestConfig {
         proxy: cli.proxy.clone(),
@@ -46,94 +68,49 @@ async fn run(cli: Cli) -> Result<()> {
         sapisid3p: cookies.sapisid3p.clone(),
         timeout,
     };
+    let retries = cli.fragment_retries.unwrap_or(cli.retries);
     let downloader = Downloader::new(DownloadConfig {
-        retries: cli.retries,
+        retries,
         timeout,
         proxy: cli.proxy.clone(),
         cookies: cookies.header,
         ffmpeg: cli.ffmpeg_location.clone(),
         force_overwrites: cli.force_overwrites,
+        quiet: cli.quiet,
     })?;
-    let ffmpeg_available = downloader.ffmpeg_available().await;
 
-    let dump_json = cli.dump_json || cli.dump_single_json;
+    let json_mode = if cli.dump_single_json {
+        JsonMode::Single
+    } else if cli.dump_json {
+        JsonMode::PerVideo
+    } else {
+        JsonMode::None
+    };
     let simulate = cli.simulate || cli.skip_download;
+    let section = parse_range(cli.download_sections.as_deref().unwrap_or_default())?;
+    let options = ResolveOptions {
+        no_playlist: cli.no_playlist,
+        playlist_limit: cli.playlist_limit,
+        playlist_items: cli.playlist_items.clone(),
+    };
+
     let context = RunContext {
         cli: &cli,
         request_config: &request_config,
         downloader: &downloader,
-        ffmpeg_available,
+        json_mode,
         simulate,
-        dump_json,
+        section,
     };
 
     for raw_url in &cli.urls {
-        let target = classify(raw_url, cli.no_playlist)?;
-        match target {
-            Target::Video { id } => {
-                process_video(&id, None, &context).await?;
+        let resolved = api::resolve(raw_url, &request_config, &options).await?;
+        match resolved {
+            Resolved::Video { info, original_url } => {
+                process_info(*info, &original_url, None, &context).await?;
             }
-            Target::Playlist { id, video_id } => {
-                debug!("fetching playlist {id}");
-                let fetch_limit = max_playlist_item(&cli.playlist_items)
-                    .map(|limit| (limit as u64).min(cli.playlist_limit))
-                    .unwrap_or(cli.playlist_limit);
-                let mut playlist = match video_id {
-                    Some(video_id) => {
-                        fetch_inline_playlist(&video_id, &id, &request_config, fetch_limit).await?
-                    }
-                    None => fetch_playlist(&id, &request_config, fetch_limit).await?,
-                };
-                if dump_json {
-                    filter_playlist_entries(&mut playlist, &cli.playlist_items)?;
-                    println!(
-                        "{}",
-                        serde_json::to_string(&json::playlist_json(&playlist, raw_url))?
-                    );
-                    continue;
-                }
-                let selected = parse_item_ranges(&cli.playlist_items, playlist.entries.len())?;
-                if selected.is_empty() {
-                    warn!("playlist {:?} has no matching entries", playlist.title);
-                    continue;
-                }
-
-                info!(
-                    "playlist {:?} ({}): downloading {} of {} entries",
-                    playlist.title,
-                    playlist.id,
-                    selected.len(),
-                    playlist.entries.len()
-                );
-
-                for index in selected {
-                    let Some(entry) = playlist.entries.get(index - 1) else {
-                        continue;
-                    };
-                    info!(
-                        "[{}/{}] {}",
-                        entry.index,
-                        playlist.entries.len(),
-                        entry.title
-                    );
-                    let playlist_context = (playlist.title.clone(), entry.index);
-                    process_video(&entry.id, Some(playlist_context), &context).await?;
-                }
-            }
-            Target::Search { query, limit } => {
-                let mut playlist = fetch_search(&query, limit, &request_config).await?;
-                if dump_json {
-                    filter_playlist_entries(&mut playlist, &cli.playlist_items)?;
-                    println!(
-                        "{}",
-                        serde_json::to_string(&json::playlist_json(&playlist, raw_url))?
-                    );
-                    continue;
-                }
-                for entry in playlist.entries.iter().take(limit as usize) {
-                    let playlist_context = (playlist.title.clone(), entry.index);
-                    process_video(&entry.id, Some(playlist_context), &context).await?;
-                }
+            Resolved::Playlist { info, original_url } => {
+                process_playlist(info, &original_url, &context).await?;
             }
         }
     }
@@ -145,37 +122,93 @@ struct RunContext<'a> {
     cli: &'a Cli,
     request_config: &'a RequestConfig,
     downloader: &'a Downloader,
-    ffmpeg_available: bool,
+    json_mode: JsonMode,
     simulate: bool,
-    dump_json: bool,
+    section: Option<DownloadRange>,
 }
 
-async fn process_video(
+async fn process_playlist(
+    playlist: youtube::PlaylistInfo,
+    original_url: &str,
+    context: &RunContext<'_>,
+) -> Result<()> {
+    if context.json_mode == JsonMode::Single {
+        println!(
+            "{}",
+            serde_json::to_string(&json::playlist_json(&playlist, original_url))?
+        );
+        return Ok(());
+    }
+
+    if context.json_mode == JsonMode::PerVideo {
+        for entry in &playlist.entries {
+            let original = format!("https://www.youtube.com/watch?v={}", entry.id);
+            let playlist_context = (playlist.title.clone(), entry.index);
+            process_video_id(&entry.id, &original, Some(playlist_context), context).await?;
+        }
+        return Ok(());
+    }
+
+    if playlist.entries.is_empty() {
+        warn!("playlist {:?} has no matching entries", playlist.title);
+        return Ok(());
+    }
+
+    info!(
+        "playlist {:?} ({}): downloading {} entries",
+        playlist.title,
+        playlist.id,
+        playlist.entries.len()
+    );
+
+    for (position, entry) in playlist.entries.iter().enumerate() {
+        info!(
+            "[{}/{}] {}",
+            position + 1,
+            playlist.entries.len(),
+            entry.title
+        );
+        let original = format!("https://www.youtube.com/watch?v={}", entry.id);
+        let playlist_context = (playlist.title.clone(), entry.index);
+        process_video_id(&entry.id, &original, Some(playlist_context), context).await?;
+    }
+    Ok(())
+}
+
+async fn process_video_id(
     video_id: &str,
+    original_url: &str,
+    playlist: Option<(String, usize)>,
+    context: &RunContext<'_>,
+) -> Result<()> {
+    let info = fetch_video(video_id, context.request_config).await?;
+    process_info(info, original_url, playlist, context).await
+}
+
+async fn process_info(
+    mut info: VideoInfo,
+    original_url: &str,
     playlist: Option<(String, usize)>,
     context: &RunContext<'_>,
 ) -> Result<()> {
     let cli = context.cli;
     let downloader = context.downloader;
-    let simulate = context.simulate;
-    let dump_json = context.dump_json;
-    let mut info = fetch_video(video_id, context.request_config).await?;
 
     if cli.list_audio_tracks {
         print_audio_tracks(&info);
         return Ok(());
     }
 
-    if dump_json {
-        println!(
-            "{}",
-            serde_json::to_string(&json::video_json(&info, &info.webpage_url))?
-        );
-        return Ok(());
-    }
-
     if let Some(track) = &cli.audio_track {
         apply_audio_track(&mut info, track)?;
+    }
+
+    if context.json_mode != JsonMode::None {
+        println!(
+            "{}",
+            serde_json::to_string(&json::video_json(&info, original_url))?
+        );
+        return Ok(());
     }
 
     if cli.list_formats {
@@ -184,59 +217,98 @@ async fn process_video(
         return Ok(());
     }
 
-    write_extras(&info, playlist.as_ref(), cli, downloader).await?;
-
-    if simulate {
-        eprintln!("simulate: {} [{}]", info.title, info.id);
+    if context.simulate {
+        status!(cli, "simulate: {} [{}]", info.title, info.id);
         return Ok(());
     }
 
-    let expression = if cli.extract_audio {
-        "bestaudio"
+    let expression = if context.extract_audio() {
+        cli.format.as_deref().unwrap_or("bestaudio/best")
     } else {
-        cli.format.as_str()
+        cli.format.as_deref().unwrap_or(DEFAULT_FORMAT)
     };
-
     let selection = select(&info, expression)?;
 
-    if selection.needs_merge() && !context.ffmpeg_available {
-        return Err(YtrustError::msg(
+    if context.extract_audio()
+        && selection.audio.is_none()
+        && selection
+            .video
+            .as_ref()
+            .is_some_and(|format| !format.has_audio)
+    {
+        return Err(YtrustError::coded(
+            ErrorCode::NoAudio,
+            format!("selected format has no audio for {}", info.id),
+        ));
+    }
+
+    if selection.needs_merge() && !downloader.ffmpeg_available().await {
+        return Err(YtrustError::coded(
+            ErrorCode::Ffmpeg,
             "ffmpeg is required to merge separate video and audio streams; install ffmpeg or choose a single format with -f",
         ));
     }
 
-    if cli.extract_audio && selection.audio.is_none() {
-        return Err(YtrustError::msg(format!(
-            "no audio-only format found for {}",
-            info.id
-        )));
-    }
-
     if cli.output == "-" {
+        if context.extract_audio() && cli.audio_format.is_some() {
+            return Err(YtrustError::coded(
+                ErrorCode::InvalidInput,
+                "audio conversion to stdout is not supported; write to a file instead",
+            ));
+        }
         let format = selection.single().ok_or_else(|| {
-            YtrustError::msg("streaming merged video+audio to stdout is not supported")
+            YtrustError::coded(
+                ErrorCode::InvalidInput,
+                "streaming merged video+audio to stdout is not supported",
+            )
         })?;
-        let offset = parse_section_start(cli.download_sections.as_deref())?;
-        return downloader.stream_to_stdout(format, offset, &info.id).await;
-    }
-
-    let duration_secs = info.duration_secs;
-
-    if cli.extract_audio {
-        return download_audio_only(&info, &selection, playlist, cli, downloader, duration_secs)
+        return downloader
+            .stream_to_stdout(format, context.section, &info.id)
             .await;
     }
 
-    download_video(&info, &selection, playlist, cli, downloader, duration_secs).await
+    write_extras(&info, playlist.as_ref(), cli, downloader).await?;
+
+    let duration_secs = info.duration_secs;
+    if context.extract_audio() {
+        return download_audio_only(
+            &info,
+            &selection,
+            playlist,
+            cli,
+            downloader,
+            duration_secs,
+            context.section,
+        )
+        .await;
+    }
+
+    download_video(
+        &info,
+        &selection,
+        playlist,
+        cli,
+        downloader,
+        duration_secs,
+        context.section,
+    )
+    .await
+}
+
+impl RunContext<'_> {
+    fn extract_audio(&self) -> bool {
+        self.cli.extract_audio || self.cli.audio_format.is_some()
+    }
 }
 
 async fn download_video(
-    info: &youtube::VideoInfo,
+    info: &VideoInfo,
     selection: &FormatSelection,
     playlist: Option<(String, usize)>,
     cli: &Cli,
     downloader: &Downloader,
     duration_secs: Option<u64>,
+    section: Option<DownloadRange>,
 ) -> Result<()> {
     let (ext, context_format) = if selection.needs_merge() {
         let video = selection.video.as_ref().expect("video");
@@ -250,7 +322,7 @@ async fn download_video(
     } else {
         let format = selection
             .single()
-            .ok_or_else(|| YtrustError::msg("no format selected"))?;
+            .ok_or_else(|| YtrustError::coded(ErrorCode::InvalidInput, "no format selected"))?;
         (format_ext(format).to_string(), format.clone())
     };
 
@@ -266,13 +338,14 @@ async fn download_video(
     )?;
 
     if destination == Path::new("-") {
-        return Err(YtrustError::msg(
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
             "stdout output is not supported for video downloads yet",
         ));
     }
 
     if destination.exists() && !cli.force_overwrites {
-        eprintln!("already downloaded: {}", destination.to_string_lossy());
+        status!(cli, "already downloaded: {}", destination.to_string_lossy());
         return Ok(());
     }
 
@@ -282,20 +355,25 @@ async fn download_video(
         .unwrap_or(&info.id)
         .to_string();
 
-    debug!("selected format: {selection:?}");
+    debug!(
+        "selected formats: video={:?}, audio={:?}",
+        selection.video.as_ref().map(|format| format.itag),
+        selection.audio.as_ref().map(|format| format.itag)
+    );
 
     if !selection.needs_merge() {
         let format = selection
             .single()
-            .ok_or_else(|| YtrustError::msg("no format selected"))?;
-        eprintln!(
+            .ok_or_else(|| YtrustError::coded(ErrorCode::InvalidInput, "no format selected"))?;
+        status!(
+            cli,
             "downloading: {} [{}] ({})",
             info.title,
             info.id,
             format_duration(duration_secs.unwrap_or(0))
         );
         return downloader
-            .download_format(format, &destination, &label, duration_secs)
+            .download_format(format, &destination, &label, duration_secs, section)
             .await;
     }
 
@@ -308,7 +386,8 @@ async fn download_video(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    eprintln!(
+    status!(
+        cli,
         "downloading: {} [{}] ({} + {})",
         info.title,
         info.id,
@@ -319,9 +398,9 @@ async fn download_video(
     let video_label = format!("{} [video]", label);
     let audio_label = format!("{} [audio]", label);
     let video_download =
-        downloader.download_format(video, &video_path, &video_label, duration_secs);
+        downloader.download_format(video, &video_path, &video_label, duration_secs, section);
     let audio_download =
-        downloader.download_format(audio, &audio_path, &audio_label, duration_secs);
+        downloader.download_format(audio, &audio_path, &audio_label, duration_secs, section);
 
     let (video_result, audio_result) = tokio::join!(video_download, audio_download);
     video_result?;
@@ -343,26 +422,30 @@ async fn download_video(
 }
 
 async fn download_audio_only(
-    info: &youtube::VideoInfo,
+    info: &VideoInfo,
     selection: &FormatSelection,
     playlist: Option<(String, usize)>,
     cli: &Cli,
     downloader: &Downloader,
     duration_secs: Option<u64>,
+    section: Option<DownloadRange>,
 ) -> Result<()> {
     let audio = selection
         .audio
         .as_ref()
         .or(selection.video.as_ref())
-        .ok_or_else(|| YtrustError::msg("no audio format selected"))?;
+        .ok_or_else(|| YtrustError::coded(ErrorCode::NoAudio, "no audio format selected"))?;
 
     let source_ext = format_ext(audio);
-    let target_ext = cli
-        .audio_format
-        .as_deref()
-        .unwrap_or(source_ext)
-        .trim_start_matches('.')
-        .to_string();
+    let extracted = selection.audio.is_none();
+    let target_ext = if let Some(audio_format) = cli.audio_format.as_deref() {
+        audio_format.trim_start_matches('.').to_ascii_lowercase()
+    } else if extracted {
+        default_audio_ext(audio).to_string()
+    } else {
+        source_ext.to_string()
+    };
+    let convert = extracted || (cli.audio_format.is_some() && target_ext != source_ext);
 
     let mut context = TemplateContext::from_info(info, &target_ext).with_format(audio);
     if let Some((name, index)) = &playlist {
@@ -376,13 +459,14 @@ async fn download_audio_only(
     )?;
 
     if destination == Path::new("-") {
-        return Err(YtrustError::msg(
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
             "stdout output is not supported for audio downloads yet",
         ));
     }
 
     if destination.exists() && !cli.force_overwrites {
-        eprintln!("already downloaded: {}", destination.to_string_lossy());
+        status!(cli, "already downloaded: {}", destination.to_string_lossy());
         return Ok(());
     }
 
@@ -392,12 +476,16 @@ async fn download_audio_only(
         .unwrap_or(&info.id)
         .to_string();
 
-    eprintln!("downloading audio: {} [{}]", info.title, info.id);
+    status!(cli, "downloading audio: {} [{}]", info.title, info.id);
 
-    if cli.audio_format.is_none() {
+    if !convert {
         return downloader
-            .download_format(audio, &destination, &label, duration_secs)
+            .download_format(audio, &destination, &label, duration_secs, section)
             .await;
+    }
+
+    if !downloader.ffmpeg_available().await {
+        return Err(YtrustError::FfmpegMissing);
     }
 
     let source_path = intermediate_path(&destination, "source", audio.itag, source_ext);
@@ -407,6 +495,7 @@ async fn download_audio_only(
             &source_path,
             &format!("{label} [audio]"),
             duration_secs,
+            section,
         )
         .await?;
 
@@ -423,7 +512,7 @@ async fn download_audio_only(
 }
 
 async fn write_extras(
-    info: &youtube::VideoInfo,
+    info: &VideoInfo,
     playlist: Option<&(String, usize)>,
     cli: &Cli,
     downloader: &Downloader,
@@ -439,21 +528,22 @@ async fn write_extras(
     }
 
     if cli.write_all_thumbnails {
+        let mut used = BTreeSet::new();
         for (index, thumb) in info.thumbnails.iter().enumerate() {
             let ext = thumbnail_ext(&thumb.url);
             let base = render_path(
                 &cli.output,
-                &TemplateContext {
-                    ext: ext.to_string(),
-                    ..ctx.clone()
-                },
+                &ctx.clone().with_ext(ext),
                 cli.output_dir.as_deref(),
                 cli.restrict_filenames,
             )?;
-            let suffix = match (thumb.width, thumb.height) {
+            let mut suffix = match (thumb.width, thumb.height) {
                 (Some(width), Some(height)) => format!("{width}x{height}"),
                 _ => index.to_string(),
             };
+            if !used.insert(suffix.clone()) {
+                suffix.push_str(&format!(".{index}"));
+            }
             let destination = append_to_stem(&base, &suffix, ext);
             downloader
                 .download_url(&thumb.url, &destination, &destination.to_string_lossy())
@@ -463,15 +553,13 @@ async fn write_extras(
         && let Some(thumb) = info.thumbnails.last()
     {
         let ext = thumbnail_ext(&thumb.url);
-        let destination = render_path(
+        let base = render_path(
             &cli.output,
-            &TemplateContext {
-                ext: ext.to_string(),
-                ..ctx.clone()
-            },
+            &ctx.clone().with_ext(ext),
             cli.output_dir.as_deref(),
             cli.restrict_filenames,
         )?;
+        let destination = ensure_extension(&base, ext);
         downloader
             .download_url(&thumb.url, &destination, &destination.to_string_lossy())
             .await?;
@@ -479,10 +567,10 @@ async fn write_extras(
 
     let mut tracks = Vec::new();
     if cli.write_subs {
-        tracks.extend(info.subtitles.iter());
+        tracks.extend(info.subtitles.iter().map(|track| (track, false)));
     }
     if cli.write_auto_subs {
-        tracks.extend(info.automatic_captions.iter());
+        tracks.extend(info.automatic_captions.iter().map(|track| (track, true)));
     }
     if tracks.is_empty() {
         return Ok(());
@@ -490,10 +578,14 @@ async fn write_extras(
 
     let format = cli.sub_format.to_ascii_lowercase();
     if format != "vtt" && format != "srt" {
-        return Err(YtrustError::msg("--sub-format supports vtt or srt"));
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            "--sub-format supports vtt or srt",
+        ));
     }
 
-    for track in tracks {
+    let mut used = std::collections::BTreeMap::new();
+    for (track, is_auto) in tracks {
         if !subtitle_language_selected(&cli.sub_langs, &track.language) {
             continue;
         }
@@ -506,21 +598,60 @@ async fn write_extras(
         };
         let base = render_path(
             &cli.output,
-            &TemplateContext {
-                ext: format.clone(),
-                ..ctx.clone()
-            },
+            &ctx.clone().with_ext(format.clone()),
             cli.output_dir.as_deref(),
             cli.restrict_filenames,
         )?;
-        let destination = append_to_stem(&base, &track.language, &format);
+        let mut suffix = track.language.clone();
+        if is_auto {
+            suffix.push_str(".auto");
+        }
+        let count = used.entry(suffix.clone()).or_insert(0usize);
+        *count += 1;
+        if *count > 1 {
+            suffix.push_str(&format!(".{}", *count));
+        }
+        let destination = append_to_stem(&base, &suffix, &format);
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(&destination, body).await?;
-        eprintln!("subtitle: {}", destination.to_string_lossy());
+        status!(cli, "subtitle: {}", destination.to_string_lossy());
     }
 
+    Ok(())
+}
+
+fn default_audio_ext(format: &Format) -> &'static str {
+    let codec = format
+        .audio_codec
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if codec.starts_with("opus") {
+        "opus"
+    } else if codec.starts_with("mp4a") || codec.starts_with("aac") {
+        "m4a"
+    } else if codec.starts_with("vorbis") {
+        "ogg"
+    } else if codec.starts_with("flac") {
+        "flac"
+    } else {
+        "m4a"
+    }
+}
+
+fn validate_merge_format(value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let value = value.trim_start_matches('.').to_ascii_lowercase();
+    if !matches!(value.as_str(), "mp4" | "mkv" | "webm") {
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            format!("--merge-output-format supports mp4, mkv or webm, got {value}"),
+        ));
+    }
     Ok(())
 }
 
@@ -538,6 +669,17 @@ fn thumbnail_ext(url: &str) -> &'static str {
     }
 }
 
+fn ensure_extension(path: &Path, ext: &str) -> PathBuf {
+    if path
+        .extension()
+        .is_some_and(|existing| existing.eq_ignore_ascii_case(ext))
+    {
+        path.to_path_buf()
+    } else {
+        path.with_extension(ext)
+    }
+}
+
 fn append_to_stem(path: &Path, suffix: &str, ext: &str) -> PathBuf {
     let stem = path
         .file_stem()
@@ -551,12 +693,15 @@ fn subtitle_language_selected(selection: &str, language: &str) -> bool {
     if selection.eq_ignore_ascii_case("all") {
         return true;
     }
+    let language = language.to_ascii_lowercase();
     selection.split(',').map(str::trim).any(|item| {
-        !item.is_empty()
-            && (language.eq_ignore_ascii_case(item)
-                || language
-                    .to_ascii_lowercase()
-                    .starts_with(&format!("{}-", item.to_ascii_lowercase())))
+        if item.is_empty() {
+            return false;
+        }
+        let item = item.to_ascii_lowercase();
+        language == item
+            || language.starts_with(&format!("{item}-"))
+            || item.starts_with(&format!("{language}-"))
     })
 }
 
@@ -585,7 +730,7 @@ fn vtt_to_srt(input: &str) -> String {
         output.push_str(&format!("{index}\n"));
         for (line_index, line) in lines.iter().enumerate() {
             if line_index == 0 {
-                output.push_str(&line.replace('.', ","));
+                output.push_str(&normalize_vtt_timestamp(line));
             } else {
                 output.push_str(line);
             }
@@ -622,7 +767,19 @@ fn vtt_to_srt(input: &str) -> String {
     output
 }
 
-fn print_audio_tracks(info: &youtube::VideoInfo) {
+fn normalize_vtt_timestamp(line: &str) -> String {
+    let Some((start, rest)) = line.split_once("-->") else {
+        return line.replace('.', ",");
+    };
+    let end = rest.split_whitespace().next().unwrap_or(rest);
+    format!(
+        "{} --> {}",
+        start.trim().replace('.', ","),
+        end.replace('.', ",")
+    )
+}
+
+fn print_audio_tracks(info: &VideoInfo) {
     let mut seen = BTreeSet::new();
     for format in &info.formats {
         if !format.has_audio || format.has_video {
@@ -649,9 +806,9 @@ fn print_audio_tracks(info: &youtube::VideoInfo) {
     }
 }
 
-fn apply_audio_track(info: &mut youtube::VideoInfo, requested: &str) -> Result<()> {
+fn apply_audio_track(info: &mut VideoInfo, requested: &str) -> Result<()> {
     let requested = requested.trim();
-    let matches = |format: &youtube::Format| {
+    let matches = |format: &Format| {
         if requested.eq_ignore_ascii_case("default") {
             return format.audio_is_default;
         }
@@ -670,9 +827,10 @@ fn apply_audio_track(info: &mut youtube::VideoInfo, requested: &str) -> Result<(
         .iter()
         .any(|format| format.has_audio && !format.has_video && matches(format))
     {
-        return Err(YtrustError::msg(format!(
-            "audio track {requested:?} was not found; use --list-audio-tracks"
-        )));
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            format!("audio track {requested:?} was not found; use --list-audio-tracks"),
+        ));
     }
 
     info.formats
@@ -689,28 +847,11 @@ fn intermediate_path(destination: &Path, kind: &str, itag: u64, ext: &str) -> Pa
     destination.with_file_name(format!(".{name}.{kind}.{itag}.{ext}"))
 }
 
-fn parse_section_start(value: Option<&str>) -> Result<Option<u64>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let first = value.split(',').next().unwrap_or(value).trim();
-    let first = first.strip_prefix('*').unwrap_or(first);
-    let (start, _) = first
-        .split_once('-')
-        .ok_or_else(|| YtrustError::msg(format!("invalid download section: {value}")))?;
-    if start.trim().is_empty() {
-        return Ok(None);
-    }
-    let seconds = start
-        .trim()
-        .parse::<f64>()
-        .map_err(|_| YtrustError::msg(format!("invalid download section start: {start}")))?;
-    Ok((seconds > 0.0).then_some(seconds.floor() as u64))
-}
-
 fn init_logging(cli: &Cli) {
-    let default = if cli.quiet || cli.no_warnings {
+    let default = if cli.quiet {
         "error"
+    } else if cli.no_warnings {
+        "info"
     } else {
         match cli.verbose {
             0 => "warn",
@@ -734,10 +875,22 @@ fn init_logging(cli: &Cli) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ytrust::youtube::parse_item_ranges;
 
     #[test]
     fn parses_playlist_ranges() {
         assert_eq!(parse_item_ranges("1-3,5", 10).unwrap(), vec![1, 2, 3, 5]);
         assert_eq!(parse_item_ranges("5-", 7).unwrap(), vec![5, 6, 7]);
+        assert_eq!(parse_item_ranges("10-", 5).unwrap(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn converts_vtt_timestamps_to_srt() {
+        let srt = vtt_to_srt(
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000 align:start\nHello\n\n00:00:03.500 --> 00:00:04.000\nWorld\n",
+        );
+        assert!(srt.contains("00:00:01,000 --> 00:00:02,000\nHello"));
+        assert!(!srt.contains("align:start"));
+        assert!(srt.contains("00:00:03,500 --> 00:00:04,000\nWorld"));
     }
 }

@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use ytrust::constants::{
+    DEFAULT_OUTPUT, DEFAULT_PLAYLIST_ITEMS, DEFAULT_PLAYLIST_LIMIT, DEFAULT_RETRIES,
+    DEFAULT_SUB_FORMAT, DEFAULT_SUB_LANGS, DEFAULT_TIMEOUT_SECS,
+};
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "ytrust",
@@ -17,21 +22,11 @@ pub struct Cli {
     pub urls: Vec<String>,
 
     /// Format selector (e.g. best, bestvideo+bestaudio, 137+140, mp4)
-    #[arg(
-        short = 'f',
-        long,
-        default_value = "bestvideo+bestaudio/best",
-        env = "YTRUST_FORMAT"
-    )]
-    pub format: String,
+    #[arg(short = 'f', long, env = "YTRUST_FORMAT")]
+    pub format: Option<String>,
 
     /// Output filename template. Supports {title}, {id}, {ext}, {height}, {uploader}, {playlist}, {playlist_index}
-    #[arg(
-        short = 'o',
-        long,
-        default_value = "{title} [{id}].{ext}",
-        env = "YTRUST_OUTPUT"
-    )]
+    #[arg(short = 'o', long, default_value = DEFAULT_OUTPUT, env = "YTRUST_OUTPUT")]
     pub output: String,
 
     /// Directory for output files
@@ -46,11 +41,11 @@ pub struct Cli {
     #[arg(short = 'x', long)]
     pub extract_audio: bool,
 
-    /// Convert extracted audio to this format (mp3, m4a, opus, flac, wav)
+    /// Convert extracted audio to this format (mp3, m4a, opus, ogg, flac, wav)
     #[arg(long, value_name = "FORMAT")]
     pub audio_format: Option<String>,
 
-    /// Print metadata as JSON and do not download
+    /// Print one JSON object per video and do not download
     #[arg(short = 'j', long = "dump-json", alias = "print-json")]
     pub dump_json: bool,
 
@@ -62,7 +57,7 @@ pub struct Cli {
     #[arg(long)]
     pub skip_download: bool,
 
-    /// yt-dlp compatibility: list playlist entries without full extraction
+    /// yt-dlp compatibility: playlists are always resolved flat, accepted as a no-op
     #[arg(long)]
     pub flat_playlist: bool,
 
@@ -74,11 +69,11 @@ pub struct Cli {
     #[arg(long, value_name = "SECONDS")]
     pub socket_timeout: Option<u64>,
 
-    /// yt-dlp compatibility: fragment retry count
+    /// yt-dlp compatibility alias for --retries
     #[arg(long, value_name = "N")]
     pub fragment_retries: Option<u32>,
 
-    /// Download only a time range, e.g. *120-inf
+    /// Download only one time range, e.g. *120-inf or *1:00-2:30
     #[arg(long, value_name = "RANGE")]
     pub download_sections: Option<String>,
 
@@ -91,11 +86,11 @@ pub struct Cli {
     pub write_auto_subs: bool,
 
     /// Subtitle languages: all or comma-separated codes
-    #[arg(long, value_name = "LANGS", default_value = "all")]
+    #[arg(long, value_name = "LANGS", default_value = DEFAULT_SUB_LANGS)]
     pub sub_langs: String,
 
     /// Subtitle format: vtt or srt
-    #[arg(long, value_name = "FORMAT", default_value = "vtt")]
+    #[arg(long, value_name = "FORMAT", default_value = DEFAULT_SUB_FORMAT)]
     pub sub_format: String,
 
     /// Download the best thumbnail
@@ -123,19 +118,19 @@ pub struct Cli {
     pub no_playlist: bool,
 
     /// Playlist item ranges, e.g. 1-3,7,10-
-    #[arg(long, value_name = "RANGES", default_value = "1-")]
+    #[arg(long, value_name = "RANGES", default_value = DEFAULT_PLAYLIST_ITEMS)]
     pub playlist_items: String,
 
     /// Maximum number of playlist entries to inspect
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = DEFAULT_PLAYLIST_LIMIT)]
     pub playlist_limit: u64,
 
     /// Retries per download
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = DEFAULT_RETRIES)]
     pub retries: u32,
 
     /// HTTP timeout in seconds
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
 
     /// Proxy URL (http, https, socks5)

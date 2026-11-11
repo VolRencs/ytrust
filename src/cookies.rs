@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
 
 use aes::Aes128;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
@@ -9,7 +10,8 @@ use rusqlite::{Connection, OpenFlags};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
-use crate::error::{Result, YtrustError};
+use crate::error::{ErrorCode, Result, YtrustError};
+use crate::util::unix_time_i64;
 
 #[derive(Debug, Clone)]
 struct Cookie {
@@ -27,23 +29,12 @@ pub struct CookieJar {
 
 impl CookieJar {
     pub fn header_for(&self, host: &str) -> Option<String> {
-        self.header(host, true)
-    }
-
-    fn all_header_for(&self, host: &str) -> Option<String> {
-        self.header(host, false)
-    }
-
-    fn header(&self, host: &str, essential_only: bool) -> Option<String> {
-        let now = unix_time();
+        let now = unix_time_i64();
         let mut matched: Vec<&Cookie> = self
             .cookies
             .iter()
             .filter(|cookie| {
-                (cookie.expiry == 0 || cookie.expiry >= now)
-                    && domain_matches(host, &cookie.domain)
-                    && path_matches("/", &cookie.path)
-                    && (!essential_only || essential_cookie(&cookie.name))
+                (cookie.expiry == 0 || cookie.expiry >= now) && domain_matches(host, &cookie.domain)
             })
             .collect();
 
@@ -55,7 +46,7 @@ impl CookieJar {
                 .then_with(|| b.expiry.cmp(&a.expiry))
         });
 
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = BTreeSet::new();
         let mut values = Vec::new();
         for cookie in matched {
             if seen.insert(cookie.name.as_str()) {
@@ -84,7 +75,7 @@ impl CookieJar {
     }
 
     fn value(&self, name: &str) -> Option<String> {
-        let now = unix_time();
+        let now = unix_time_i64();
         self.cookies
             .iter()
             .filter(|cookie| cookie.name == name && (cookie.expiry == 0 || cookie.expiry >= now))
@@ -105,14 +96,24 @@ pub fn load(cookie_file: Option<&Path>, from_browser: Option<&str>) -> Result<Lo
     let mut jar = CookieJar::default();
 
     if let Some(path) = cookie_file {
-        jar.merge(load_netscape(path)?);
+        jar.merge(load_netscape(path).map_err(|error| {
+            YtrustError::coded(
+                ErrorCode::Cookies,
+                format!("failed to load cookies file {}: {error}", path.display()),
+            )
+        })?);
     }
     if let Some(spec) = from_browser {
-        jar.merge(load_browser(spec)?);
+        jar.merge(load_browser(spec).map_err(|error| {
+            YtrustError::coded(
+                ErrorCode::Cookies,
+                format!("failed to load cookies from {spec}: {error}"),
+            )
+        })?);
     }
 
     Ok(LoadedCookies {
-        header: jar.all_header_for("www.youtube.com"),
+        header: jar.header_for("www.youtube.com"),
         sapisid: jar.value("SAPISID"),
         sapisid1p: jar.value("__Secure-1PAPISID"),
         sapisid3p: jar.value("__Secure-3PAPISID"),
@@ -145,6 +146,7 @@ fn load_netscape(path: &Path) -> Result<CookieJar> {
 }
 
 fn load_browser(spec: &str) -> Result<CookieJar> {
+    let spec = spec.trim();
     let (browser, explicit_path) = match spec.split_once(':') {
         Some((browser, path)) if !path.is_empty() => {
             (browser.to_ascii_lowercase(), Some(PathBuf::from(path)))
@@ -165,9 +167,12 @@ fn load_browser(spec: &str) -> Result<CookieJar> {
             let path = find_chromium_profile(&browser)?;
             load_chromium(&path)
         }
-        other => Err(YtrustError::msg(format!(
-            "unsupported browser: {other}. Use firefox, chrome, chromium, brave, edge, vivaldi or opera"
-        ))),
+        other => Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            format!(
+                "unsupported browser: {other}. Use firefox, chrome, chromium, brave, edge, vivaldi or opera"
+            ),
+        )),
     }
 }
 
@@ -180,10 +185,7 @@ fn load_from_path(path: &Path) -> Result<CookieJar> {
         if name.eq_ignore_ascii_case("Cookies") {
             return load_chromium_db(path);
         }
-        return Err(YtrustError::msg(format!(
-            "unsupported cookie file: {}. Use cookies.txt, cookies.sqlite or a browser profile",
-            path.display()
-        )));
+        return load_netscape(path);
     }
 
     let firefox = path.join("cookies.sqlite");
@@ -195,10 +197,10 @@ fn load_from_path(path: &Path) -> Result<CookieJar> {
         return load_chromium_db(&chromium);
     }
 
-    Err(YtrustError::msg(format!(
-        "no supported cookie database found in {}",
-        path.display()
-    )))
+    Err(YtrustError::coded(
+        ErrorCode::Cookies,
+        format!("no supported cookie database found in {}", path.display()),
+    ))
 }
 
 fn load_firefox(path: &Path) -> Result<CookieJar> {
@@ -258,6 +260,8 @@ fn find_firefox_profile() -> Result<PathBuf> {
         for base in [
             home.join(".mozilla/firefox"),
             home.join(".config/mozilla/firefox"),
+            home.join("snap/firefox/common/.mozilla/firefox"),
+            home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
         ] {
             collect_firefox_profiles(&base, &mut candidates);
         }
@@ -265,7 +269,13 @@ fn find_firefox_profile() -> Result<PathBuf> {
     if let Some(config) = dirs::config_dir() {
         collect_firefox_profiles(&config.join("mozilla/firefox"), &mut candidates);
     }
+    if let Some(data) = dirs::data_dir() {
+        collect_firefox_profiles(&data.join("Mozilla/Firefox"), &mut candidates);
+        collect_firefox_profiles(&data.join("Firefox"), &mut candidates);
+    }
 
+    candidates.sort();
+    candidates.dedup();
     candidates.sort_by_key(|path| {
         (
             !path
@@ -279,10 +289,12 @@ fn find_firefox_profile() -> Result<PathBuf> {
         )
     });
 
-    candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| YtrustError::msg("Firefox profile with cookies.sqlite was not found"))
+    candidates.into_iter().next().ok_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::Cookies,
+            "Firefox profile with cookies.sqlite was not found",
+        )
+    })
 }
 
 fn collect_firefox_profiles(base: &Path, out: &mut Vec<PathBuf>) {
@@ -302,6 +314,9 @@ fn find_chromium_profile(browser: &str) -> Result<PathBuf> {
     let mut candidates = Vec::new();
 
     for root in roots {
+        if let Some(db) = chromium_cookie_db(&root) {
+            candidates.push(db);
+        }
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
         };
@@ -316,6 +331,8 @@ fn find_chromium_profile(browser: &str) -> Result<PathBuf> {
         }
     }
 
+    candidates.sort();
+    candidates.dedup();
     candidates.sort_by_key(|path| {
         (
             !path
@@ -330,34 +347,135 @@ fn find_chromium_profile(browser: &str) -> Result<PathBuf> {
         )
     });
 
-    candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| YtrustError::msg(format!("{browser} profile with cookies was not found")))
+    candidates.into_iter().next().ok_or_else(|| {
+        YtrustError::coded(
+            ErrorCode::Cookies,
+            format!("{browser} profile with cookies was not found"),
+        )
+    })
 }
 
 fn chromium_roots(browser: &str) -> Vec<PathBuf> {
-    let Some(config) = dirs::config_dir() else {
+    let mut roots = Vec::new();
+    roots.extend(linux_chromium_roots(browser));
+    roots.extend(windows_chromium_roots(browser));
+    roots.extend(macos_chromium_roots(browser));
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_chromium_roots(browser: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(config) = dirs::config_dir() {
+        roots.extend(match browser {
+            "chrome" => vec![
+                config.join("google-chrome"),
+                config.join("google-chrome-beta"),
+                config.join("google-chrome-unstable"),
+                config.join("google-chrome-for-testing"),
+            ],
+            "chromium" => vec![config.join("chromium")],
+            "brave" => vec![
+                config.join("BraveSoftware/Brave-Browser"),
+                config.join("BraveSoftware/Brave-Browser-Beta"),
+                config.join("BraveSoftware/Brave-Browser-Nightly"),
+            ],
+            "edge" => vec![config.join("microsoft-edge")],
+            "vivaldi" => vec![config.join("vivaldi")],
+            "opera" => vec![config.join("opera")],
+            _ => Vec::new(),
+        });
+    }
+    if let Some(home) = dirs::home_dir() {
+        roots.extend(match browser {
+            "chrome" => vec![home.join(".var/app/com.google.Chrome/config/google-chrome")],
+            "chromium" => vec![
+                home.join("snap/chromium/common/chromium"),
+                home.join(".var/app/org.chromium.Chromium/config/chromium"),
+            ],
+            "brave" => vec![
+                home.join("snap/brave/common/.config/BraveSoftware/Brave-Browser"),
+                home.join(".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"),
+            ],
+            "edge" => vec![home.join(".var/app/com.microsoft.Edge/config/microsoft-edge")],
+            "vivaldi" => vec![home.join(".var/app/com.vivaldi.Vivaldi/config/vivaldi")],
+            "opera" => vec![home.join(".var/app/com.opera.Opera/config/opera")],
+            _ => Vec::new(),
+        });
+    }
+    roots
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn linux_chromium_roots(_browser: &str) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_chromium_roots(browser: &str) -> Vec<PathBuf> {
+    let Some(local) = dirs::data_local_dir() else {
         return Vec::new();
     };
     match browser {
         "chrome" => vec![
-            config.join("google-chrome"),
-            config.join("google-chrome-beta"),
-            config.join("google-chrome-unstable"),
-            config.join("google-chrome-for-testing"),
+            local.join("Google/Chrome/User Data"),
+            local.join("Google/Chrome Beta/User Data"),
+            local.join("Google/Chrome SxS/User Data"),
+            local.join("Google/Chrome for Testing/User Data"),
         ],
-        "chromium" => vec![config.join("chromium")],
+        "chromium" => vec![local.join("Chromium/User Data")],
         "brave" => vec![
-            config.join("BraveSoftware/Brave-Browser"),
-            config.join("BraveSoftware/Brave-Browser-Beta"),
-            config.join("BraveSoftware/Brave-Browser-Nightly"),
+            local.join("BraveSoftware/Brave-Browser/User Data"),
+            local.join("BraveSoftware/Brave-Browser-Beta/User Data"),
+            local.join("BraveSoftware/Brave-Browser-Nightly/User Data"),
         ],
-        "edge" => vec![config.join("microsoft-edge")],
-        "vivaldi" => vec![config.join("vivaldi")],
-        "opera" => vec![config.join("opera")],
+        "edge" => vec![local.join("Microsoft/Edge/User Data")],
+        "vivaldi" => vec![local.join("Vivaldi/User Data")],
+        "opera" => vec![
+            local.join("Opera Software/Opera Stable"),
+            local.join("Opera Software/Opera GX Stable"),
+        ],
         _ => Vec::new(),
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_chromium_roots(_browser: &str) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_chromium_roots(browser: &str) -> Vec<PathBuf> {
+    let Some(data) = dirs::data_dir() else {
+        return Vec::new();
+    };
+    match browser {
+        "chrome" => vec![
+            data.join("Google/Chrome"),
+            data.join("Google/Chrome Beta"),
+            data.join("Google/Chrome Canary"),
+        ],
+        "chromium" => vec![data.join("Chromium")],
+        "brave" => vec![
+            data.join("BraveSoftware/Brave-Browser"),
+            data.join("BraveSoftware/Brave-Browser-Beta"),
+            data.join("BraveSoftware/Brave-Browser-Nightly"),
+        ],
+        "edge" => vec![data.join("Microsoft Edge")],
+        "vivaldi" => vec![data.join("Vivaldi")],
+        "opera" => vec![
+            data.join("com.operasoftware.Opera"),
+            data.join("com.operasoftware.OperaGX"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_chromium_roots(_browser: &str) -> Vec<PathBuf> {
+    Vec::new()
 }
 
 fn chromium_cookie_db(profile: &Path) -> Option<PathBuf> {
@@ -374,10 +492,10 @@ fn load_chromium(path: &Path) -> Result<CookieJar> {
         return load_chromium_db(path);
     }
     let db = chromium_cookie_db(path).ok_or_else(|| {
-        YtrustError::msg(format!(
-            "no Chromium Cookies database found in {}",
-            path.display()
-        ))
+        YtrustError::coded(
+            ErrorCode::Cookies,
+            format!("no Chromium Cookies database found in {}", path.display()),
+        )
     })?;
     load_chromium_db(&db)
 }
@@ -398,6 +516,7 @@ fn load_chromium_db(path: &Path) -> Result<CookieJar> {
     })?;
 
     let mut jar = CookieJar::default();
+    let mut skipped_encrypted = 0usize;
     for row in rows {
         let (host, path, name, value, encrypted, expires_utc) = row?;
         if !relevant_domain(&host) {
@@ -406,7 +525,10 @@ fn load_chromium_db(path: &Path) -> Result<CookieJar> {
         let value = if value.is_empty() {
             match decrypt_chromium_cookie(&encrypted, &host) {
                 Some(value) => value,
-                None => continue,
+                None => {
+                    skipped_encrypted += 1;
+                    continue;
+                }
             }
         } else {
             value
@@ -417,6 +539,18 @@ fn load_chromium_db(path: &Path) -> Result<CookieJar> {
             0
         };
         jar.insert(&host, &path, &name, &value, expiry);
+    }
+
+    if jar.cookies.is_empty() && skipped_encrypted > 0 {
+        return Err(YtrustError::coded(
+            ErrorCode::Cookies,
+            "Chromium cookies are encrypted with an unsupported platform keyring; export cookies.txt or use Firefox",
+        ));
+    }
+    if skipped_encrypted > 0 {
+        tracing::warn!(
+            "skipped {skipped_encrypted} Chromium cookie(s) encrypted with an unsupported platform keyring"
+        );
     }
 
     Ok(jar)
@@ -446,12 +580,11 @@ fn decrypt_chromium_cookie(encrypted: &[u8], host: &str) -> Option<String> {
         return None;
     }
 
-    let mut key = [0u8; 16];
-    pbkdf2_hmac::<Sha1>(b"peanuts", b"saltysalt", 1, &mut key);
+    let key = chromium_key();
     let iv = [b' '; 16];
     let mut buffer = encrypted[3..].to_vec();
     type Aes128CbcDec = Decryptor<Aes128>;
-    let plain = Aes128CbcDec::new(&key.into(), &iv.into())
+    let plain = Aes128CbcDec::new(key.into(), &iv.into())
         .decrypt_padded::<Pkcs7>(&mut buffer)
         .ok()?;
 
@@ -465,34 +598,13 @@ fn decrypt_chromium_cookie(encrypted: &[u8], host: &str) -> Option<String> {
     String::from_utf8(plain.to_vec()).ok()
 }
 
-fn essential_cookie(name: &str) -> bool {
-    matches!(
-        name,
-        "SID"
-            | "HSID"
-            | "SSID"
-            | "APISID"
-            | "SAPISID"
-            | "SIDCC"
-            | "LOGIN_INFO"
-            | "PREF"
-            | "CONSENT"
-            | "SOCS"
-            | "VISITOR_INFO1_LIVE"
-            | "VISITOR_PRIVACY_METADATA"
-            | "AEC"
-            | "NID"
-            | "__Secure-1PSID"
-            | "__Secure-3PSID"
-            | "__Secure-1PAPISID"
-            | "__Secure-3PAPISID"
-            | "__Secure-1PSIDTS"
-            | "__Secure-3PSIDTS"
-            | "__Secure-1PSIDCC"
-            | "__Secure-3PSIDCC"
-            | "__Secure-ENID"
-            | "__Secure-YNID"
-    )
+fn chromium_key() -> &'static [u8; 16] {
+    static KEY: OnceLock<[u8; 16]> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut key = [0u8; 16];
+        pbkdf2_hmac::<Sha1>(b"peanuts", b"saltysalt", 1, &mut key);
+        key
+    })
 }
 
 fn relevant_domain(host: &str) -> bool {
@@ -507,17 +619,6 @@ fn domain_matches(host: &str, domain: &str) -> bool {
         || host
             .to_ascii_lowercase()
             .ends_with(&format!(".{}", domain.to_ascii_lowercase()))
-}
-
-fn path_matches(request_path: &str, cookie_path: &str) -> bool {
-    request_path.starts_with(cookie_path)
-}
-
-fn unix_time() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -536,8 +637,7 @@ mod tests {
         use aes::cipher::BlockModeEncrypt;
         use cbc::Encryptor;
 
-        let mut key = [0u8; 16];
-        pbkdf2_hmac::<Sha1>(b"peanuts", b"saltysalt", 1, &mut key);
+        let key = *chromium_key();
         let iv = [b' '; 16];
         let mut plain = Sha256::digest(host.as_bytes()).to_vec();
         plain.extend_from_slice(value.as_bytes());

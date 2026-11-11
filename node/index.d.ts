@@ -32,6 +32,7 @@ export interface Format {
   resolution?: string | null;
   format_note?: string | null;
   is_live?: boolean;
+  is_hls?: boolean;
   http_headers: HttpHeaders;
   expires_at?: number | null;
   audio_track?: {
@@ -60,8 +61,14 @@ export interface VideoResult {
   formats: Format[];
   best_audio?: Format | null;
   player_js_url?: string | null;
-  subtitles?: Record<string, unknown>;
-  automatic_captions?: Record<string, unknown>;
+  subtitles?: Record<string, SubtitleTrack[]>;
+  automatic_captions?: Record<string, SubtitleTrack[]>;
+}
+
+export interface SubtitleTrack {
+  ext: string;
+  url: string;
+  name: string;
 }
 
 export interface PlaylistEntry {
@@ -93,6 +100,10 @@ export interface AudioResult extends Format {
   duration?: number | null;
   thumbnail?: string | null;
   webpage_url: string;
+  uploader?: string;
+  channel?: string;
+  upload_date?: string;
+  is_live?: boolean;
 }
 
 export type YtrustErrorCode =
@@ -109,6 +120,10 @@ export type YtrustErrorCode =
   | "NO_AUDIO"
   | "INVALID_RESPONSE"
   | "NATIVE_LOAD"
+  | "FORMAT_NOT_FOUND"
+  | "FFMPEG"
+  | "IO"
+  | "CHALLENGE_FAILED"
   | "UNKNOWN";
 
 export declare class YtrustError extends Error {
@@ -118,6 +133,7 @@ export declare class YtrustError extends Error {
 
 export declare function errorCode(message: unknown): YtrustErrorCode;
 
+/** @deprecated Use version(). */
 export declare function probe(): string;
 export declare function version(): string;
 

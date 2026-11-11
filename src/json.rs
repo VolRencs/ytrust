@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 
 use crate::format::best_audio;
 use crate::output::format_ext;
+use crate::util::unix_time;
 use crate::youtube::{Format, PlaylistEntry, PlaylistInfo, SubtitleTrack, Thumbnail, VideoInfo};
 
 pub fn video_json(info: &VideoInfo, original_url: &str) -> Value {
@@ -77,12 +78,13 @@ fn format_json(format: &Format) -> Value {
         "cipher": format.cipher,
         "ext": ext,
         "protocol": if format.is_hls { "m3u8_native" } else { "https" },
+        "is_hls": format.is_hls,
         "vcodec": format.video_codec.clone().unwrap_or_else(|| "none".to_string()),
         "acodec": format.audio_codec.clone().unwrap_or_else(|| "none".to_string()),
         "width": format.width,
         "height": format.height,
         "fps": format.fps,
-        "tbr": format.bitrate / 1_000,
+        "tbr": format.bitrate as f64 / 1_000.0,
         "filesize": format.content_length,
         "resolution": resolution,
         "format_note": format.quality_label,
@@ -94,7 +96,7 @@ fn format_json(format: &Format) -> Value {
     });
 
     if let Some(abr) = format.audio_bitrate {
-        value["abr"] = json!(abr / 1_000);
+        value["abr"] = json!(abr as f64 / 1_000.0);
     }
     if format.audio_track_name.is_some() || format.audio_track_id.is_some() {
         value["audio_track"] = json!({
@@ -161,13 +163,6 @@ fn subtitles_json(tracks: &[SubtitleTrack]) -> Value {
             .push(entry);
     }
     Value::Object(result)
-}
-
-fn unix_time() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
