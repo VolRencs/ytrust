@@ -1,12 +1,13 @@
 [package]
 name = "ytrust"
-version = "0.4.3"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.99"
 description = "Fast, modern YouTube downloader"
 repository = "https://github.com/VolRencs/ytrust"
 readme = "README.md"
 license = "GPL-3.0-only"
+publish = false
 
 [workspace]
 members = ["node"]

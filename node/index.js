@@ -20,6 +20,7 @@ function requireNative() {
 }
 
 const ERROR_CODES = [
+  ["NATIVE_LOAD", /native addon is unavailable|Cannot find native binding|Failed to load native binding/i],
   ["AGE_RESTRICTED", /age.?restricted|confirm your age/i],
   ["BOTCHECK", /confirm you.?re not a bot|sign in to confirm you.?re not a bot/i],
   ["PRIVATE", /private video|video is private/i],
@@ -95,10 +96,6 @@ function toYtrustError(error) {
 
 export function version() {
   return requireNative().version();
-}
-
-export function probe() {
-  return version();
 }
 
 function normalizeOptions(options) {

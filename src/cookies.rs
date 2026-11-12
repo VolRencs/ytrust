@@ -147,33 +147,56 @@ fn load_netscape(path: &Path) -> Result<CookieJar> {
 
 fn load_browser(spec: &str) -> Result<CookieJar> {
     let spec = spec.trim();
-    let (browser, explicit_path) = match spec.split_once(':') {
-        Some((browser, path)) if !path.is_empty() => {
-            (browser.to_ascii_lowercase(), Some(PathBuf::from(path)))
+    let (browser, profile) = match spec.split_once(':') {
+        Some((browser, profile)) if !profile.is_empty() => {
+            (browser.to_ascii_lowercase(), Some(profile.to_string()))
         }
         _ => (spec.to_ascii_lowercase(), None),
     };
 
-    if let Some(path) = explicit_path {
+    let Some(profile) = profile else {
+        return match browser.as_str() {
+            "firefox" => {
+                let path = find_firefox_profile()?;
+                load_firefox(&path)
+            }
+            "chrome" | "chromium" | "brave" | "edge" | "vivaldi" | "opera" => {
+                let path = find_chromium_profile(&browser)?;
+                load_chromium(&path)
+            }
+            other => Err(unsupported_browser(other)),
+        };
+    };
+
+    let path = PathBuf::from(&profile);
+    if path.exists()
+        || profile.contains('/')
+        || profile.contains('\\')
+        || Path::new(&profile).is_absolute()
+    {
         return load_from_path(&path);
     }
 
     match browser.as_str() {
         "firefox" => {
-            let path = find_firefox_profile()?;
+            let path = find_firefox_profile_named(&profile)?;
             load_firefox(&path)
         }
         "chrome" | "chromium" | "brave" | "edge" | "vivaldi" | "opera" => {
-            let path = find_chromium_profile(&browser)?;
+            let path = find_chromium_profile_named(&browser, &profile)?;
             load_chromium(&path)
         }
-        other => Err(YtrustError::coded(
-            ErrorCode::InvalidInput,
-            format!(
-                "unsupported browser: {other}. Use firefox, chrome, chromium, brave, edge, vivaldi or opera"
-            ),
-        )),
+        other => Err(unsupported_browser(other)),
     }
+}
+
+fn unsupported_browser(browser: &str) -> YtrustError {
+    YtrustError::coded(
+        ErrorCode::InvalidInput,
+        format!(
+            "unsupported browser: {browser}. Use firefox, chrome, chromium, brave, edge, vivaldi or opera"
+        ),
+    )
 }
 
 fn load_from_path(path: &Path) -> Result<CookieJar> {
@@ -255,27 +278,7 @@ fn open_firefox_db(path: &Path) -> Result<(Connection, Option<tempfile::TempDir>
 }
 
 fn find_firefox_profile() -> Result<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        for base in [
-            home.join(".mozilla/firefox"),
-            home.join(".config/mozilla/firefox"),
-            home.join("snap/firefox/common/.mozilla/firefox"),
-            home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
-        ] {
-            collect_firefox_profiles(&base, &mut candidates);
-        }
-    }
-    if let Some(config) = dirs::config_dir() {
-        collect_firefox_profiles(&config.join("mozilla/firefox"), &mut candidates);
-    }
-    if let Some(data) = dirs::data_dir() {
-        collect_firefox_profiles(&data.join("Mozilla/Firefox"), &mut candidates);
-        collect_firefox_profiles(&data.join("Firefox"), &mut candidates);
-    }
-
-    candidates.sort();
-    candidates.dedup();
+    let mut candidates = firefox_candidates();
     candidates.sort_by_key(|path| {
         (
             !path
@@ -295,6 +298,45 @@ fn find_firefox_profile() -> Result<PathBuf> {
             "Firefox profile with cookies.sqlite was not found",
         )
     })
+}
+
+fn find_firefox_profile_named(name: &str) -> Result<PathBuf> {
+    firefox_candidates()
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+        })
+        .ok_or_else(|| {
+            YtrustError::coded(
+                ErrorCode::Cookies,
+                format!("Firefox profile {name:?} was not found"),
+            )
+        })
+}
+
+fn firefox_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        for base in [
+            home.join(".mozilla/firefox"),
+            home.join(".config/mozilla/firefox"),
+            home.join("snap/firefox/common/.mozilla/firefox"),
+            home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
+        ] {
+            collect_firefox_profiles(&base, &mut candidates);
+        }
+    }
+    if let Some(config) = dirs::config_dir() {
+        collect_firefox_profiles(&config.join("mozilla/firefox"), &mut candidates);
+    }
+    if let Some(data) = dirs::data_dir() {
+        collect_firefox_profiles(&data.join("Mozilla/Firefox"), &mut candidates);
+        collect_firefox_profiles(&data.join("Firefox"), &mut candidates);
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn collect_firefox_profiles(base: &Path, out: &mut Vec<PathBuf>) {
@@ -353,6 +395,36 @@ fn find_chromium_profile(browser: &str) -> Result<PathBuf> {
             format!("{browser} profile with cookies was not found"),
         )
     })
+}
+
+fn find_chromium_profile_named(browser: &str, name: &str) -> Result<PathBuf> {
+    for root in chromium_roots(browser) {
+        if root
+            .file_name()
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+            && let Some(db) = chromium_cookie_db(&root)
+        {
+            return Ok(db);
+        }
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let profile = entry.path();
+            if profile.is_dir()
+                && profile
+                    .file_name()
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+                && let Some(db) = chromium_cookie_db(&profile)
+            {
+                return Ok(db);
+            }
+        }
+    }
+    Err(YtrustError::coded(
+        ErrorCode::Cookies,
+        format!("{browser} profile {name:?} was not found"),
+    ))
 }
 
 fn chromium_roots(browser: &str) -> Vec<PathBuf> {

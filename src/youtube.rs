@@ -107,7 +107,25 @@ pub struct Format {
     pub audio_track_name: Option<String>,
     pub audio_track_id: Option<String>,
     pub audio_is_default: bool,
+    pub language: Option<String>,
     pub user_agent: String,
+}
+
+impl Format {
+    /// Best available size estimate for progress reporting and JSON output.
+    pub fn estimated_size(&self, duration_secs: Option<u64>) -> Option<u64> {
+        self.content_length
+            .or_else(|| self.progress_size(duration_secs))
+    }
+
+    /// Size estimate for the requested duration, ignoring a content length
+    /// that describes the complete stream (for example with section downloads).
+    pub fn progress_size(&self, duration_secs: Option<u64>) -> Option<u64> {
+        let bitrate = self.audio_bitrate.unwrap_or(self.bitrate);
+        duration_secs
+            .filter(|duration| *duration > 0 && bitrate > 0)
+            .map(|duration| bitrate.saturating_mul(duration) / 8)
+    }
 }
 
 pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
@@ -161,29 +179,32 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
         .find(|(key, _)| key == "list")
         .map(|(_, value)| value.to_string())
         .filter(|value| !value.is_empty());
-    let video = parsed
+    let query_video = parsed
         .query_pairs()
         .find(|(key, _)| key == "v")
         .map(|(_, value)| value.to_string())
         .filter(|value| !value.is_empty());
+    let path_video = video_id_from_url(&parsed);
+    let video_id = query_video.as_deref().and_then(valid_id).or(path_video);
 
     if let Some(ref list) = list
         && !no_playlist
     {
         return Ok(Target::Playlist {
             id: list.clone(),
-            video_id: video,
+            video_id,
         });
     }
 
-    if let Some(video_id) = video {
-        let video_id = valid_id(&video_id).ok_or_else(|| {
-            YtrustError::coded(
-                ErrorCode::InvalidInput,
-                format!("invalid video ID: {video_id}"),
-            )
-        })?;
+    if let Some(video_id) = video_id {
         return Ok(Target::Video { id: video_id });
+    }
+
+    if let Some(video) = query_video {
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            format!("invalid video ID: {video}"),
+        ));
     }
 
     if path.starts_with("/playlist") {
@@ -600,8 +621,9 @@ pub async fn fetch_playlist(
     let mut seen = BTreeSet::new();
     let mut continuation = None;
     let mut title = String::from("Playlist");
+    let max_pages = max_playlist_pages(limit);
 
-    for page in 0..40 {
+    for page in 0..max_pages {
         let body = match &continuation {
             Some(token) => json!({
                 "context": web_context(),
@@ -667,13 +689,19 @@ pub async fn fetch_inline_playlist(
     limit: u64,
 ) -> Result<PlaylistInfo> {
     let client = build_client(config)?;
-    let radio = if playlist_id.starts_with("RD") {
-        "&start_radio=1"
-    } else {
-        ""
-    };
-    let watch_url =
-        format!("https://www.youtube.com/watch?v={video_id}&list={playlist_id}{radio}&hl=en&gl=US");
+    let mut watch_url = Url::parse("https://www.youtube.com/watch")
+        .map_err(|error| YtrustError::coded(ErrorCode::InvalidInput, error.to_string()))?;
+    {
+        let mut query = watch_url.query_pairs_mut();
+        query
+            .append_pair("v", video_id)
+            .append_pair("list", playlist_id);
+        if playlist_id.starts_with("RD") {
+            query.append_pair("start_radio", "1");
+        }
+        query.append_pair("hl", "en").append_pair("gl", "US");
+    }
+    let watch_url = watch_url.to_string();
     let html = fetch_text(&client, &watch_url, config, WEB_UA, None).await?;
     let data = extract_json_assignment(&html, "ytInitialData")?;
     let mut playlist = data
@@ -693,7 +721,8 @@ pub async fn fetch_inline_playlist(
 
     let mut entries = Vec::new();
     let mut seen = BTreeSet::new();
-    for _ in 0..40 {
+    let max_pages = max_playlist_pages(limit);
+    for _ in 0..max_pages {
         let (page_entries, endpoint) = extract_inline_entries(&playlist);
         if page_entries.is_empty() {
             break;
@@ -897,8 +926,9 @@ pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Re
     let mut entries = Vec::new();
     let mut seen = BTreeSet::new();
     let mut continuation = None;
+    let max_pages = max_playlist_pages(limit);
 
-    for _ in 0..40 {
+    for _ in 0..max_pages {
         let body = match &continuation {
             Some(token) => json!({
                 "context": web_context(),
@@ -941,6 +971,10 @@ pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Re
     })
 }
 
+fn max_playlist_pages(limit: u64) -> usize {
+    limit.div_ceil(50).clamp(40, 1_000) as usize
+}
+
 pub fn max_playlist_item(expression: &str) -> Option<usize> {
     let mut max = None;
     for part in expression
@@ -948,8 +982,8 @@ pub fn max_playlist_item(expression: &str) -> Option<usize> {
         .map(str::trim)
         .filter(|part| !part.is_empty())
     {
-        if let Some((start, end)) = part.split_once('-') {
-            if start.trim().is_empty() || end.trim().is_empty() {
+        if let Some((_start, end)) = part.split_once('-') {
+            if end.trim().is_empty() {
                 return None;
             }
             let end = end.trim().parse::<usize>().ok()?;
@@ -1314,6 +1348,12 @@ fn parse_video_info(
 
     let captions = response.captions;
     let microformat = response.microformat;
+    let default_audio_language = microformat
+        .as_ref()
+        .and_then(|microformat| microformat.player_microformat_renderer.as_ref())
+        .and_then(|renderer| renderer.get("defaultAudioLanguage"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let details = response.video_details.ok_or_else(|| {
         YtrustError::coded(
             ErrorCode::InvalidResponse,
@@ -1370,6 +1410,7 @@ fn parse_video_info(
             audio_track_name: None,
             audio_track_id: None,
             audio_is_default: true,
+            language: None,
             user_agent: client_kind.user_agent().to_string(),
         });
     }
@@ -1408,6 +1449,22 @@ fn parse_video_info(
         .unwrap_or_default();
 
     let (subtitles, automatic_captions) = parse_captions(captions);
+    let fallback_language = default_audio_language
+        .or_else(|| {
+            subtitles
+                .first()
+                .map(|track| clean_caption_language(&track.language))
+        })
+        .or_else(|| {
+            automatic_captions
+                .first()
+                .map(|track| clean_caption_language(&track.language))
+        });
+    for format in &mut formats {
+        if format.has_audio && format.language.is_none() {
+            format.language = fallback_language.clone();
+        }
+    }
     let id = if details.video_id.is_empty() {
         requested_id.to_string()
     } else {
@@ -1446,6 +1503,13 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
 
     let (container, video_codec, audio_codec, has_video, has_audio) =
         parse_mime_and_codecs(&raw.mime_type);
+    let language = raw
+        .audio_track
+        .as_ref()
+        .and_then(|track| track.id.as_deref())
+        .map(|id| id.split('.').next().unwrap_or(id))
+        .filter(|language| !language.is_empty())
+        .map(str::to_string);
     let audio_bitrate = if has_audio && !has_video {
         raw.audio_quality.as_ref().map(|_| raw.bitrate.unwrap_or(0))
     } else {
@@ -1485,8 +1549,16 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
             .as_ref()
             .and_then(|track| track.audio_is_default)
             .unwrap_or(false),
+        language,
         user_agent: client_kind.user_agent().to_string(),
     })
+}
+
+fn clean_caption_language(language: &str) -> String {
+    language
+        .trim_start_matches("a-")
+        .trim_end_matches("-orig")
+        .to_string()
 }
 
 fn normalize_upload_date(value: &str) -> String {
@@ -1791,6 +1863,16 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(target, Target::Video { id, .. } if id == "dQw4w9WgXcQ"));
+    }
+
+    #[test]
+    fn classifies_short_url_with_playlist_as_inline() {
+        let target = classify("https://youtu.be/dQw4w9WgXcQ?list=RDdQw4w9WgXcQ", false).unwrap();
+        assert!(matches!(
+            target,
+            Target::Playlist { id, video_id }
+                if id == "RDdQw4w9WgXcQ" && video_id.as_deref() == Some("dQw4w9WgXcQ")
+        ));
     }
 
     #[test]

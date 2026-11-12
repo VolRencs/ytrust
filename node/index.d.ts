@@ -29,6 +29,8 @@ export interface Format {
   tbr?: number;
   abr?: number;
   filesize?: number | null;
+  filesize_approx?: number | null;
+  language?: string | null;
   resolution?: string | null;
   format_note?: string | null;
   is_live?: boolean;
@@ -39,6 +41,7 @@ export interface Format {
     id: string | null;
     display_name: string | null;
     audio_is_default: boolean;
+    language?: string | null;
   };
 }
 
@@ -78,6 +81,7 @@ export interface PlaylistEntry {
   webpage_url: string;
   title: string;
   duration?: number | null;
+  playlist_index?: number;
   thumbnail?: string | null;
   thumbnails?: Array<{ url: string; width?: number | null; height?: number | null }>;
 }
@@ -133,8 +137,6 @@ export declare class YtrustError extends Error {
 
 export declare function errorCode(message: unknown): YtrustErrorCode;
 
-/** @deprecated Use version(). */
-export declare function probe(): string;
 export declare function version(): string;
 
 export declare function resolve(

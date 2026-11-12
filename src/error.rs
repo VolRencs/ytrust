@@ -62,7 +62,10 @@ impl fmt::Display for ErrorCode {
 #[derive(Debug, Error)]
 pub enum YtrustError {
     #[error("HTTP: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
+
+    #[error("{message}")]
+    HttpStatus { status: u16, message: String },
 
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -95,6 +98,14 @@ pub enum YtrustError {
     InvalidOutput(PathBuf),
 }
 
+impl From<reqwest::Error> for YtrustError {
+    fn from(error: reqwest::Error) -> Self {
+        // Signed googlevideo URLs must never leak into errors exposed to
+        // callers, and reqwest includes the full URL by default.
+        Self::Http(error.without_url())
+    }
+}
+
 impl YtrustError {
     pub fn msg(message: impl Into<String>) -> Self {
         Self::Message(message.into())
@@ -116,12 +127,40 @@ impl YtrustError {
         }
     }
 
+    pub fn is_broken_pipe(&self) -> bool {
+        matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Http(error) => {
+                error.is_timeout()
+                    || error.is_connect()
+                    || error
+                        .status()
+                        .is_some_and(|status| status == 429 || status.is_server_error())
+            }
+            Self::HttpStatus { status, .. } => *status == 429 || *status >= 500,
+            Self::Coded { code, .. } => matches!(code, ErrorCode::Timeout | ErrorCode::Network),
+            Self::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+            ),
+            _ => false,
+        }
+    }
+
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Http(error) if error.is_timeout() => ErrorCode::Timeout,
             Self::Http(error) if error.is_connect() => ErrorCode::Network,
             Self::Http(error) if error.is_status() => ErrorCode::Http,
             Self::Http(_) => ErrorCode::Network,
+            Self::HttpStatus { .. } => ErrorCode::Http,
             Self::Io(_) => ErrorCode::Io,
             Self::Json(_) => ErrorCode::InvalidResponse,
             Self::Sqlite(_) => ErrorCode::Cookies,
@@ -154,6 +193,32 @@ mod tests {
             YtrustError::FormatNotFound("x".into()).code(),
             ErrorCode::FormatNotFound
         );
+    }
+
+    #[test]
+    fn classifies_retryable_statuses() {
+        assert!(
+            YtrustError::HttpStatus {
+                status: 503,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            YtrustError::HttpStatus {
+                status: 429,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !YtrustError::HttpStatus {
+                status: 404,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(!YtrustError::coded(ErrorCode::InvalidInput, "x").is_retryable());
     }
 
     #[test]

@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test from "node:test";
-import { errorCode, probe, resolve, resolveAudio, version, YtrustError } from "../index.js";
+import { errorCode, resolve, resolveAudio, version, YtrustError } from "../index.js";
 
-test("probe and version", () => {
-  assert.equal(probe(), version());
+test("version", () => {
   assert.match(version(), /^\d+\.\d+\.\d+/);
 });
 
@@ -23,6 +22,7 @@ test("errorCode classifies common failures", () => {
   assert.equal(errorCode("I/O: No such file or directory"), "IO");
   assert.equal(errorCode("challenge solving failed"), "CHALLENGE_FAILED");
   assert.equal(errorCode("JSON: expected value"), "INVALID_RESPONSE");
+  assert.equal(errorCode("native addon is unavailable: missing"), "NATIVE_LOAD");
   assert.equal(errorCode("something else"), "UNKNOWN");
 });
 
@@ -118,9 +118,11 @@ test("resolveAudio single video", { skip: !process.env.YTRUST_INTEGRATION }, asy
   assert.equal(typeof audio.expires_at, "number");
 });
 
-test("resolveAudio solves signatureCipher formats", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
+test("resolveAudio solves signatureCipher formats", {
+  skip: !process.env.YTRUST_INTEGRATION || !process.env.YTRUST_COOKIES,
+}, async () => {
   const audio = await resolveAudio("https://www.youtube.com/watch?v=0t9dU9iNyYo", {
-    cookiesPath: process.env.YTRUST_COOKIES,
+    ...(process.env.YTRUST_COOKIES ? { cookiesPath: process.env.YTRUST_COOKIES } : {}),
   });
   assert.match(audio.url, /^https:\/\/.+googlevideo\.com\//);
   assert.ok(audio.url.includes("sig="));

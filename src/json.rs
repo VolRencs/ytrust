@@ -26,8 +26,12 @@ pub fn video_json(info: &VideoInfo, original_url: &str) -> Value {
         "extractor": "youtube",
         "extractor_key": "Youtube",
         "epoch": unix_time(),
-        "formats": info.formats.iter().map(format_json).collect::<Vec<_>>(),
-        "best_audio": best_audio(info).map(format_json),
+        "formats": info
+            .formats
+            .iter()
+            .map(|format| format_json(format, info.duration_secs))
+            .collect::<Vec<_>>(),
+        "best_audio": best_audio(info).map(|format| format_json(format, info.duration_secs)),
         "player_js_url": info.player_js_url,
         "subtitles": subtitles_json(&info.subtitles),
         "automatic_captions": subtitles_json(&info.automatic_captions),
@@ -58,13 +62,26 @@ fn entry_json(entry: &PlaylistEntry) -> Value {
         "webpage_url": webpage_url,
         "title": entry.title,
         "duration": entry.duration,
+        "playlist_index": entry.index,
         "thumbnail": entry.thumbnails.last().map(|thumb| thumb.url.clone()),
         "thumbnails": thumbnails_json(&entry.thumbnails),
     })
 }
 
-fn format_json(format: &Format) -> Value {
+pub fn playlist_entry_json(
+    entry: &PlaylistEntry,
+    playlist_title: &str,
+    playlist_count: usize,
+) -> Value {
+    let mut value = entry_json(entry);
+    value["playlist_title"] = json!(playlist_title);
+    value["playlist_count"] = json!(playlist_count);
+    value
+}
+
+fn format_json(format: &Format, duration_secs: Option<u64>) -> Value {
     let ext = format_ext(format);
+    let filesize_approx = format.estimated_size(duration_secs);
     let resolution = match (format.width, format.height) {
         (Some(width), Some(height)) => Some(format!("{width}x{height}")),
         (None, Some(height)) => Some(format!("{height}p")),
@@ -86,6 +103,8 @@ fn format_json(format: &Format) -> Value {
         "fps": format.fps,
         "tbr": format.bitrate as f64 / 1_000.0,
         "filesize": format.content_length,
+        "filesize_approx": filesize_approx,
+        "language": format.language,
         "resolution": resolution,
         "format_note": format.quality_label,
         "is_live": format.is_live,
@@ -103,6 +122,7 @@ fn format_json(format: &Format) -> Value {
             "id": format.audio_track_id,
             "display_name": format.audio_track_name,
             "audio_is_default": format.audio_is_default,
+            "language": format.language,
         });
     }
 
@@ -205,6 +225,7 @@ mod tests {
             audio_track_name: None,
             audio_track_id: None,
             audio_is_default: false,
+            language: None,
             user_agent: "test-agent".to_string(),
         }
     }
@@ -264,7 +285,7 @@ mod tests {
         value.signature_cipher = Some(
             "s=abc&sp=sig&url=https%3A%2F%2Frr1---sn-test.googlevideo.com%2Fvideoplayback%3Fexpire%3D42".to_string(),
         );
-        let json = format_json(&value);
+        let json = format_json(&value, Some(213));
         assert_eq!(json["url"], "");
         assert!(json["signature_cipher"].as_str().unwrap().contains("s=abc"));
         assert_eq!(json["expires_at"], 42);
@@ -275,6 +296,19 @@ mod tests {
         let info = video_info(vec![format(137, None, true, 4_000_000, None)]);
         let value = video_json(&info, &info.webpage_url);
         assert!(value["best_audio"].is_null());
+    }
+
+    #[test]
+    fn format_json_exposes_language_and_estimated_size() {
+        let mut value = format(251, Some("opus"), false, 136_000, Some(136_000));
+        value.language = Some("en-US".to_string());
+        value.audio_track_id = Some("en-US.4".to_string());
+        value.audio_track_name = Some("English (US)".to_string());
+        value.content_length = None;
+        let json = format_json(&value, Some(100));
+        assert_eq!(json["language"], "en-US");
+        assert_eq!(json["audio_track"]["language"], "en-US");
+        assert_eq!(json["filesize_approx"], 1_700_000u64);
     }
 
     #[test]

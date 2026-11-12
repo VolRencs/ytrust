@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 use crate::constants::WEB_UA;
 use crate::error::{ErrorCode, Result, YtrustError};
 use crate::http::is_youtube_host;
+use crate::progress::{ExtraFile, Progress};
 use crate::youtube::Format;
 
 #[derive(Debug, Clone)]
@@ -158,6 +159,7 @@ impl Downloader {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn download_format(
         &self,
         format: &Format,
@@ -165,16 +167,26 @@ impl Downloader {
         label: &str,
         duration_secs: Option<u64>,
         range: Option<DownloadRange>,
+        progress: Option<&Progress>,
+        component: &str,
     ) -> Result<()> {
         if range.is_some() || format.is_hls {
-            self.download_via_ffmpeg(format, destination, label, duration_secs, range)
+            self.download_via_ffmpeg(format, destination, label, duration_secs, range, progress)
                 .await
         } else {
-            self.download_http(format, destination, label).await
+            self.download_http(format, destination, label, progress, component)
+                .await
         }
     }
 
-    async fn download_http(&self, format: &Format, destination: &Path, label: &str) -> Result<()> {
+    async fn download_http(
+        &self,
+        format: &Format,
+        destination: &Path,
+        label: &str,
+        progress: Option<&Progress>,
+        component: &str,
+    ) -> Result<()> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -194,14 +206,21 @@ impl Downloader {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.download_http_once(format, &part, total, &bar).await {
+            match self
+                .download_http_once(format, &part, total, &bar, progress, component)
+                .await
+            {
                 Ok(()) => {
                     replace_file(&part, destination).await?;
                     bar.finish_with_message(format!("{label} [done]"));
                     return Ok(());
                 }
                 Err(error) => {
+                    let retryable = error.is_retryable();
                     last_error = Some(error);
+                    if !retryable {
+                        break;
+                    }
                     bar.set_message(format!("{label} [retrying]"));
                 }
             }
@@ -219,6 +238,8 @@ impl Downloader {
         part: &Path,
         total: Option<u64>,
         bar: &ProgressBar,
+        progress: Option<&Progress>,
+        component: &str,
     ) -> Result<()> {
         let mut existing = tokio::fs::metadata(part)
             .await
@@ -227,12 +248,18 @@ impl Downloader {
         if let Some(total) = total {
             if existing == total {
                 bar.set_position(total);
+                if let Some(progress) = progress {
+                    progress.finish_component(component);
+                }
                 return Ok(());
             }
             if existing > total {
                 tokio::fs::remove_file(part).await?;
                 existing = 0;
             }
+        }
+        if let Some(progress) = progress {
+            progress.set_done(component, existing);
         }
 
         let mut request = self
@@ -255,17 +282,17 @@ impl Downloader {
             if total.is_some_and(|total| existing >= total) {
                 return Ok(());
             }
-            return Err(YtrustError::coded(
-                ErrorCode::Http,
-                "server rejected resume range",
-            ));
+            return Err(YtrustError::HttpStatus {
+                status: status.as_u16(),
+                message: "server rejected resume range".to_string(),
+            });
         }
 
         if !status.is_success() {
-            return Err(YtrustError::coded(
-                ErrorCode::Http,
-                format!("unexpected HTTP status {status}"),
-            ));
+            return Err(YtrustError::HttpStatus {
+                status: status.as_u16(),
+                message: format!("unexpected HTTP status {status}"),
+            });
         }
 
         let append = status == reqwest::StatusCode::PARTIAL_CONTENT && existing > 0;
@@ -278,6 +305,9 @@ impl Downloader {
         };
         if let Some(expected) = expected {
             bar.set_length(expected);
+            if let Some(progress) = progress {
+                progress.set_total(component, expected);
+            }
         }
         bar.set_position(if append { existing } else { 0 });
 
@@ -295,6 +325,9 @@ impl Downloader {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             bar.inc(chunk.len() as u64);
+            if let Some(progress) = progress {
+                progress.add(component, chunk.len() as u64);
+            }
         }
         file.flush().await?;
         let actual = file.metadata().await?.len();
@@ -307,6 +340,9 @@ impl Downloader {
             ));
         }
         bar.set_position(actual);
+        if let Some(progress) = progress {
+            progress.finish_component(component);
+        }
         Ok(())
     }
 
@@ -317,6 +353,7 @@ impl Downloader {
         label: &str,
         duration_secs: Option<u64>,
         range: Option<DownloadRange>,
+        progress: Option<&Progress>,
     ) -> Result<()> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -369,16 +406,26 @@ impl Downloader {
             .arg("-nostats")
             .arg(destination);
 
-        run_ffmpeg(command, bar, label, self.config.proxy.as_deref()).await
+        run_ffmpeg(
+            command,
+            bar,
+            label,
+            self.config.proxy.as_deref(),
+            duration,
+            progress,
+            "download",
+        )
+        .await
     }
 
     pub async fn merge(
         &self,
         video: &Path,
-        audio: &Path,
+        audios: &[(PathBuf, Option<String>)],
         destination: &Path,
         label: &str,
         duration_secs: Option<u64>,
+        progress: Option<&Progress>,
     ) -> Result<()> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -396,15 +443,22 @@ impl Downloader {
             .arg("-nostdin")
             .arg("-y")
             .arg("-i")
-            .arg(video)
-            .arg("-i")
-            .arg(audio)
-            .arg("-map")
-            .arg("0:v:0")
-            .arg("-map")
-            .arg("1:a:0")
-            .arg("-c")
-            .arg("copy");
+            .arg(video);
+        for (audio, _) in audios {
+            command.arg("-i").arg(audio);
+        }
+        command.arg("-map").arg("0:v:0");
+        for index in 0..audios.len() {
+            command.arg("-map").arg(format!("{}:a:0", index + 1));
+        }
+        command.arg("-c").arg("copy");
+        for (index, (_, language)) in audios.iter().enumerate() {
+            if let Some(language) = language {
+                command
+                    .arg(format!("-metadata:s:a:{index}"))
+                    .arg(format!("language={}", language_metadata(language)));
+            }
+        }
 
         if destination
             .extension()
@@ -419,22 +473,36 @@ impl Downloader {
             .arg("-nostats")
             .arg(destination);
 
-        run_ffmpeg(command, bar, label, self.config.proxy.as_deref()).await
+        run_ffmpeg(
+            command,
+            bar,
+            label,
+            self.config.proxy.as_deref(),
+            duration_secs,
+            progress,
+            "merge",
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn convert_audio(
         &self,
         input: &Path,
         destination: &Path,
         audio_format: &str,
         label: &str,
+        duration_secs: Option<u64>,
+        audio_quality: Option<&str>,
+        progress: Option<&Progress>,
     ) -> Result<()> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
         let codec = audio_codec(audio_format)?;
-        let bar = self.progress_bar(None, label);
+        let bar = self.progress_bar(duration_secs, label);
+        bar.set_style(duration_style());
         let ffmpeg = self.ffmpeg_path().await?;
         let mut command = Command::new(ffmpeg);
         command
@@ -447,13 +515,180 @@ impl Downloader {
             .arg(input)
             .arg("-vn")
             .arg("-c:a")
-            .arg(codec)
+            .arg(codec);
+        if let Some(quality) = audio_quality.filter(|quality| !quality.trim().is_empty()) {
+            apply_audio_quality(&mut command, codec, quality.trim());
+        }
+        command
             .arg("-progress")
             .arg("pipe:1")
             .arg("-nostats")
             .arg(destination);
 
-        run_ffmpeg(command, bar, label, self.config.proxy.as_deref()).await
+        run_ffmpeg(
+            command,
+            bar,
+            label,
+            self.config.proxy.as_deref(),
+            duration_secs,
+            progress,
+            "audio",
+        )
+        .await
+    }
+
+    pub async fn embed_subtitles(
+        &self,
+        media: &Path,
+        extras: &[ExtraFile],
+        duration_secs: Option<u64>,
+        progress: Option<&Progress>,
+    ) -> Result<PathBuf> {
+        let subtitles: Vec<&ExtraFile> = extras
+            .iter()
+            .filter(|extra| extra.kind == "subtitle")
+            .collect();
+        if subtitles.is_empty() {
+            return Ok(media.to_path_buf());
+        }
+        let extension = media
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let subtitle_codec = match extension.as_str() {
+            "mp4" | "m4v" | "mov" => "mov_text",
+            "mkv" => "srt",
+            _ => {
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    "--embed-subs requires an mp4/mov or mkv output container",
+                ));
+            }
+        };
+        let temp = temp_output_path(media, "embed", &extension);
+        let ffmpeg = self.ffmpeg_path().await?;
+        let bar = self.progress_bar(duration_secs, "subtitles");
+        bar.set_style(duration_style());
+        let mut command = Command::new(ffmpeg);
+        command
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-i")
+            .arg(media);
+        for subtitle in &subtitles {
+            command.arg("-i").arg(&subtitle.path);
+        }
+        command.arg("-map").arg("0");
+        for index in 0..subtitles.len() {
+            command.arg("-map").arg(format!("{}:0", index + 1));
+        }
+        command
+            .arg("-c")
+            .arg("copy")
+            .arg("-c:s")
+            .arg(subtitle_codec);
+        for (index, subtitle) in subtitles.iter().enumerate() {
+            if let Some(language) = &subtitle.language {
+                command
+                    .arg(format!("-metadata:s:s:{index}"))
+                    .arg(format!("language={}", language_metadata(language)));
+            }
+        }
+        command
+            .arg("-progress")
+            .arg("pipe:1")
+            .arg("-nostats")
+            .arg(&temp);
+        let result = run_ffmpeg(
+            command,
+            bar,
+            "subtitles",
+            self.config.proxy.as_deref(),
+            duration_secs,
+            progress,
+            "subtitles",
+        )
+        .await;
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(error);
+        }
+        replace_file(&temp, media).await?;
+        Ok(media.to_path_buf())
+    }
+
+    pub async fn remux(
+        &self,
+        media: &Path,
+        container: &str,
+        duration_secs: Option<u64>,
+        progress: Option<&Progress>,
+    ) -> Result<PathBuf> {
+        let container = container
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if !matches!(container.as_str(), "mp4" | "mkv" | "webm") {
+            return Err(YtrustError::coded(
+                ErrorCode::InvalidInput,
+                format!("--remux-video supports mp4, mkv or webm, got {container}"),
+            ));
+        }
+        let current = media
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if current == container {
+            return Ok(media.to_path_buf());
+        }
+        let destination = media.with_extension(&container);
+        let temp = temp_output_path(&destination, "remux", &container);
+        let ffmpeg = self.ffmpeg_path().await?;
+        let bar = self.progress_bar(duration_secs, "remux");
+        bar.set_style(duration_style());
+        let mut command = Command::new(ffmpeg);
+        command
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-i")
+            .arg(media)
+            .arg("-map")
+            .arg("0")
+            .arg("-c")
+            .arg("copy");
+        if container == "mp4" {
+            command.arg("-movflags").arg("+faststart");
+        }
+        command
+            .arg("-progress")
+            .arg("pipe:1")
+            .arg("-nostats")
+            .arg(&temp);
+        let result = run_ffmpeg(
+            command,
+            bar,
+            "remux",
+            self.config.proxy.as_deref(),
+            duration_secs,
+            progress,
+            "remux",
+        )
+        .await;
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(error);
+        }
+        replace_file(&temp, &destination).await?;
+        let _ = tokio::fs::remove_file(media).await;
+        Ok(destination)
     }
 
     pub async fn download_url(&self, url: &str, destination: &Path, label: &str) -> Result<()> {
@@ -483,7 +718,11 @@ impl Downloader {
                     return Ok(());
                 }
                 Err(error) => {
+                    let retryable = error.is_retryable();
                     last_error = Some(error);
+                    if !retryable {
+                        break;
+                    }
                     bar.set_message(format!("{label} [retrying]"));
                 }
             }
@@ -513,10 +752,10 @@ impl Downloader {
         let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
-            return Err(YtrustError::coded(
-                ErrorCode::Http,
-                format!("HTTP {status} for {}", crate::http::redact_url(url)),
-            ));
+            return Err(YtrustError::HttpStatus {
+                status: status.as_u16(),
+                message: format!("HTTP {status} for {}", crate::http::redact_url(url)),
+            });
         }
         let expected = response.content_length();
         if let Some(expected) = expected {
@@ -564,13 +803,13 @@ impl Downloader {
         let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
-            return Err(YtrustError::coded(
-                ErrorCode::Http,
-                format!(
+            return Err(YtrustError::HttpStatus {
+                status: status.as_u16(),
+                message: format!(
                     "unexpected HTTP status {status} for {}",
                     crate::http::redact_url(&format.url)
                 ),
-            ));
+            });
         }
 
         let bar = self.progress_bar(None, label);
@@ -658,7 +897,7 @@ impl Downloader {
         if !status.success() {
             return Err(YtrustError::Ffmpeg {
                 status: status.to_string(),
-                stderr: stderr.trim().to_string(),
+                stderr: redact_ffmpeg_stderr(stderr.trim()),
             });
         }
         tracing::debug!("stream finished: {label}");
@@ -678,14 +917,14 @@ impl Downloader {
         let status = response.status();
         let text = response.text().await?;
         if !status.is_success() {
-            return Err(YtrustError::coded(
-                ErrorCode::Http,
-                format!(
+            return Err(YtrustError::HttpStatus {
+                status: status.as_u16(),
+                message: format!(
                     "HTTP {status} for {}: {}",
                     crate::http::redact_url(url),
                     text.chars().take(200).collect::<String>()
                 ),
-            ));
+            });
         }
         Ok(text)
     }
@@ -790,6 +1029,14 @@ fn part_path(destination: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn temp_output_path(destination: &Path, kind: &str, extension: &str) -> PathBuf {
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    destination.with_file_name(format!(".{name}.{kind}.{extension}"))
+}
+
 fn format_part_path(destination: &Path, format: &Format) -> PathBuf {
     let name = destination
         .file_name()
@@ -820,6 +1067,9 @@ async fn run_ffmpeg(
     bar: ProgressBar,
     label: &str,
     proxy: Option<&str>,
+    duration_secs: Option<u64>,
+    progress: Option<&Progress>,
+    processor: &str,
 ) -> Result<()> {
     if let Some(proxy) = proxy {
         command
@@ -843,17 +1093,33 @@ async fn run_ffmpeg(
         .take()
         .ok_or_else(|| YtrustError::coded(ErrorCode::Ffmpeg, "ffmpeg stderr unavailable"))?;
 
+    if let Some(progress) = progress {
+        progress.phase_started(processor);
+    }
+    let progress_handle = progress.cloned();
     let progress_bar = bar.clone();
     let progress_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         let mut last_us = 0u64;
         while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(value) = line.strip_prefix("out_time_us=")
-                && let Ok(us) = value.parse::<u64>()
+            let timestamp = line
+                .strip_prefix("out_time_us=")
+                .and_then(|value| value.parse::<u64>().ok())
+                .or_else(|| {
+                    line.strip_prefix("out_time_ms=")
+                        .and_then(|value| value.parse::<u64>().ok())
+                });
+            if let Some(us) = timestamp
                 && us >= last_us
             {
                 last_us = us;
-                progress_bar.set_position(us / 1_000_000);
+                let seconds = us / 1_000_000;
+                progress_bar.set_position(seconds);
+                if let (Some(progress), Some(duration)) = (&progress_handle, duration_secs)
+                    && duration > 0
+                {
+                    progress.phase_progress(seconds as f64 / duration as f64 * 100.0);
+                }
             }
         }
     });
@@ -873,15 +1139,100 @@ async fn run_ffmpeg(
     let stderr = stderr_task.await.unwrap_or_default();
 
     if !status.success() {
+        if let Some(progress) = progress {
+            progress.phase_failed(processor);
+        }
         bar.abandon_with_message(format!("{label} [failed]"));
         return Err(YtrustError::Ffmpeg {
             status: status.to_string(),
-            stderr: stderr.trim().to_string(),
+            stderr: redact_ffmpeg_stderr(stderr.trim()),
         });
     }
 
+    if let Some(progress) = progress {
+        progress.phase_finished(processor);
+    }
     bar.finish_with_message(format!("{label} [done]"));
     Ok(())
+}
+
+fn redact_ffmpeg_stderr(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .map(|word| {
+                    let Some(start) = word.find("http://").or_else(|| word.find("https://")) else {
+                        return word.to_string();
+                    };
+                    let prefix = &word[..start];
+                    let candidate = &word[start..];
+                    let end = candidate
+                        .find(|character: char| {
+                            !character.is_ascii_graphic()
+                                || matches!(character, '"' | '\'' | ')' | ']' | ',' | ';')
+                        })
+                        .unwrap_or(candidate.len());
+                    format!(
+                        "{prefix}{}{}",
+                        crate::http::redact_url(&candidate[..end]),
+                        &candidate[end..]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn language_metadata(language: &str) -> String {
+    let language = language.trim().split('-').next().unwrap_or(language);
+    match language.to_ascii_lowercase().as_str() {
+        "en" => "eng".to_string(),
+        "de" => "ger".to_string(),
+        "fr" => "fre".to_string(),
+        "es" => "spa".to_string(),
+        "it" => "ita".to_string(),
+        "pt" => "por".to_string(),
+        "ru" => "rus".to_string(),
+        "uk" => "ukr".to_string(),
+        "pl" => "pol".to_string(),
+        "tr" => "tur".to_string(),
+        "ja" => "jpn".to_string(),
+        "ko" => "kor".to_string(),
+        "zh" => "chi".to_string(),
+        "ar" => "ara".to_string(),
+        "hi" => "hin".to_string(),
+        "nl" => "dut".to_string(),
+        "sv" => "swe".to_string(),
+        "da" => "dan".to_string(),
+        "no" => "nor".to_string(),
+        "fi" => "fin".to_string(),
+        "cs" => "cze".to_string(),
+        "el" => "gre".to_string(),
+        "he" => "heb".to_string(),
+        "id" => "ind".to_string(),
+        "vi" => "vie".to_string(),
+        "th" => "tha".to_string(),
+        _ => language.to_string(),
+    }
+}
+
+fn apply_audio_quality(command: &mut Command, codec: &str, quality: &str) {
+    if let Some(bitrate) = quality
+        .strip_suffix('k')
+        .or_else(|| quality.strip_suffix('K'))
+        .or_else(|| quality.strip_suffix('m'))
+        .or_else(|| quality.strip_suffix('M'))
+    {
+        let suffix = &quality[quality.len() - 1..];
+        command.arg("-b:a").arg(format!("{bitrate}{suffix}"));
+        return;
+    }
+    if quality.parse::<u8>().is_ok() && matches!(codec, "libmp3lame" | "libvorbis") {
+        command.arg("-q:a").arg(quality);
+    }
 }
 
 #[cfg(test)]
@@ -927,5 +1278,21 @@ mod tests {
         assert_eq!(audio_codec("mp3").unwrap(), "libmp3lame");
         assert_eq!(audio_codec("M4A").unwrap(), "aac");
         assert!(audio_codec("aiff").is_err());
+    }
+
+    #[test]
+    fn maps_language_metadata() {
+        assert_eq!(language_metadata("en-US"), "eng");
+        assert_eq!(language_metadata("de"), "ger");
+        assert_eq!(language_metadata("xx"), "xx");
+    }
+
+    #[test]
+    fn redacts_urls_in_ffmpeg_errors() {
+        let redacted = redact_ffmpeg_stderr(
+            "Error opening input file https://rr1.googlevideo.com/videoplayback?sig=secret&expire=1",
+        );
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("expire=1"));
     }
 }

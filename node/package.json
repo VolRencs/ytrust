@@ -1,6 +1,6 @@
 {
   "name": "ytrust",
-  "version": "0.4.3",
+  "version": "1.0.0",
   "private": true,
   "packageManager": "pnpm@12.18.0",
   "description": "Native ytrust bindings for Node.js",
@@ -38,6 +38,7 @@
     "native.d.ts",
     "*.node",
     "solver/*.js",
+    "solver/*.d.ts",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md"
@@ -73,7 +74,7 @@
     "prepack": "pnpm build && pnpm check"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.6.6",
+    "@biomejs/biome": "^2.6.7",
     "@napi-rs/cli": "^3.10.12",
     "@types/node": "^26.6.6",
     "typescript": "^7.0.2"

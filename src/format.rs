@@ -8,31 +8,31 @@ use crate::output::{format_bytes, format_duration, format_ext};
 #[derive(Debug, Clone)]
 pub struct FormatSelection {
     pub video: Option<Format>,
-    pub audio: Option<Format>,
+    pub audios: Vec<Format>,
 }
 
 impl FormatSelection {
     pub fn single(&self) -> Option<&Format> {
-        if self.audio.is_none() {
-            self.video.as_ref()
-        } else if self.video.is_none() {
-            self.audio.as_ref()
-        } else {
-            None
+        match (self.video.as_ref(), self.audios.as_slice()) {
+            (Some(video), []) => Some(video),
+            (None, [audio]) => Some(audio),
+            _ => None,
         }
     }
 
     pub fn needs_merge(&self) -> bool {
-        self.video.is_some() && self.audio.is_some()
+        self.video.is_some() && !self.audios.is_empty()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Best,
+    BestAny,
     BestVideo,
     BestVideoAny,
     BestAudio,
+    BestAudioAny,
     Worst,
     WorstVideo,
     WorstAudio,
@@ -56,6 +56,10 @@ struct Filter {
     acodec: Option<String>,
     acodec_not: Option<String>,
     acodec_prefix: Option<String>,
+    language: Option<String>,
+    language_not: Option<String>,
+    language_prefix: Option<String>,
+    language_contains: Option<String>,
 }
 
 impl Filter {
@@ -147,6 +151,28 @@ impl Filter {
             return false;
         }
 
+        let language = value.language.as_deref().unwrap_or("none").to_lowercase();
+        if let Some(expected) = &self.language
+            && language != *expected
+        {
+            return false;
+        }
+        if let Some(unexpected) = &self.language_not
+            && language == *unexpected
+        {
+            return false;
+        }
+        if let Some(prefix) = &self.language_prefix
+            && !language.starts_with(prefix)
+        {
+            return false;
+        }
+        if let Some(fragment) = &self.language_contains
+            && !language.contains(fragment)
+        {
+            return false;
+        }
+
         true
     }
 }
@@ -174,10 +200,12 @@ impl Component {
         let (base, filter) = parse_filter(raw)?;
         let base = base.trim().to_ascii_lowercase();
         let (kind, argument) = match base.as_str() {
-            "b" | "best" | "best*" => (Kind::Best, base.clone()),
+            "b" | "best" => (Kind::Best, base.clone()),
+            "b*" | "best*" => (Kind::BestAny, base.clone()),
             "bv" | "bestvideo" => (Kind::BestVideo, base.clone()),
             "bv*" | "bestvideo*" => (Kind::BestVideoAny, base.clone()),
             "ba" | "bestaudio" | "audio" => (Kind::BestAudio, base.clone()),
+            "ba*" | "bestaudio*" => (Kind::BestAudioAny, base.clone()),
             "w" | "worst" => (Kind::Worst, base.clone()),
             "wv" | "worstvideo" => (Kind::WorstVideo, base.clone()),
             "wa" | "worstaudio" => (Kind::WorstAudio, base.clone()),
@@ -247,9 +275,14 @@ fn apply_filter(filter: &mut Filter, expression: &str) -> Result<()> {
     };
 
     let number = || {
-        value
-            .trim_end_matches(['k', 'K', 'm', 'M'])
+        let (digits, multiplier) = match value.as_bytes().last().copied() {
+            Some(b'k' | b'K') => (&value[..value.len() - 1], 1_000u64),
+            Some(b'm' | b'M') => (&value[..value.len() - 1], 1_000_000u64),
+            _ => (value, 1u64),
+        };
+        digits
             .parse::<u64>()
+            .map(|number| number.saturating_mul(multiplier))
             .map_err(|_| {
                 YtrustError::coded(
                     ErrorCode::InvalidInput,
@@ -273,6 +306,10 @@ fn apply_filter(filter: &mut Filter, expression: &str) -> Result<()> {
         ("acodec", "=") | ("acodec", "~") => filter.acodec = Some(value.to_ascii_lowercase()),
         ("acodec", "!=") => filter.acodec_not = Some(value.to_ascii_lowercase()),
         ("acodec", "^=") => filter.acodec_prefix = Some(value.to_ascii_lowercase()),
+        ("language", "=") => filter.language = Some(value.to_ascii_lowercase()),
+        ("language", "!=") => filter.language_not = Some(value.to_ascii_lowercase()),
+        ("language", "^=") => filter.language_prefix = Some(value.to_ascii_lowercase()),
+        ("language", "~") => filter.language_contains = Some(value.to_ascii_lowercase()),
         _ => {
             return Err(YtrustError::coded(
                 ErrorCode::InvalidInput,
@@ -305,77 +342,85 @@ pub fn select(info: &VideoInfo, expression: &str) -> Result<FormatSelection> {
 }
 
 fn select_alternative(formats: &[Format], alternative: &str) -> Result<FormatSelection> {
-    let mut parts = alternative
+    let parts: Vec<&str> = alternative
         .split('+')
         .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let first = parts
-        .next()
-        .ok_or_else(|| YtrustError::coded(ErrorCode::InvalidInput, "empty format selector"))?;
-    let second = parts.next();
-
-    if parts.next().is_some() {
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
         return Err(YtrustError::coded(
             ErrorCode::InvalidInput,
-            format!("too many components in format selector: {alternative:?}"),
+            "empty format selector",
         ));
     }
 
-    let first = Component::parse(first)?;
-    if let Some(second) = second {
-        let second = Component::parse(second)?;
-        let (video_component, audio_component) = if matches!(
-            first.kind,
-            Kind::BestVideo | Kind::BestVideoAny | Kind::WorstVideo
-        ) {
-            (first, second)
-        } else if matches!(
-            second.kind,
-            Kind::BestVideo | Kind::BestVideoAny | Kind::WorstVideo
-        ) {
-            (second, first)
-        } else {
-            (first, second)
-        };
-
-        let video = choose_video(formats, &video_component)?;
-        let audio = choose_audio(formats, &audio_component)?;
-        return Ok(FormatSelection {
-            video: Some(video),
-            audio: Some(audio),
-        });
-    }
-
-    match first.kind {
-        Kind::BestAudio | Kind::WorstAudio => Ok(FormatSelection {
-            video: None,
-            audio: Some(choose_audio(formats, &first)?),
-        }),
-        Kind::BestVideo | Kind::BestVideoAny | Kind::WorstVideo => Ok(FormatSelection {
-            video: Some(choose_video(formats, &first)?),
-            audio: None,
-        }),
-        Kind::Best | Kind::Worst | Kind::BestExt | Kind::Exact => {
-            let format = choose_single(formats, &first)?;
-            if is_audio_only(&format) {
-                Ok(FormatSelection {
-                    video: None,
-                    audio: Some(format),
-                })
-            } else {
-                Ok(FormatSelection {
-                    video: Some(format),
-                    audio: None,
-                })
+    let mut video = None;
+    let mut audios = Vec::new();
+    for part in parts {
+        let component = Component::parse(part)?;
+        match component.kind {
+            Kind::BestVideo | Kind::BestVideoAny | Kind::WorstVideo => {
+                let format = choose_video(formats, &component)?;
+                set_video(&mut video, format, alternative)?;
+            }
+            Kind::BestAudio | Kind::WorstAudio => {
+                let format = choose_audio(formats, &component)?;
+                push_audio(&mut audios, format);
+            }
+            Kind::BestAudioAny => {
+                let format = choose_audio_any(formats, &component)?;
+                push_audio(&mut audios, format);
+            }
+            Kind::Best | Kind::BestAny | Kind::Worst | Kind::BestExt | Kind::Exact => {
+                let format = choose_single(formats, &component)?;
+                if is_audio_only(&format) {
+                    push_audio(&mut audios, format);
+                } else {
+                    set_video(&mut video, format, alternative)?;
+                }
             }
         }
+    }
+
+    if video.is_none() && audios.is_empty() {
+        return Err(YtrustError::FormatNotFound(format!(
+            "no format matched {alternative:?}"
+        )));
+    }
+
+    Ok(FormatSelection { video, audios })
+}
+
+fn set_video(video: &mut Option<Format>, format: Format, alternative: &str) -> Result<()> {
+    if video.is_some() {
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            format!("multiple video formats selected in {alternative:?}"),
+        ));
+    }
+    *video = Some(format);
+    Ok(())
+}
+
+fn push_audio(audios: &mut Vec<Format>, format: Format) {
+    let duplicate = audios.iter().any(|existing| {
+        existing.itag == format.itag
+            && existing.language == format.language
+            && existing.audio_track_id == format.audio_track_id
+    });
+    if !duplicate {
+        audios.push(format);
     }
 }
 
 fn choose_single(formats: &[Format], component: &Component) -> Result<Format> {
     let mut candidates: Vec<&Format> = formats
         .iter()
-        .filter(|format| component.filter.matches(format) && format_matches_kind(format, component))
+        .filter(|format| {
+            component.filter.matches(format)
+                && format_matches_kind(format, component)
+                && !(matches!(component.kind, Kind::Worst) && format.is_hls)
+        })
         .collect();
 
     if candidates.is_empty() {
@@ -447,6 +492,27 @@ fn choose_audio(formats: &[Format], component: &Component) -> Result<Format> {
     Ok((*selected.expect("non-empty candidate list")).clone())
 }
 
+fn choose_audio_any(formats: &[Format], component: &Component) -> Result<Format> {
+    let mut candidates: Vec<&Format> = formats
+        .iter()
+        .filter(|format| {
+            format.has_audio
+                && component.filter.matches(format)
+                && format_matches_audio_kind(format, component)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Err(YtrustError::FormatNotFound(format!(
+            "{} (audio)",
+            component.argument
+        )));
+    }
+
+    candidates.sort_by(|a, b| compare_audio(a, b));
+    Ok((*candidates.last().expect("non-empty candidate list")).clone())
+}
+
 fn format_matches_kind(format: &Format, component: &Component) -> bool {
     match component.kind {
         Kind::Exact => format.itag.to_string() == component.argument,
@@ -457,6 +523,7 @@ fn format_matches_kind(format: &Format, component: &Component) -> bool {
                 && ext_matches(format_ext(format), &component.argument)
         }
         Kind::Best | Kind::Worst => format.has_video && format.has_audio,
+        Kind::BestAny => true,
         _ => true,
     }
 }
@@ -468,8 +535,7 @@ fn is_audio_ext(value: &str) -> bool {
 fn format_matches_video_kind(format: &Format, component: &Component) -> bool {
     match component.kind {
         Kind::BestVideo => is_video_only(format),
-        Kind::BestVideoAny => true,
-        Kind::WorstVideo => true,
+        Kind::BestVideoAny | Kind::WorstVideo => true,
         Kind::Exact => format.itag.to_string() == component.argument,
         Kind::BestExt => ext_matches(format_ext(format), &component.argument),
         _ => true,
@@ -549,15 +615,20 @@ fn compare_audio(a: &Format, b: &Format) -> Ordering {
         ))
 }
 
-pub fn print_formats(info: &VideoInfo) {
-    println!(
-        "{:<6} {:<6} {:<12} {:<6} {:<14} {:<14} {:>10}  NOTE",
-        "ID", "EXT", "RESOLUTION", "FPS", "VCODEC", "ACODEC", "SIZE"
-    );
+pub fn print_formats(info: &VideoInfo) -> Result<()> {
+    use std::io::Write;
+
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "{:<6} {:<6} {:<12} {:<6} {:<14} {:<14} {:<8} {:>10}  NOTE",
+        "ID", "EXT", "RESOLUTION", "FPS", "VCODEC", "ACODEC", "LANG", "SIZE"
+    )?;
     for format in &info.formats {
         let resolution = match (format.width, format.height) {
             (Some(w), Some(h)) => format!("{w}x{h}"),
             (None, Some(h)) => format!("{h}p"),
+            _ if format.is_hls => String::from("HLS"),
             _ => String::from("audio"),
         };
         let fps = format.fps.map(|v| v.to_string()).unwrap_or_default();
@@ -576,27 +647,31 @@ pub fn print_formats(info: &VideoInfo) {
         } else {
             ""
         };
-        println!(
-            "{:<6} {:<6} {:<12} {:<6} {:<14} {:<14} {:>10}  {}",
+        writeln!(
+            out,
+            "{:<6} {:<6} {:<12} {:<6} {:<14} {:<14} {:<8} {:>10}  {}",
             format.itag,
             format_ext(format),
             resolution,
             fps,
             format.video_codec.as_deref().unwrap_or("none"),
             format.audio_codec.as_deref().unwrap_or("none"),
+            format.language.as_deref().unwrap_or("-"),
             size,
             note
-        );
+        )?;
     }
 
     let duration = info
         .duration_secs
         .map(format_duration)
         .unwrap_or_else(|| "?".to_string());
-    println!("\nDuration: {duration}");
+    writeln!(out, "\nDuration: {duration}")?;
     if let Some(hls) = &info.hls_manifest_url {
-        println!("HLS manifest: {hls}");
+        writeln!(out, "HLS manifest: {hls}")?;
     }
+    out.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -640,6 +715,7 @@ mod tests {
             audio_track_name: None,
             audio_track_id: None,
             audio_is_default: false,
+            language: None,
             user_agent: "test".to_string(),
         }
     }
@@ -683,7 +759,7 @@ mod tests {
         let selection = select(&info, "bestvideo+bestaudio").unwrap();
         assert!(selection.needs_merge());
         assert_eq!(selection.video.unwrap().itag, 137);
-        assert_eq!(selection.audio.unwrap().itag, 251);
+        assert_eq!(selection.audios[0].itag, 251);
     }
 
     #[test]
@@ -700,5 +776,56 @@ mod tests {
     fn parses_codec_filter() {
         let (_, filter) = parse_filter("bestvideo[vcodec!=none]").unwrap();
         assert_eq!(filter.vcodec_not.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn parses_language_filters() {
+        let (_, filter) = parse_filter("bestaudio[language=en]").unwrap();
+        assert_eq!(filter.language.as_deref(), Some("en"));
+        let (_, filter) = parse_filter("bestaudio[language^=en]").unwrap();
+        assert_eq!(filter.language_prefix.as_deref(), Some("en"));
+        let (_, filter) = parse_filter("bestaudio[language!=de]").unwrap();
+        assert_eq!(filter.language_not.as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn parses_numeric_suffixes() {
+        let (_, filter) = parse_filter("bestvideo[height<=1k]").unwrap();
+        assert_eq!(filter.height_lte, Some(1000));
+        let (_, filter) = parse_filter("bestvideo[height<=1M]").unwrap();
+        assert_eq!(filter.height_lte, Some(1_000_000));
+    }
+
+    #[test]
+    fn selects_multiple_audio_languages() {
+        let mut en = format(251, false, true, None, Some(160_000));
+        en.language = Some("en".to_string());
+        let mut de = format(252, false, true, None, Some(160_000));
+        de.language = Some("de".to_string());
+        let info = info(vec![format(137, true, false, Some(1080), None), en, de]);
+        let selection = select(
+            &info,
+            "bestvideo+bestaudio[language=en]+bestaudio[language=de]",
+        )
+        .unwrap();
+        assert_eq!(selection.video.unwrap().itag, 137);
+        assert_eq!(selection.audios.len(), 2);
+        assert_eq!(selection.audios[0].language.as_deref(), Some("en"));
+        assert_eq!(selection.audios[1].language.as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn bestaudio_star_accepts_muxed_fallback() {
+        let info = info(vec![format(18, true, true, Some(360), None)]);
+        let selection = select(&info, "bestaudio*").unwrap();
+        assert_eq!(selection.single().unwrap().itag, 18);
+    }
+
+    #[test]
+    fn worst_skips_hls() {
+        let mut hls = format(0, true, true, None, None);
+        hls.is_hls = true;
+        let info = info(vec![hls]);
+        assert!(select(&info, "worst").is_err());
     }
 }

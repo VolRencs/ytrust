@@ -21,11 +21,12 @@ const { resolveAudio } = require("ytrust");
 - `resolve(input, options?)` — metadata and formats, `yt-dlp -J` compatible.
 - `resolveAudio(input, options?)` — best playable audio format plus video
   metadata. Throws `CHALLENGE_FAILED` if every audio format remains unsolvable.
-- `probe()` / `version()` — addon version string (`probe` is a deprecated alias).
+- `version()` — addon version string.
 - `YtrustError` — error class with a stable `code`.
 - `errorCode(message)` — classify a raw error message.
 
-Every format includes `http_headers`, `expires_at` and `is_hls`. Ciphered
+Every format includes `http_headers`, `expires_at`, `is_hls`, `language` and
+`filesize_approx` (when it can be estimated). Ciphered
 formats are solved with yt-dlp's EJS bundle in a bounded worker pool, and
 player JS is fetched through the same proxy/timeout/cookies configuration as
 the API requests. This keeps challenge solving off the Node event loop. Player
@@ -45,7 +46,7 @@ newer Windows app-bound encryption) are skipped with a warning; export a
 pnpm install
 pnpm build
 pnpm test
-pnpm test:integration   # network tests against YouTube
+pnpm test:integration   # network tests; set YTRUST_COOKIES to run the ciphered-format case
 pnpm lint               # Biome
 ```
 

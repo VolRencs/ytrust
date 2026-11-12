@@ -12,6 +12,8 @@ external binary.
 
 - Rust 1.99+ to build from source
 - Node.js 26+ for the native module (prebuilt addon targets `linux-x64-gnu`, glibc 2.35+)
+- Node.js 20+ for `signatureCipher`/`n` solving in the CLI (optional; needed only
+  when YouTube exposes ciphered formats)
 - ffmpeg with the codecs you need when converting or merging media
 
 ## Build
@@ -47,14 +49,56 @@ ytrust --playlist-items 1-10 "https://www.youtube.com/playlist?list=..."
 
 # Cookies for age-restricted or bot-checked videos
 ytrust --cookies cookies.txt "https://www.youtube.com/watch?v=..."
+
+# Multiple dubbed audio tracks in one container
+ytrust -f 'bestvideo+bestaudio[language=en]+bestaudio[language=de]' \
+  --audio-multistreams "https://www.youtube.com/watch?v=..."
+
+# Machine-readable progress events for a UI
+ytrust --progress-json -P ~/Downloads "https://www.youtube.com/watch?v=..."
+
+# Explicit JavaScript runtime for ciphered-only videos
+ytrust --js-runtimes node:/usr/bin/node "https://www.youtube.com/watch?v=..."
 ```
 
-Run `ytrust --help` for the full list of options. Ciphered-only formats are
-included in JSON but the CLI does not run the JavaScript challenge solver; use
-the Node module when a video exposes only `signatureCipher` formats. `--download-sections`
-accepts one range such as `*120-inf` or `*1:00-2:30`. `-j` prints one JSON
-object per video, while `-J` prints one object per URL (a playlist object for
-playlists).
+Run `ytrust --help` for the full list of options. The CLI bundles the same EJS
+challenge solver as the Node module and runs it through a detected Node.js
+runtime; pass `--js-runtimes none` to disable it, or `node:PATH` to select a
+specific binary. `--download-sections` accepts one range such as `*120-inf` or
+`*1:00-2:30`. `-j` prints one JSON object per video, while `-J` prints one object
+per URL (a playlist object for playlists). `-j --flat-playlist` emits playlist
+entries without fetching every video. `--ignore-errors` continues after a
+per-item failure and exits with status 1 when anything failed. `--skip-download`
+skips media but still writes requested thumbnails and subtitles; `--simulate`
+writes nothing.
+
+### Progress JSON
+
+`--progress-json` writes newline-delimited JSON to stdout. Human status and
+progress bars stay on stderr. Events are versioned with `"v": 1` and include
+`start`, `progress`, `postprocess`, `file`, `done`, `error` and `playlist`.
+Every `done` event contains an absolute `filepath` for the final media file.
+Bytes, speed and ETA are aggregated across separate video/audio downloads; the
+`components` array exposes per-stream progress. `--progress-json` conflicts with
+`-j`, `-J`, `-F`, `--list-audio-tracks` and `-o -`.
+
+### Audio tracks and formats
+
+Every format in `-J` output includes `language`, and `audio_track` includes
+`id`, `display_name`, `audio_is_default` and `language`. Use format filters:
+
+```bash
+-f 'bestaudio[language=en]'
+-f 'bestaudio[language^=en]'
+-f 'bestaudio[language!=de]'
+-f 'bestvideo+bestaudio[language=en]+bestaudio[language=de]'
+```
+
+Multiple audio tracks require `--audio-multistreams` in video mode and are
+merged with language metadata. In audio-only mode (`-x`) each selected language
+is written to its own file instead. `--embed-subs` muxes downloaded subtitles
+into the final container, `--remux-video` selects the final container, and
+`--audio-quality` accepts `0`-`10` (VBR) or a bitrate such as `192K`.
 
 ## Node.js module
 
@@ -88,7 +132,9 @@ Returns the same shape as `yt-dlp -J`: `_type: "video"` for a single video or
 
 - `http_headers` — headers required to fetch `url` (`User-Agent`, `Referer`);
 - `expires_at` — Unix timestamp parsed from the googlevideo `expire` parameter;
-- `is_hls` — true for HLS manifest entries.
+- `is_hls` — true for HLS manifest entries;
+- `language` — audio track language when YouTube reports one;
+- `filesize_approx` — estimated size when the exact size is unknown.
 
 ### `resolveAudio(input, options?)`
 
@@ -103,7 +149,7 @@ attached to a watch URL.
 | Option | Default | Description |
 |---|---|---|
 | `cookiesPath` | — | Netscape `cookies.txt` file |
-| `cookiesFromBrowser` | — | Browser profile, e.g. `firefox` or `firefox:/path` |
+| `cookiesFromBrowser` | — | Browser profile, e.g. `firefox`, `firefox:profile` or `firefox:/path` |
 | `proxy` | — | `http`, `https` or `socks5` proxy URL |
 | `timeout` | `30` | HTTP timeout in seconds |
 | `playlistLimit` | `500` | Maximum playlist entries to fetch |

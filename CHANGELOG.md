@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.0.0
+
+### Added
+
+- CLI support for `signatureCipher` and `n` challenges through the bundled
+  yt-dlp EJS solver and an external JavaScript runtime:
+  `--js-runtimes node[:PATH]` / `YTRUST_JS_RUNTIMES`.
+- Machine-readable `--progress-json` NDJSON events (`start`, `progress`,
+  `postprocess`, `file`, `done`, `error`, `playlist`) with absolute final file
+  paths, aggregate byte progress, speed, ETA and playlist indexes.
+- Format filters for `language`, `language!=`, `language^=` and `language~=`.
+- Multiple audio tracks in one video container via
+  `--audio-multistreams`, including language metadata. Audio-only multi-select
+  produces one file per language.
+- `--ignore-errors`, real flat playlist output (`-j --flat-playlist`),
+  `--skip-download` with thumbnail/subtitle writing, `--encoding`,
+  `--windows-filenames`, `--convert-subs`, `--continue` and `--part`
+  compatibility options.
+- `--embed-subs`, `--remux-video` and `--audio-quality`.
+- yt-dlp-style output templates such as `%(title)s [%(id)s].%(ext)s`.
+- Browser profile selection by name, including Windows `Default` profiles.
+
+### Changed
+
+- The Rust toolchain remains pinned to the installed 1.99.1 release and the
+  MSRV remains 1.99.
+- Updated GitHub Actions, Biome 2.6.7, TypeScript 7 strict settings and
+  transitive Rust dependencies, including the `ctutils` security fix
+  (RUSTSEC-2026-0385).
+- `--skip-download` now means "skip media but write requested extras", matching
+  yt-dlp. `--simulate` remains a no-file mode.
+- `--no-warnings` now actually suppresses warning events.
+- Video JSON formats include `language`, `language` in `audio_track`, and
+  `filesize_approx`; playlist entries include `playlist_index`.
+- The CLI tolerates a closed stdout (`... | head`) instead of panicking with
+  broken pipe.
+
+### Fixed
+
+- `youtu.be/ID?list=...` and Shorts/embed URLs with an attached playlist now
+  resolve inline playlists correctly.
+- Download retries only retry transient failures instead of 403/404 responses.
+- Subtitle sidecars respect `--force-overwrites`.
+- `worst` no longer selects a 4K HLS manifest just because it is the only muxed
+  entry.
+- Signed URLs are removed from reqwest errors and ffmpeg stderr.
+- Removed the deprecated `probe()` Node.js alias.
+
 ## 0.4.3
 
 - Cached the player JS URL for 30 minutes in the native addon, avoiding a

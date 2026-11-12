@@ -324,6 +324,7 @@ pub fn redact_url(url: &str) -> String {
     if url.query().is_some() {
         url.set_query(Some("<redacted>"));
     }
+    url.set_fragment(None);
     url.to_string()
 }
 

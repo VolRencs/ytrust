@@ -1,8 +1,23 @@
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+
+use serde_json::Value;
 
 use crate::youtube::{Format, VideoInfo};
 
 use crate::error::{Result, YtrustError};
+
+pub fn write_line(line: &str) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{line}")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+pub fn write_json(value: &Value) -> Result<()> {
+    let line = serde_json::to_string(value)?;
+    write_line(&line)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct TemplateContext {
@@ -80,7 +95,11 @@ pub fn render_path(
         return Ok(PathBuf::from("-"));
     }
 
-    let rendered = replace_template(template, ctx, restrict);
+    let rendered = replace_template(
+        &replace_percent_template(template, ctx, restrict),
+        ctx,
+        restrict,
+    );
     let mut path = PathBuf::new();
 
     for component in Path::new(&rendered).components() {
@@ -110,6 +129,32 @@ pub fn render_path(
     }
 
     Ok(path)
+}
+
+fn replace_percent_template(template: &str, ctx: &TemplateContext, restrict: bool) -> String {
+    let mut out = String::with_capacity(template.len() + 32);
+    let mut index = 0;
+    while index < template.len() {
+        let rest = &template[index..];
+        if rest.starts_with("%%") {
+            out.push('%');
+            index += 2;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("%(")
+            && let Some(end) = after.find(')')
+            && after[end + 1..].starts_with('s')
+        {
+            let key = &after[..end];
+            out.push_str(&sanitize_component(template_value(key, ctx), restrict));
+            index += 2 + end + 2;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or('%');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
 }
 
 fn replace_template(template: &str, ctx: &TemplateContext, restrict: bool) -> String {
@@ -236,17 +281,30 @@ pub fn format_ext(format: &Format) -> &'static str {
 }
 
 pub fn merged_ext(video_ext: &str, audio_ext: &str, override_ext: Option<&str>) -> String {
+    merged_ext_multi(video_ext, &[audio_ext], override_ext)
+}
+
+pub fn merged_ext_multi(
+    video_ext: &str,
+    audio_exts: &[&str],
+    override_ext: Option<&str>,
+) -> String {
     if let Some(ext) = override_ext {
         return ext.trim_start_matches('.').to_ascii_lowercase();
     }
-    if video_ext == audio_ext {
+    if audio_exts.is_empty() {
         return video_ext.to_string();
     }
-    match (video_ext, audio_ext) {
-        ("mp4", "m4a") | ("m4a", "mp4") => "mp4".to_string(),
-        ("webm", "webm") => "webm".to_string(),
-        _ => "mkv".to_string(),
+    if audio_exts.iter().all(|ext| *ext == video_ext) {
+        return video_ext.to_string();
     }
+    if video_ext == "mp4" && audio_exts.iter().all(|ext| *ext == "m4a") {
+        return "mp4".to_string();
+    }
+    if video_ext == "webm" && audio_exts.iter().all(|ext| *ext == "webm") {
+        return "webm".to_string();
+    }
+    "mkv".to_string()
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -315,5 +373,25 @@ mod tests {
         };
         let path = render_path("../{title}", &ctx, None, false).unwrap();
         assert_eq!(path, PathBuf::from("_").join("evil"));
+    }
+
+    #[test]
+    fn chooses_multi_audio_container() {
+        assert_eq!(merged_ext_multi("mp4", &["m4a", "m4a"], None), "mp4");
+        assert_eq!(merged_ext_multi("mp4", &["m4a", "webm"], None), "mkv");
+        assert_eq!(merged_ext_multi("webm", &["webm", "webm"], None), "webm");
+        assert_eq!(merged_ext_multi("mp4", &["m4a"], Some("mkv")), "mkv");
+    }
+
+    #[test]
+    fn supports_yt_dlp_style_templates() {
+        let ctx = TemplateContext {
+            title: "A/B: Test?".into(),
+            id: "abc123".into(),
+            ext: "mp4".into(),
+            ..Default::default()
+        };
+        let path = render_path("%(title)s [%(id)s].%(ext)s", &ctx, None, false).unwrap();
+        assert_eq!(path, PathBuf::from("A_B_ Test_ [abc123].mp4"));
     }
 }

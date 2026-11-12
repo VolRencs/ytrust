@@ -53,13 +53,95 @@ pub struct Cli {
     #[arg(short = 'J', long = "dump-single-json")]
     pub dump_single_json: bool,
 
-    /// yt-dlp compatibility: skip media download
+    /// Skip the media download but still write requested thumbnails/subtitles
     #[arg(long)]
     pub skip_download: bool,
 
-    /// yt-dlp compatibility: playlists are always resolved flat, accepted as a no-op
+    /// Resolve playlists without fetching every video (flat metadata)
     #[arg(long)]
     pub flat_playlist: bool,
+
+    /// Print machine-readable newline-delimited JSON progress events
+    #[arg(
+        long,
+        env = "YTRUST_PROGRESS_JSON",
+        conflicts_with_all = ["dump_json", "dump_single_json", "list_formats", "list_audio_tracks"]
+    )]
+    pub progress_json: bool,
+
+    /// Continue after per-item errors and report them as JSON events
+    #[arg(long)]
+    pub ignore_errors: bool,
+
+    /// JavaScript runtime for signatureCipher/n-challenge solving (node, node:PATH, PATH, none)
+    #[arg(
+        long,
+        alias = "js-runtime",
+        value_name = "RUNTIMES",
+        env = "YTRUST_JS_RUNTIMES"
+    )]
+    pub js_runtimes: Option<String>,
+
+    /// Merge multiple selected audio tracks into the output container
+    #[arg(long)]
+    pub audio_multistreams: bool,
+
+    /// Select an audio track by id/name/language; may be repeated
+    #[arg(
+        long = "audio-track",
+        value_name = "TRACK",
+        value_delimiter = ',',
+        action = clap::ArgAction::Append
+    )]
+    pub audio_tracks: Vec<String>,
+
+    /// Audio encoder quality: 0-10 (VBR) or a bitrate such as 192K
+    #[arg(long, value_name = "QUALITY")]
+    pub audio_quality: Option<String>,
+
+    /// Embed downloaded subtitles into the final media file
+    #[arg(long)]
+    pub embed_subs: bool,
+
+    /// Remux the final media into this container (mp4, mkv or webm)
+    #[arg(long, value_name = "FORMAT")]
+    pub remux_video: Option<String>,
+
+    /// yt-dlp compatibility: output encoding (UTF-8 is always used)
+    #[arg(long, value_name = "ENCODING")]
+    pub encoding: Option<String>,
+
+    /// yt-dlp compatibility: sanitize names for Windows (already the default)
+    #[arg(long)]
+    pub windows_filenames: bool,
+
+    /// yt-dlp compatibility: use .part files and resume (already the default)
+    #[arg(long = "continue", hide = true)]
+    pub continue_: bool,
+
+    /// yt-dlp compatibility: use .part files (already the default)
+    #[arg(long, hide = true)]
+    pub part: bool,
+
+    /// yt-dlp compatibility: convert downloaded subtitles to this format
+    #[arg(long, value_name = "FORMAT")]
+    pub convert_subs: Option<String>,
+
+    /// yt-dlp compatibility: accepted for compatibility; ytrust uses its own retry schedule
+    #[arg(long, value_name = "EXPR", hide = true)]
+    pub retry_sleep: Option<String>,
+
+    /// yt-dlp compatibility: accepted for compatibility; ytrust streams sequentially
+    #[arg(long, value_name = "N", hide = true)]
+    pub concurrent_fragments: Option<u32>,
+
+    /// yt-dlp compatibility: accepted for compatibility
+    #[arg(long, hide = true)]
+    pub abort_on_unavailable_fragments: bool,
+
+    /// yt-dlp compatibility: accepted for compatibility
+    #[arg(long, hide = true)]
+    pub force_keyframes_at_cuts: bool,
 
     /// yt-dlp compatibility: suppress warnings
     #[arg(long)]
@@ -100,10 +182,6 @@ pub struct Cli {
     /// Download all available thumbnails
     #[arg(long)]
     pub write_all_thumbnails: bool,
-
-    /// Select a YouTube audio track by id or display name, or "default"
-    #[arg(long, value_name = "TRACK")]
-    pub audio_track: Option<String>,
 
     /// List available audio tracks and exit
     #[arg(long)]
