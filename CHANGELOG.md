@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Browser cookie loading no longer sends Google `ST-*` secure-token cookies.
+  Large Firefox profiles could produce a ~400 KB `Cookie` header and fail with
+  `error sending request`. Non-essential cookies are now also capped at 16 KiB,
+  while authentication/consent cookies are kept first.
+
 ## 1.0.0
 
 ### Added

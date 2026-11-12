@@ -13,6 +13,35 @@ use sha2::{Digest, Sha256};
 use crate::error::{ErrorCode, Result, YtrustError};
 use crate::util::unix_time_i64;
 
+/// Keep the Cookie header comfortably below common HTTP server/proxy limits.
+const MAX_COOKIE_HEADER_BYTES: usize = 16 * 1024;
+
+/// Authentication and consent cookies that must survive size trimming.
+const ESSENTIAL_COOKIE_NAMES: &[&str] = &[
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "SAPISID",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "__Secure-1PAPISID",
+    "__Secure-3PAPISID",
+    "__Secure-1PSIDTS",
+    "__Secure-3PSIDTS",
+    "__Secure-1PSIDCC",
+    "__Secure-3PSIDCC",
+    "LOGIN_INFO",
+    "PREF",
+    "VISITOR_INFO1_LIVE",
+    "VISITOR_PRIVACY_METADATA",
+    "YSC",
+    "CONSENT",
+    "SOCS",
+    "DEVICE_INFO",
+    "WID",
+];
+
 #[derive(Debug, Clone)]
 struct Cookie {
     domain: String,
@@ -34,7 +63,9 @@ impl CookieJar {
             .cookies
             .iter()
             .filter(|cookie| {
-                (cookie.expiry == 0 || cookie.expiry >= now) && domain_matches(host, &cookie.domain)
+                (cookie.expiry == 0 || cookie.expiry >= now)
+                    && domain_matches(host, &cookie.domain)
+                    && !is_discarded_cookie(&cookie.name)
             })
             .collect();
 
@@ -46,12 +77,37 @@ impl CookieJar {
                 .then_with(|| b.expiry.cmp(&a.expiry))
         });
 
+        let mut ordered: Vec<&Cookie> = Vec::with_capacity(matched.len());
         let mut seen = BTreeSet::new();
-        let mut values = Vec::new();
-        for cookie in matched {
-            if seen.insert(cookie.name.as_str()) {
-                values.push(format!("{}={}", cookie.name, cookie.value));
+        for name in ESSENTIAL_COOKIE_NAMES {
+            if let Some(cookie) = matched
+                .iter()
+                .find(|cookie| cookie.name.eq_ignore_ascii_case(name))
+                && seen.insert(cookie.name.clone())
+            {
+                ordered.push(cookie);
             }
+        }
+        for cookie in matched {
+            if seen.insert(cookie.name.clone()) {
+                ordered.push(cookie);
+            }
+        }
+
+        let mut values = Vec::new();
+        let mut bytes = 0usize;
+        for cookie in ordered {
+            let entry = format!("{}={}", cookie.name, cookie.value);
+            let separator = if values.is_empty() { 0 } else { 2 };
+            let needed = entry.len() + separator;
+            let essential = ESSENTIAL_COOKIE_NAMES
+                .iter()
+                .any(|name| cookie.name.eq_ignore_ascii_case(name));
+            if !essential && bytes + needed > MAX_COOKIE_HEADER_BYTES {
+                continue;
+            }
+            bytes += needed;
+            values.push(entry);
         }
 
         (!values.is_empty()).then(|| values.join("; "))
@@ -62,7 +118,7 @@ impl CookieJar {
     }
 
     fn insert(&mut self, domain: &str, path: &str, name: &str, value: &str, expiry: i64) {
-        if name.is_empty() {
+        if name.is_empty() || is_discarded_cookie(name) {
             return;
         }
         self.cookies.push(Cookie {
@@ -679,6 +735,14 @@ fn chromium_key() -> &'static [u8; 16] {
     })
 }
 
+/// Google's `ST-*` secure-token cookies are unrelated to YouTube auth and can
+/// be hundreds of kilobytes in large Firefox profiles. They must never be
+/// copied into a single Cookie header.
+fn is_discarded_cookie(name: &str) -> bool {
+    name.get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ST-"))
+}
+
 fn relevant_domain(host: &str) -> bool {
     let host = host.trim_start_matches('.');
     host == "youtube.com"
@@ -782,5 +846,43 @@ mod tests {
         jar.insert(".youtube.com", "/", "SID", "secret", 0);
         jar.insert(".google.com", "/", "SID", "wrong", 0);
         assert_eq!(jar.header_for("www.youtube.com"), Some("SID=secret".into()));
+    }
+
+    #[test]
+    fn drops_large_st_cookies() {
+        let mut jar = CookieJar::default();
+        jar.insert(".youtube.com", "/", "ST-1", &"x".repeat(400_000), 0);
+        jar.insert(".youtube.com", "/", "SID", "auth", 0);
+        let header = jar.header_for("www.youtube.com").unwrap();
+        assert_eq!(header, "SID=auth");
+        assert!(header.len() < MAX_COOKIE_HEADER_BYTES);
+    }
+
+    #[test]
+    fn caps_cookie_header_size() {
+        let mut jar = CookieJar::default();
+        jar.insert(".youtube.com", "/", "SID", "auth", 0);
+        for index in 0..20 {
+            jar.insert(
+                ".youtube.com",
+                "/",
+                &format!("BIG{index}"),
+                &"y".repeat(4_000),
+                0,
+            );
+        }
+        let header = jar.header_for("www.youtube.com").unwrap();
+        assert!(header.starts_with("SID=auth"));
+        assert!(header.len() <= MAX_COOKIE_HEADER_BYTES);
+    }
+
+    #[test]
+    fn prioritizes_essential_cookies() {
+        let mut jar = CookieJar::default();
+        jar.insert(".youtube.com", "/", "OTHER", "first", 0);
+        jar.insert(".youtube.com", "/", "SID", "auth", 0);
+        jar.insert(".youtube.com", "/", "HSID", "auth2", 0);
+        let header = jar.header_for("www.youtube.com").unwrap();
+        assert!(header.starts_with("SID=auth; HSID=auth2"));
     }
 }
