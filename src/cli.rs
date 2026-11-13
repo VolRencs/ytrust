@@ -26,7 +26,7 @@ pub struct Cli {
     #[arg(short = 'f', long, env = "YTRUST_FORMAT")]
     pub format: Option<String>,
 
-    /// Do not retry with a muxed format when adaptive streams are rejected (HTTP 403/410)
+    /// Do not retry with a muxed format when streams are still rejected after cold-start retries (HTTP 403/410)
     #[arg(long)]
     pub no_fallback: bool,
 
@@ -213,7 +213,7 @@ pub struct Cli {
     #[arg(long, default_value_t = DEFAULT_PLAYLIST_LIMIT)]
     pub playlist_limit: u64,
 
-    /// Retries per download
+    /// Retries per download; cold googlevideo 403s always get a few extra attempts
     #[arg(long, default_value_t = DEFAULT_RETRIES)]
     pub retries: u32,
 

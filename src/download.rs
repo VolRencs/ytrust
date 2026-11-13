@@ -17,6 +17,12 @@ use crate::progress::{ExtraFile, Progress};
 use crate::youtube::Format;
 
 const MAX_FFMPEG_STDERR_BYTES: usize = 64 * 1024;
+/// Fresh googlevideo URLs are redirected to a cold edge that answers 403
+/// until it has fetched the stream. YouTube expects clients to retry the
+/// original URL after a short pause, so keep a small budget even when the
+/// caller disabled user-level retries.
+const COLD_START_MIN_ATTEMPTS: u32 = 5;
+const COLD_START_BASE_DELAY_MS: u64 = 500;
 
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
@@ -191,15 +197,15 @@ impl Downloader {
         let part = format_part_path(destination, format, component);
         let total = format.content_length.filter(|total| *total > 0);
         let bar = self.progress_bar(total, label);
-        let mut last_error = None;
+        let last_error;
+        let mut attempt = 0u32;
+        let mut cold_attempts = 0u32;
+        let mut last_was_cold = false;
 
-        for attempt in 0..=self.config.retries {
+        loop {
             if attempt > 0 {
-                let delay = download_retry_delay(attempt);
-                warn!(
-                    "retrying {label} in {delay:?} ({attempt}/{})",
-                    self.config.retries
-                );
+                let delay = retry_delay(attempt, cold_attempts, last_was_cold);
+                warn!("retrying {label} in {delay:?} (attempt {})", attempt + 1);
                 tokio::time::sleep(delay).await;
             }
 
@@ -214,19 +220,30 @@ impl Downloader {
                 }
                 Err(error) => {
                     let retryable = is_download_retryable(&error);
-                    last_error = Some(error);
-                    if !retryable {
+                    let cold_start = is_cold_start_forbidden(&error, format);
+                    if cold_start {
+                        cold_attempts = cold_attempts.saturating_add(1);
+                    }
+                    last_was_cold = cold_start;
+                    if !retryable
+                        || !should_retry_download(
+                            self.config.retries,
+                            attempt,
+                            cold_start,
+                            cold_attempts,
+                        )
+                    {
+                        last_error = error;
                         break;
                     }
                     bar.set_message(format!("{label} [retrying]"));
                 }
             }
+            attempt = attempt.saturating_add(1);
         }
 
         bar.abandon_with_message(format!("{label} [failed]"));
-        Err(last_error.unwrap_or_else(|| {
-            YtrustError::coded(ErrorCode::Network, format!("failed to download {label}"))
-        }))
+        Err(last_error)
     }
 
     async fn download_http_once(
@@ -884,14 +901,14 @@ impl Downloader {
         );
 
         let bar = self.progress_bar(None, label);
-        let mut last_error = None;
-        for attempt in 0..=self.config.retries {
+        let last_error;
+        let mut attempt = 0u32;
+        let mut cold_attempts = 0u32;
+        let mut last_was_cold = false;
+        loop {
             if attempt > 0 {
-                let delay = download_retry_delay(attempt);
-                warn!(
-                    "retrying {label} in {delay:?} ({attempt}/{})",
-                    self.config.retries
-                );
+                let delay = retry_delay(attempt, cold_attempts, last_was_cold);
+                warn!("retrying {label} in {delay:?} (attempt {})", attempt + 1);
                 tokio::time::sleep(delay).await;
             }
             let mut written = 0u64;
@@ -902,17 +919,28 @@ impl Downloader {
                 }
                 Err(error) => {
                     let retryable = written == 0 && is_download_retryable(&error);
-                    last_error = Some(error);
-                    if !retryable {
+                    let cold_start = is_cold_start_forbidden(&error, format);
+                    if cold_start {
+                        cold_attempts = cold_attempts.saturating_add(1);
+                    }
+                    last_was_cold = cold_start;
+                    if !retryable
+                        || !should_retry_download(
+                            self.config.retries,
+                            attempt,
+                            cold_start,
+                            cold_attempts,
+                        )
+                    {
+                        last_error = error;
                         break;
                     }
                 }
             }
+            attempt = attempt.saturating_add(1);
         }
         bar.abandon_with_message(format!("{label} [failed]"));
-        Err(last_error.unwrap_or_else(|| {
-            YtrustError::coded(ErrorCode::Network, format!("failed to stream {label}"))
-        }))
+        Err(last_error)
     }
 
     async fn stream_to_stdout_once(
@@ -1164,6 +1192,39 @@ fn apply_ffmpeg_http_options(command: &mut Command, is_live: bool) {
 
 fn download_retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(500u64 << attempt.min(3))
+}
+
+fn cold_start_retry_delay(cold_attempts: u32) -> Duration {
+    Duration::from_millis(COLD_START_BASE_DELAY_MS << cold_attempts.saturating_sub(1).min(3))
+}
+
+fn retry_delay(attempt: u32, cold_attempts: u32, last_was_cold: bool) -> Duration {
+    if last_was_cold {
+        cold_start_retry_delay(cold_attempts)
+    } else {
+        download_retry_delay(attempt)
+    }
+}
+
+fn should_retry_download(
+    user_retries: u32,
+    attempt: u32,
+    cold_start: bool,
+    cold_attempts: u32,
+) -> bool {
+    attempt < user_retries || (cold_start && cold_attempts < COLD_START_MIN_ATTEMPTS)
+}
+
+fn is_cold_start_forbidden(error: &YtrustError, format: &Format) -> bool {
+    matches!(error, YtrustError::HttpStatus { status: 403, .. }) && is_googlevideo_url(&format.url)
+}
+
+fn is_googlevideo_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    host == "googlevideo.com" || host.ends_with(".googlevideo.com")
 }
 
 fn is_download_retryable(error: &YtrustError) -> bool {
@@ -1708,6 +1769,77 @@ mod tests {
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("hidden"));
         assert!(redacted.contains("Cookie:"));
+    }
+
+    #[test]
+    fn detects_cold_start_forbidden_responses() {
+        let format = Format {
+            itag: 18,
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=18".to_string(),
+            signature_cipher: None,
+            cipher: None,
+            container: "mp4".to_string(),
+            video_codec: Some("avc1".to_string()),
+            audio_codec: Some("mp4a".to_string()),
+            has_video: true,
+            has_audio: true,
+            width: Some(640),
+            height: Some(360),
+            fps: Some(30),
+            bitrate: 500_000,
+            audio_bitrate: None,
+            content_length: Some(1_000),
+            quality_label: None,
+            is_hls: false,
+            is_live: false,
+            audio_track_name: None,
+            audio_track_id: None,
+            audio_is_default: false,
+            language: None,
+            user_agent: "test",
+        };
+        let forbidden = YtrustError::HttpStatus {
+            status: 403,
+            message: "cold edge".to_string(),
+        };
+        assert!(is_cold_start_forbidden(&forbidden, &format));
+        assert!(is_googlevideo_url(&format.url));
+        assert!(!is_googlevideo_url("https://example.com/videoplayback"));
+
+        let mut other_host = format.clone();
+        other_host.url = "https://example.com/video".to_string();
+        assert!(!is_cold_start_forbidden(&forbidden, &other_host));
+
+        let not_forbidden = YtrustError::HttpStatus {
+            status: 404,
+            message: "missing".to_string(),
+        };
+        assert!(!is_cold_start_forbidden(&not_forbidden, &format));
+    }
+
+    #[test]
+    fn retries_cold_start_forbidden_without_user_retries() {
+        assert!(should_retry_download(0, 0, true, 1));
+        assert!(should_retry_download(0, 1, true, 2));
+        assert!(should_retry_download(0, 2, true, 3));
+        assert!(should_retry_download(0, 3, true, 4));
+        assert!(!should_retry_download(0, 4, true, 5));
+        assert!(!should_retry_download(0, 0, false, 0));
+        assert!(should_retry_download(2, 0, false, 0));
+        assert!(should_retry_download(2, 1, false, 0));
+        assert!(!should_retry_download(2, 2, false, 0));
+    }
+
+    #[test]
+    fn uses_short_cold_start_backoff() {
+        assert_eq!(
+            retry_delay(1, 1, true),
+            Duration::from_millis(COLD_START_BASE_DELAY_MS)
+        );
+        assert_eq!(retry_delay(2, 2, true), Duration::from_millis(1_000));
+        assert_eq!(retry_delay(3, 3, true), Duration::from_millis(2_000));
+        assert_eq!(retry_delay(4, 4, true), Duration::from_millis(4_000));
+        assert_eq!(retry_delay(1, 0, false), download_retry_delay(1));
     }
 
     #[tokio::test]

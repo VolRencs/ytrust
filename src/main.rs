@@ -433,13 +433,10 @@ async fn process_info(
                 Some(height) => {
                     status!(
                         cli,
-                        "adaptive streams rejected; retrying with a {height}p muxed format"
+                        "streams still rejected; retrying with a {height}p muxed format"
                     )
                 }
-                None => status!(
-                    cli,
-                    "adaptive streams rejected; retrying with a muxed format"
-                ),
+                None => status!(cli, "streams still rejected; retrying with a muxed format"),
             }
             download_selection(&info, &fallback, original_url, playlist, context, &extras).await
         }

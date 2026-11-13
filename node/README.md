@@ -21,13 +21,19 @@ const { resolveAudio } = require("ytrust");
 - `resolve(input, options?)` — metadata and formats, `yt-dlp -J` compatible.
 - `resolveAudio(input, options?)` — best playable audio format plus video
   metadata. Throws `CHALLENGE_FAILED` if every audio format remains unsolvable.
+  Pass `ensurePlayable: true` to retry transient googlevideo `403`s and return
+  only after the URL responds successfully.
 - `version()` — addon version string.
 - `YtrustError` — error class with a stable `code`.
 - `errorCode(message)` — classify a raw error message.
 
 Every format includes `http_headers`, `expires_at`, `is_hls`, `language`,
 `filesize_approx` (when it can be estimated) and `playable` (false while a
-signature/`n` challenge is unresolved). Ciphered formats are solved with
+signature/`n` challenge is unresolved). `playable: true` means the URL is
+challenge-free, not that YouTube's CDN edge has warmed up yet. Downloaders
+should retry `403` for a few seconds (for ffmpeg use
+`-reconnect_on_http_error 403`), or `resolveAudio(..., { ensurePlayable: true })`
+will do it for you. Ciphered formats are solved with
 yt-dlp's EJS bundle in a bounded worker pool, and player JS is fetched through
 the same proxy/timeout/cookies configuration as the API requests. This keeps
 challenge solving off the Node event loop. Player JS URLs are cached for 30

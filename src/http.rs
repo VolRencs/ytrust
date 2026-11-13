@@ -368,6 +368,84 @@ fn retryable_status(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
+const WARMUP_ATTEMPTS: u32 = 5;
+const WARMUP_BASE_DELAY_MS: u64 = 500;
+
+/// Probe a googlevideo media URL until its edge has warmed up.
+///
+/// Freshly resolved URLs are redirected to an edge that temporarily answers
+/// `403` while it fetches the stream. The same original URL starts returning
+/// `2xx` after a short pause, so callers that expose URLs (for example the Node
+/// addon) can use this to guarantee that consumers will not hit the cold edge.
+pub async fn warm_up_media_url(
+    config: &RequestConfig,
+    raw_url: &str,
+    user_agent: Option<&str>,
+    referer: Option<&str>,
+) -> Result<()> {
+    let url = Url::parse(raw_url)
+        .map_err(|_| YtrustError::coded(ErrorCode::InvalidInput, "invalid media URL"))?;
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if url.scheme() != "https" || !(host == "googlevideo.com" || host.ends_with(".googlevideo.com"))
+    {
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            "media URL must use https on a googlevideo host",
+        ));
+    }
+
+    let client = client(config)?;
+    let user_agent = user_agent.unwrap_or(WEB_UA);
+    let referer = referer.unwrap_or("https://www.youtube.com/");
+    let mut last_error = None;
+
+    for attempt in 0..WARMUP_ATTEMPTS {
+        if attempt > 0 {
+            let delay = Duration::from_millis(WARMUP_BASE_DELAY_MS << (attempt - 1).min(3));
+            tokio::time::sleep(delay).await;
+        }
+
+        let mut request = client
+            .get(url.clone())
+            .header(reqwest::header::ACCEPT, "*/*")
+            .header(reqwest::header::USER_AGENT, user_agent)
+            .header(reqwest::header::REFERER, referer)
+            .header(reqwest::header::RANGE, "bytes=0-0");
+        if let Some(cookies) = config.cookies_for(raw_url) {
+            request = request.header(reqwest::header::COOKIE, cookies);
+        }
+
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                // Do not read the body: a server that ignores Range could send
+                // the whole media file. Dropping the response cancels it.
+                drop(response);
+                return Ok(());
+            }
+            Ok(response) => {
+                let status = response.status();
+                let retryable = status == StatusCode::FORBIDDEN
+                    || status == StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error();
+                last_error = Some(YtrustError::HttpStatus {
+                    status: status.as_u16(),
+                    message: format!("HTTP {status} for {}", redact_url(raw_url)),
+                });
+                if !retryable {
+                    break;
+                }
+            }
+            Err(error) => {
+                last_error = Some(error.into());
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        YtrustError::coded(ErrorCode::Network, "media URL did not become reachable")
+    }))
+}
+
 pub(crate) fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
     if let Some(retry_after) = retry_after {
         return retry_after;
@@ -475,5 +553,18 @@ mod tests {
         let redacted = redact_url("https://rr1.googlevideo.com/videoplayback?sig=secret&expire=1");
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("expire=1"));
+    }
+
+    #[tokio::test]
+    async fn warm_up_rejects_non_googlevideo_urls() {
+        let config = RequestConfig::default();
+        let error = warm_up_media_url(&config, "https://example.com/video", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidInput);
+        let error = warm_up_media_url(&config, "http://rr1.googlevideo.com/video", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidInput);
     }
 }

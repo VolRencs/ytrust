@@ -6,6 +6,12 @@ export interface ResolveOptions {
   playlistLimit?: number;
   playlistItems?: string;
   noPlaylist?: boolean;
+  /**
+   * `resolveAudio` only: wait until the selected media URL passes YouTube's
+   * CDN cold-start window before returning it. Retries transient 403s for a
+   * few seconds. Defaults to false.
+   */
+  ensurePlayable?: boolean;
 }
 
 export interface HttpHeaders {

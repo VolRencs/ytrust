@@ -118,6 +118,15 @@ test("resolve validates options before calling native code", async () => {
       return true;
     },
   );
+  await assert.rejects(
+    // @ts-expect-error testing ensurePlayable validation
+    () => resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ", { ensurePlayable: "yes" }),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "INVALID_INPUT");
+      return true;
+    },
+  );
 });
 
 test("resolve single video", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
@@ -151,6 +160,18 @@ test("resolveAudio solves signatureCipher formats", {
   assert.match(audio.url, /^https:\/\/.+googlevideo\.com\//);
   assert.ok(audio.url.includes("sig="));
   assert.ok(new URL(audio.url).searchParams.has("n"));
+});
+
+test("resolveAudio ensurePlayable warms the URL", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
+  const audio = await resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ", {
+    ...integrationOptions,
+    ensurePlayable: true,
+  });
+  const response = await fetch(audio.url, {
+    headers: { ...audio.http_headers, Range: "bytes=0-0" },
+  });
+  assert.ok(response.ok);
+  await response.arrayBuffer();
 });
 
 test("resolveAudio ignores an attached playlist", { skip: !process.env.YTRUST_INTEGRATION }, async () => {

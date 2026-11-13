@@ -149,3 +149,22 @@ pub async fn player_js_url(video_id: String, options: Option<ResolveOptions>) ->
         .await
         .map_err(napi_error)
 }
+
+/// Wait until a googlevideo URL has passed the CDN cold-start window.
+///
+/// Freshly resolved URLs may answer `403` on the first request while the edge
+/// fetches the stream. This helper retries the original URL with a short
+/// backoff and respects the configured proxy, timeout and cookies.
+#[napi]
+pub async fn warm_up(
+    url: String,
+    user_agent: Option<String>,
+    referer: Option<String>,
+    options: Option<ResolveOptions>,
+) -> Result<()> {
+    let options = options.unwrap_or_default();
+    let (config, _) = request_config(&options).await.map_err(napi_error)?;
+    ytrust::http::warm_up_media_url(&config, &url, user_agent.as_deref(), referer.as_deref())
+        .await
+        .map_err(napi_error)
+}

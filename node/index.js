@@ -108,7 +108,19 @@ const OPTION_KEYS = new Set([
   "playlistLimit",
   "playlistItems",
   "noPlaylist",
+  "ensurePlayable",
 ]);
+
+/** Options handled in JavaScript and never forwarded to the native addon. */
+const JS_ONLY_OPTION_KEYS = new Set(["ensurePlayable"]);
+
+function nativeOptions(options) {
+  const forwarded = {};
+  for (const [key, value] of Object.entries(options)) {
+    if (!JS_ONLY_OPTION_KEYS.has(key)) forwarded[key] = value;
+  }
+  return forwarded;
+}
 
 function normalizeOptions(options) {
   if (options == null) return {};
@@ -139,6 +151,9 @@ function normalizeOptions(options) {
   }
   if (normalized.noPlaylist != null && typeof normalized.noPlaylist !== "boolean") {
     throw new YtrustError("INVALID_INPUT", "noPlaylist must be a boolean");
+  }
+  if (normalized.ensurePlayable != null && typeof normalized.ensurePlayable !== "boolean") {
+    throw new YtrustError("INVALID_INPUT", "ensurePlayable must be a boolean");
   }
   return normalized;
 }
@@ -491,13 +506,32 @@ function audioCandidates(result) {
   return candidates;
 }
 
+async function ensureFormatPlayable(format, options) {
+  if (!format || typeof format.url !== "string" || !format.url) return false;
+  const headers = format.http_headers ?? {};
+  const userAgent = headers["User-Agent"] ?? headers["user-agent"];
+  const referer = headers.Referer ?? headers.referer;
+  try {
+    await requireNative().warmUp(
+      format.url,
+      typeof userAgent === "string" ? userAgent : undefined,
+      typeof referer === "string" ? referer : undefined,
+      nativeOptions(options),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function resolve(input, options = {}) {
   let result;
   try {
     const source = normalizeInput(input);
-    const nativeOptions = normalizeOptions(options);
-    result = await requireNative().resolve(source, nativeOptions);
-    result = await applyChallenges(result, nativeOptions);
+    const normalized = normalizeOptions(options);
+    const forwarded = nativeOptions(normalized);
+    result = await requireNative().resolve(source, forwarded);
+    result = await applyChallenges(result, forwarded);
     if (result?.best_audio && !isPlayable(result.best_audio)) {
       const fallback = pickPlayableAudio(result.formats);
       if (fallback) result.best_audio = fallback;
@@ -516,8 +550,9 @@ export async function resolveAudio(input, options = {}) {
   try {
     const source = normalizeInput(input);
     const normalized = normalizeOptions(options);
+    const forwarded = nativeOptions(normalized);
     const result = await requireNative().resolve(source, {
-      ...normalized,
+      ...forwarded,
       noPlaylist: true,
     });
     if (result?._type !== "video") {
@@ -530,7 +565,7 @@ export async function resolveAudio(input, options = {}) {
     // Solve only the most likely audio formats first. The full solve below is
     // a safety net for unusual players where the preferred format is unusable.
     for (const candidate of candidates.slice(0, 3)) {
-      await applyChallenges(result, normalized, [candidate]);
+      await applyChallenges(result, forwarded, [candidate]);
       if (isPlayable(candidate)) {
         chosen = candidate;
         break;
@@ -538,13 +573,17 @@ export async function resolveAudio(input, options = {}) {
     }
 
     if (!chosen) {
-      await applyChallenges(result, normalized);
+      await applyChallenges(result, forwarded);
       chosen = pickPlayableAudio(candidates) ?? pickPlayableAudio(result.formats);
     }
 
     if (!chosen) {
       const code = result.best_audio ? "CHALLENGE_FAILED" : "NO_AUDIO";
       throw new YtrustError(code, `no playable audio format found for ${source}`);
+    }
+
+    if (normalized.ensurePlayable && !(await ensureFormatPlayable(chosen, normalized))) {
+      throw new YtrustError("HTTP", `audio URL is still rejected by YouTube after retries for ${source}`);
     }
 
     return {

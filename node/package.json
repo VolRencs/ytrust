@@ -1,6 +1,6 @@
 {
   "name": "ytrust",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
   "packageManager": "pnpm@12.18.0",
   "description": "Native ytrust bindings for Node.js",

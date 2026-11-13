@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.2
+
+### Fixed
+
+- Fresh googlevideo URLs are redirected to a cold CDN edge that can answer
+  `403` for a few seconds. ytrust now retries the same URL with a short
+  cold-start backoff even when `--retries 0` is used, instead of immediately
+  treating the stream as rejected. The extra attempts also apply to stdout
+  streaming.
+- The muxed fallback is now a last resort after the cold-start retries; its
+  description no longer claims that adaptive streams were rejected.
+- The Node addon exposes `ensurePlayable` for `resolveAudio` (and an internal
+  `warmUp` native helper) so callers can wait for the CDN edge before handing
+  a URL to ffmpeg or another downloader. Documentation now warns that
+  `playable: true` only means the challenge is solved, not that the CDN has
+  warmed up.
+
 ## 1.1.1
 
 ### Fixed

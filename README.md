@@ -28,9 +28,12 @@ pnpm build        # produces ytrust.linux-x64-gnu.node and native.cjs
 
 The Node addon ships as a prebuilt `.node` binary; consumers do not need a Rust
 toolchain. It bundles yt-dlp's EJS challenge solver so `n`-challenge URLs are
-returned ready for ffmpeg or another downloader. Player JS URLs are cached for
-30 minutes, and the preprocessed player is reused across videos to keep
-subsequent resolves fast.
+returned without unresolved signatures. Fresh googlevideo URLs can still hit a
+short CDN cold-start `403`; external downloaders should retry that response
+(for ffmpeg, add `-reconnect_on_http_error 403`) or use
+`resolveAudio(..., { ensurePlayable: true })`. Player JS URLs are cached for 30
+minutes, and the preprocessed player is reused across videos to keep subsequent
+resolves fast.
 
 ## CLI
 
@@ -72,9 +75,12 @@ per-item failure and exits with status 1 when anything failed. `--skip-download`
 skips media but still writes requested thumbnails and subtitles; `--simulate`
 writes nothing.
 
-If YouTube rejects adaptive video/audio URLs with `403`/`410`, ytrust retries
-once with a muxed format and reports a `fallback` progress event. Pass
-`--no-fallback` to disable this behaviour.
+Fresh googlevideo URLs can return a transient `403` for a few seconds while
+YouTube's CDN edge fetches the stream. ytrust retries the same URL with a short
+backoff (even when `--retries 0` is used) before treating the stream as
+rejected. If a `403`/`410` persists after those cold-start retries, ytrust
+retries once with a muxed format and reports a `fallback` progress event. Pass
+`--no-fallback` to disable the muxed retry.
 
 ### Progress JSON
 
@@ -164,6 +170,7 @@ attached to a watch URL.
 | `playlistLimit` | `500` | Maximum playlist entries to fetch (minimum `1`) |
 | `playlistItems` | `"1-"` | Playlist ranges, e.g. `1-10,15` |
 | `noPlaylist` | `false` | Ignore a playlist attached to a watch URL |
+| `ensurePlayable` | `false` | `resolveAudio` only: retry transient googlevideo `403`s and return the URL only after it responds successfully |
 
 ### Errors
 
