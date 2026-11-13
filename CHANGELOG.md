@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.1
+
+### Fixed
+
+- Adaptive video/audio streams rejected by YouTube with `403`/`410` now fall
+  back to a muxed format once instead of failing the whole download. The
+  fallback prefers a muxed format no taller than the requested quality and
+  works for video, audio extraction and playlist entries.
+- `--no-fallback` disables the muxed retry. Progress JSON emits a `fallback`
+  event with the original and replacement formats.
+
 ## 1.1.0
 
 ### Fixed

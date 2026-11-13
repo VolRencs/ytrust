@@ -72,11 +72,16 @@ per-item failure and exits with status 1 when anything failed. `--skip-download`
 skips media but still writes requested thumbnails and subtitles; `--simulate`
 writes nothing.
 
+If YouTube rejects adaptive video/audio URLs with `403`/`410`, ytrust retries
+once with a muxed format and reports a `fallback` progress event. Pass
+`--no-fallback` to disable this behaviour.
+
 ### Progress JSON
 
 `--progress-json` writes newline-delimited JSON to stdout. Human status and
 progress bars stay on stderr. Events are versioned with `"v": 1` and include
-`start`, `progress`, `postprocess`, `file`, `done`, `error` and `playlist`.
+`start`, `progress`, `postprocess`, `file`, `done`, `error`, `fallback` and
+`playlist`.
 Every `done` event contains an absolute `filepath` for the final media file
 when a file was written; simulate/skip events may report `null`. Bytes, speed
 and ETA are aggregated across separate video/audio downloads; the

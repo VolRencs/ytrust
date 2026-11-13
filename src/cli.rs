@@ -26,6 +26,10 @@ pub struct Cli {
     #[arg(short = 'f', long, env = "YTRUST_FORMAT")]
     pub format: Option<String>,
 
+    /// Do not retry with a muxed format when adaptive streams are rejected (HTTP 403/410)
+    #[arg(long)]
+    pub no_fallback: bool,
+
     /// Output filename template. Supports {title}, {id}, {ext}, {height}, {uploader}, {playlist}, {playlist_index}
     #[arg(short = 'o', long, default_value = DEFAULT_OUTPUT, env = "YTRUST_OUTPUT")]
     pub output: String,
@@ -371,5 +375,21 @@ fn validate_audio_quality(quality: &str) -> Result<()> {
         _ => Err(invalid(
             "--audio-quality must be 0-10 (VBR) or a bitrate such as 192K",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_no_fallback_flag() {
+        let cli = Cli::try_parse_from([
+            "ytrust",
+            "--no-fallback",
+            "https://www.youtube.com/watch?v=x",
+        ])
+        .unwrap();
+        assert!(cli.no_fallback);
     }
 }

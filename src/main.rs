@@ -18,7 +18,9 @@ use ytrust::constants::{DEFAULT_AUDIO_FORMAT, DEFAULT_FORMAT};
 use ytrust::cookies;
 use ytrust::download::{DownloadConfig, DownloadRange, Downloader, audio_codec, parse_range};
 use ytrust::error::{ErrorCode, Result, YtrustError};
-use ytrust::format::{FormatSelection, FormatSelector, print_formats};
+use ytrust::format::{
+    FormatSelection, FormatSelector, is_muxed_selection, muxed_fallback, print_formats,
+};
 use ytrust::http::RequestConfig;
 use ytrust::json;
 use ytrust::output::{
@@ -409,10 +411,53 @@ async fn process_info(
         return Ok(());
     }
 
-    let selection = context
+    let primary = context
         .selector
         .select(&info.formats)
         .map_err(|error| challenge_context(error, solve_report.as_ref()))?;
+    let extras = if cli.output == "-" || !extras_requested(cli) {
+        Vec::new()
+    } else {
+        let extras_progress =
+            make_progress(context.events, &info, original_url, playlist, Vec::new());
+        write_extras(&info, playlist, cli, downloader, extras_progress.as_ref()).await?
+    };
+    match download_selection(&info, &primary, original_url, playlist, context, &extras).await {
+        Ok(()) => Ok(()),
+        Err(error) if should_try_fallback(&error, &primary, cli) => {
+            let Some(fallback) = muxed_fallback(&info, &primary) else {
+                return Err(error);
+            };
+            emit_fallback(context.events, &info, &primary, &fallback);
+            match fallback.single().and_then(|format| format.height) {
+                Some(height) => {
+                    status!(
+                        cli,
+                        "adaptive streams rejected; retrying with a {height}p muxed format"
+                    )
+                }
+                None => status!(
+                    cli,
+                    "adaptive streams rejected; retrying with a muxed format"
+                ),
+            }
+            download_selection(&info, &fallback, original_url, playlist, context, &extras).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_selection(
+    info: &VideoInfo,
+    selection: &FormatSelection,
+    original_url: &str,
+    playlist: Option<&PlaylistContext>,
+    context: &RunContext<'_>,
+    extras: &[ExtraFile],
+) -> Result<()> {
+    let cli = context.cli;
+    let downloader = context.downloader;
     let audio_mode = context.extract_audio() || selection.video.is_none();
 
     if !audio_mode
@@ -452,11 +497,11 @@ async fn process_info(
         .or(info.duration_secs);
     let use_content_length = context.section.is_none();
     let components = if audio_mode {
-        audio_components(&selection, duration_secs, use_content_length)
+        audio_components(selection, duration_secs, use_content_length)
     } else {
-        video_components(&selection, duration_secs, use_content_length)
+        video_components(selection, duration_secs, use_content_length)
     };
-    let progress = make_progress(context.events, &info, original_url, playlist, components);
+    let progress = make_progress(context.events, info, original_url, playlist, components);
 
     if cli.output == "-" {
         if cli.embed_subs || cli.remux_video.is_some() {
@@ -482,12 +527,10 @@ async fn process_info(
             .await;
     }
 
-    let extras = write_extras(&info, playlist, cli, downloader, progress.as_ref()).await?;
-
     if audio_mode {
         return download_audio_only(
-            &info,
-            &selection,
+            info,
+            selection,
             playlist,
             cli,
             downloader,
@@ -499,17 +542,67 @@ async fn process_info(
     }
 
     download_video(
-        &info,
-        &selection,
+        info,
+        selection,
         playlist,
         cli,
         downloader,
         duration_secs,
         context.section,
-        &extras,
+        extras,
         progress.as_ref(),
     )
     .await
+}
+
+fn should_try_fallback(error: &YtrustError, selection: &FormatSelection, cli: &Cli) -> bool {
+    !cli.no_fallback && error.is_forbidden() && !is_muxed_selection(selection)
+}
+
+fn extras_requested(cli: &Cli) -> bool {
+    cli.write_thumbnail
+        || cli.write_all_thumbnails
+        || cli.write_subs
+        || cli.write_auto_subs
+        || cli.embed_subs
+}
+
+fn selection_json(selection: &FormatSelection) -> serde_json::Value {
+    let formats: Vec<serde_json::Value> = selection
+        .video
+        .iter()
+        .chain(selection.audios.iter())
+        .map(|format| {
+            serde_json::json!({
+                "format_id": format.itag.to_string(),
+                "ext": format_ext(format),
+                "height": format.height,
+                "vcodec": format.video_codec,
+                "acodec": format.audio_codec,
+                "language": format.language,
+            })
+        })
+        .collect();
+    serde_json::json!({ "formats": formats })
+}
+
+fn emit_fallback(
+    events: Option<&EventSink>,
+    info: &VideoInfo,
+    from: &FormatSelection,
+    to: &FormatSelection,
+) {
+    let Some(events) = events else {
+        return;
+    };
+    events.emit(&serde_json::json!({
+        "v": 1,
+        "event": "fallback",
+        "id": info.id,
+        "reason": "http_forbidden",
+        "from": selection_json(from),
+        "to": selection_json(to),
+    }));
 }
 
 impl RunContext<'_> {

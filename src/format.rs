@@ -548,6 +548,76 @@ fn is_audio_ext(value: &str) -> bool {
     matches!(value, "m4a" | "mp3" | "opus" | "flac" | "wav" | "ogg")
 }
 
+/// A selection that is already a single file with both video and audio.
+pub fn is_muxed_selection(selection: &FormatSelection) -> bool {
+    selection
+        .single()
+        .is_some_and(|format| format.has_video && format.has_audio)
+}
+
+/// Builds a muxed fallback selection for adaptive streams rejected by YouTube.
+///
+/// Prefers a muxed format no taller than the originally requested height and
+/// falls back to the best muxed format when the requested height has no muxed
+/// variant.
+pub fn muxed_fallback(info: &VideoInfo, selection: &FormatSelection) -> Option<FormatSelection> {
+    if is_muxed_selection(selection) {
+        return None;
+    }
+    let height = selection
+        .video
+        .as_ref()
+        .and_then(|format| format.height)
+        .or_else(|| {
+            selection
+                .audios
+                .iter()
+                .filter_map(|format| format.height)
+                .max()
+        });
+    let mut expressions = Vec::new();
+    if let Some(height) = height {
+        expressions.push(format!("best[height<={height}]"));
+    }
+    expressions.push("best".to_owned());
+    let selected_itags = selection_itags(selection);
+    for expression in expressions {
+        let Ok(selector) = FormatSelector::parse(&expression) else {
+            continue;
+        };
+        let Ok(candidate) = selector.select(&info.formats) else {
+            continue;
+        };
+        if selection_itags(&candidate) == selected_itags {
+            continue;
+        }
+        // Preserve an audio-only request: use the muxed stream as the audio
+        // source so `download_audio_only` extracts it instead of saving video.
+        if selection.video.is_none() {
+            let Some(audio) = candidate.single().cloned() else {
+                continue;
+            };
+            return Some(FormatSelection {
+                video: None,
+                audios: vec![audio],
+            });
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+fn selection_itags(selection: &FormatSelection) -> Vec<u64> {
+    let mut itags: Vec<u64> = selection
+        .video
+        .iter()
+        .chain(selection.audios.iter())
+        .map(|format| format.itag)
+        .collect();
+    itags.sort_unstable();
+    itags
+}
+
 fn format_matches_video_kind(format: &Format, component: &Component) -> bool {
     match component.kind {
         Kind::BestVideo => is_video_only(format),
@@ -896,6 +966,55 @@ mod tests {
         broken.signature_cipher = Some("s=x&url=https%3A%2F%2Fexample.com".to_string());
         let info = info(vec![broken]);
         assert_eq!(best_audio(&info).unwrap().itag, 251);
+    }
+
+    #[test]
+    fn muxed_fallback_replaces_adaptive_selection() {
+        let info = info(vec![
+            format(137, true, false, Some(1080), None),
+            format(251, false, true, None, Some(160_000)),
+            format(18, true, true, Some(360), Some(96_000)),
+        ]);
+        let primary = select(&info, "bestvideo+bestaudio").unwrap();
+        assert!(primary.needs_merge());
+        let fallback = muxed_fallback(&info, &primary).unwrap();
+        assert!(is_muxed_selection(&fallback));
+        assert_eq!(fallback.single().unwrap().itag, 18);
+    }
+
+    #[test]
+    fn muxed_fallback_ignores_height_when_no_muxed_variant_matches() {
+        let info = info(vec![
+            format(160, true, false, Some(144), None),
+            format(251, false, true, None, Some(160_000)),
+            format(18, true, true, Some(360), Some(96_000)),
+        ]);
+        let primary = select(&info, "bestvideo[height<=144]+bestaudio").unwrap();
+        let fallback = muxed_fallback(&info, &primary).unwrap();
+        assert_eq!(fallback.single().unwrap().itag, 18);
+    }
+
+    #[test]
+    fn muxed_fallback_is_not_used_for_muxed_single() {
+        let info = info(vec![format(18, true, true, Some(360), Some(96_000))]);
+        let primary = select(&info, "best").unwrap();
+        assert!(is_muxed_selection(&primary));
+        assert!(muxed_fallback(&info, &primary).is_none());
+    }
+
+    #[test]
+    fn muxed_fallback_handles_audio_only_selection() {
+        let info = info(vec![
+            format(251, false, true, None, Some(160_000)),
+            format(18, true, true, Some(360), Some(96_000)),
+        ]);
+        let primary = select(&info, "bestaudio").unwrap();
+        let fallback = muxed_fallback(&info, &primary).unwrap();
+        assert!(fallback.video.is_none());
+        assert_eq!(fallback.audios.len(), 1);
+        assert_eq!(fallback.audios[0].itag, 18);
+        assert!(fallback.audios[0].has_video);
+        assert!(fallback.audios[0].has_audio);
     }
 
     #[test]

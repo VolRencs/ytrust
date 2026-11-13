@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 YTRUST="$ROOT/target/release/ytrust"
 VIDEO="${YTRUST_TEST_VIDEO:-https://www.youtube.com/watch?v=dQw4w9WgXcQ}"
+BLOCKED_VIDEO="${YTRUST_TEST_BLOCKED_VIDEO:-https://www.youtube.com/watch?v=x5ab3TJqK40}"
 COOKIES="${YTRUST_TEST_COOKIES:-${YTRUST_COOKIES:-}}"
+BROWSER="${YTRUST_TEST_BROWSER:-}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -15,6 +17,8 @@ fi
 args=()
 if [[ -n "$COOKIES" ]]; then
   args+=(--cookies "$COOKIES")
+elif [[ -n "$BROWSER" ]]; then
+  args+=(--cookies-from-browser "$BROWSER")
 fi
 
 echo "metadata"
@@ -74,5 +78,46 @@ ls "$TMP"/*.opus >/dev/null
 
 echo "merge"
 "$YTRUST" "${args[@]}" -f '313+251' --download-sections '*0-2' -P "$TMP" "$VIDEO" >/dev/null
+
+echo "adaptive 403 -> muxed fallback (video)"
+mkdir -p "$TMP/fallback"
+"$YTRUST" "${args[@]}" --progress-json --download-sections '*0-3' \
+  -f 'bestvideo[height<=144]+bestaudio' --merge-output-format mp4 \
+  -P "$TMP/fallback" -o '%(id)s.%(ext)s' "$BLOCKED_VIDEO" >"$TMP/fallback.ndjson"
+python3 - "$TMP/fallback.ndjson" "$TMP/fallback" <<'PY'
+import json, pathlib, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+events = {row["event"] for row in rows}
+assert "fallback" in events, events
+fallback = next(row for row in rows if row["event"] == "fallback")
+assert fallback["to"]["formats"], fallback
+slot = fallback["to"]["formats"]
+assert all(f.get("vcodec") and f.get("acodec") for f in slot), slot
+done = [row for row in rows if row["event"] == "done"]
+assert done and done[-1]["filepath"], "fallback done event has no filepath"
+assert pathlib.Path(done[-1]["filepath"]).is_file()
+print(f"  {fallback['from']['formats'][0]['format_id']} -> {slot[0]['format_id']}")
+PY
+
+echo "adaptive 403 -> muxed fallback (audio)"
+mkdir -p "$TMP/fallback-audio"
+"$YTRUST" "${args[@]}" -x -f bestaudio --audio-format mp3 --download-sections '*0-3' \
+  -P "$TMP/fallback-audio" -o '%(id)s.%(ext)s' "$BLOCKED_VIDEO" >/dev/null
+ls "$TMP/fallback-audio"/*.mp3 >/dev/null
+
+echo "fallback can be disabled"
+if "$YTRUST" "${args[@]}" --no-fallback --download-sections '*0-3' \
+  -f 'bestvideo[height<=144]+bestaudio' -P "$TMP/no-fallback" -o '%(id)s.%(ext)s' \
+  "$BLOCKED_VIDEO" >/dev/null 2>"$TMP/no-fallback.err"; then
+  echo "expected --no-fallback to fail" >&2
+  exit 1
+fi
+grep -q "403" "$TMP/no-fallback.err"
+
+echo "Shorts URL"
+mkdir -p "$TMP/short"
+"$YTRUST" "${args[@]}" --download-sections '*0-2' -f 18 \
+  -P "$TMP/short" "https://www.youtube.com/shorts/dQw4w9WgXcQ" >/dev/null
+ls "$TMP/short"/* >/dev/null
 
 echo "live checks passed"

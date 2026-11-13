@@ -194,6 +194,24 @@ impl YtrustError {
         }
     }
 
+    pub fn is_forbidden(&self) -> bool {
+        match self {
+            Self::Http(error) => error
+                .status()
+                .is_some_and(|status| matches!(status.as_u16(), 401 | 403 | 410)),
+            Self::HttpStatus { status, .. } => matches!(status, 401 | 403 | 410),
+            Self::Ffmpeg { stderr, .. } => {
+                let stderr = stderr.to_ascii_lowercase();
+                (stderr.contains("403") || stderr.contains("410"))
+                    && (stderr.contains("forbidden")
+                        || stderr.contains("access denied")
+                        || stderr.contains("http"))
+            }
+            Self::Context { source, .. } => source.is_forbidden(),
+            _ => false,
+        }
+    }
+
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Http(error) if error.is_timeout() => ErrorCode::Timeout,
@@ -234,6 +252,44 @@ mod tests {
             YtrustError::FormatNotFound("x".into()).code(),
             ErrorCode::FormatNotFound
         );
+    }
+
+    #[test]
+    fn classifies_forbidden_errors() {
+        assert!(
+            YtrustError::HttpStatus {
+                status: 403,
+                message: "x".into()
+            }
+            .is_forbidden()
+        );
+        assert!(
+            YtrustError::HttpStatus {
+                status: 410,
+                message: "x".into()
+            }
+            .is_forbidden()
+        );
+        assert!(
+            !YtrustError::HttpStatus {
+                status: 404,
+                message: "x".into()
+            }
+            .is_forbidden()
+        );
+        assert!(
+            YtrustError::Ffmpeg {
+                status: "8".into(),
+                stderr: "Error opening input: Server returned 403 Forbidden".into()
+            }
+            .is_forbidden()
+        );
+        let wrapped = YtrustError::HttpStatus {
+            status: 403,
+            message: "x".into(),
+        }
+        .context("download video");
+        assert!(wrapped.is_forbidden());
     }
 
     #[test]
