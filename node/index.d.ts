@@ -16,7 +16,9 @@ export interface HttpHeaders {
 export interface Format {
   format_id: string;
   format: string;
-  url: string;
+  url: string | null;
+  /** False when the URL still has an unresolved signature/n challenge. */
+  playable?: boolean;
   signature_cipher?: string | null;
   cipher?: string | null;
   ext: string;
@@ -60,10 +62,14 @@ export interface VideoResult {
   channel_id?: string;
   upload_date?: string;
   view_count?: number | null;
+  playlist_title?: string | null;
+  playlist_index?: number | null;
+  playlist_count?: number | null;
   is_live?: boolean;
   formats: Format[];
   best_audio?: Format | null;
   player_js_url?: string | null;
+  hls_manifest_url?: string | null;
   subtitles?: Record<string, SubtitleTrack[]>;
   automatic_captions?: Record<string, SubtitleTrack[]>;
 }
@@ -99,6 +105,8 @@ export interface PlaylistResult {
 export type ResolveResult = VideoResult | PlaylistResult;
 
 export interface AudioResult extends Format {
+  url: string;
+  playable: true;
   id: string;
   title: string;
   duration?: number | null;

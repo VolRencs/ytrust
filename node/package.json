@@ -1,6 +1,6 @@
 {
   "name": "ytrust",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "packageManager": "pnpm@12.18.0",
   "description": "Native ytrust bindings for Node.js",
@@ -71,7 +71,7 @@
     "lint": "biome check .",
     "format": "biome check --write .",
     "check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && pnpm typecheck && pnpm lint && pnpm test",
-    "prepack": "pnpm build && pnpm check"
+    "prepack": "pnpm build"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.7",

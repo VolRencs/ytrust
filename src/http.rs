@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -12,14 +13,35 @@ use crate::constants::{DEFAULT_TIMEOUT_SECS, WEB_UA};
 use crate::error::{ErrorCode, Result, YtrustError};
 use crate::util::unix_time;
 
+pub(crate) const MAX_HTML_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_PLAYER_JS_BYTES: usize = 32 * 1024 * 1024;
+const MAX_JSON_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const CLIENT_CACHE_CAPACITY: usize = 8;
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct RequestConfig {
     pub proxy: Option<String>,
     pub cookies: Option<String>,
+    pub cookie_jar: Option<crate::cookies::CookieJar>,
     pub sapisid: Option<String>,
     pub sapisid1p: Option<String>,
     pub sapisid3p: Option<String>,
     pub timeout: u64,
+}
+
+impl RequestConfig {
+    pub fn cookies_for(&self, url: &str) -> Option<String> {
+        if let Some(jar) = &self.cookie_jar {
+            return jar.header_for_url(url);
+        }
+        if is_youtube_host(url) {
+            self.cookies.clone()
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for RequestConfig {
@@ -27,6 +49,7 @@ impl Default for RequestConfig {
         Self {
             proxy: None,
             cookies: None,
+            cookie_jar: None,
             sapisid: None,
             sapisid1p: None,
             sapisid3p: None,
@@ -35,21 +58,34 @@ impl Default for RequestConfig {
     }
 }
 
-type ClientCache = Mutex<HashMap<(Option<String>, u64), Client>>;
+type ClientCache = Mutex<HashMap<(Option<String>, u64), (Instant, Client)>>;
 
 static CLIENTS: OnceLock<ClientCache> = OnceLock::new();
 
+// Reuse the same client for resolve and download paths instead of building a
+// second connection pool.
+pub fn client_for_config(proxy: Option<&str>, timeout: u64) -> Result<Client> {
+    client(&RequestConfig {
+        proxy: proxy.map(ToString::to_string),
+        timeout,
+        ..RequestConfig::default()
+    })
+}
+
 /// Build (or reuse) an HTTP client for YouTube API/page traffic.
 ///
-/// The client is keyed by proxy and timeout so that long-lived Node processes
-/// reuse connections across resolves instead of creating a new pool per call.
+/// The client is keyed by proxy and effective timeout so that long-lived Node
+/// processes reuse connections across resolves instead of creating a new pool
+/// per call. The cache is bounded because Node callers control `timeout`.
 pub fn client(config: &RequestConfig) -> Result<Client> {
-    let key = (config.proxy.clone(), config.timeout);
+    let key = (config.proxy.clone(), config.timeout.max(5));
     let cache = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(cache) = cache.lock()
-        && let Some(client) = cache.get(&key)
     {
-        return Ok(client.clone());
+        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((inserted, client)) = cache.get_mut(&key) {
+            *inserted = Instant::now();
+            return Ok(client.clone());
+        }
     }
 
     let timeout = Duration::from_secs(config.timeout.max(5));
@@ -59,13 +95,23 @@ pub fn client(config: &RequestConfig) -> Result<Client> {
         .user_agent(WEB_UA);
     if let Some(proxy) = &config.proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| {
-            YtrustError::coded(ErrorCode::InvalidInput, format!("invalid proxy: {error}"))
+            YtrustError::coded(
+                ErrorCode::InvalidInput,
+                format!("invalid proxy {}: {error}", redact_proxy(proxy)),
+            )
         })?);
     }
     let client = builder.build()?;
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(key, client.clone());
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if cache.len() >= CLIENT_CACHE_CAPACITY
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (inserted, _))| *inserted)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
     }
+    cache.insert(key, (Instant::now(), client.clone()));
     Ok(client)
 }
 
@@ -118,7 +164,7 @@ pub async fn post_innertube<T: DeserializeOwned>(
                 .header("Sec-Fetch-Mode", "navigate");
         }
         let mut builder = builder.json(request.body);
-        if let Some(cookies) = &config.cookies {
+        if let Some(cookies) = config.cookies_for("https://www.youtube.com/youtubei/v1/") {
             builder = builder.header(reqwest::header::COOKIE, cookies);
         }
         if let Some(visitor_data) = request.visitor_data {
@@ -132,29 +178,10 @@ pub async fn post_innertube<T: DeserializeOwned>(
                 .header("X-Youtube-Bootstrap-Logged-In", "true");
         }
 
-        match tokio::time::timeout(timeout, builder.send()).await {
-            Ok(Ok(response)) => {
-                let status = response.status();
-                let text = match tokio::time::timeout(timeout, response.text()).await {
-                    Ok(Ok(text)) => text,
-                    Ok(Err(error)) => {
-                        last_error = Some(YtrustError::from(error));
-                        if attempt < 2 {
-                            tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-                        }
-                        continue;
-                    }
-                    Err(_) => {
-                        last_error = Some(YtrustError::coded(
-                            ErrorCode::Timeout,
-                            "YouTube request timed out",
-                        ));
-                        if attempt < 2 {
-                            tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-                        }
-                        continue;
-                    }
-                };
+        let mut retry_after = None;
+        match send_text(builder, timeout, MAX_JSON_BYTES).await {
+            Ok((status, after, text)) => {
+                retry_after = after;
                 tracing::debug!(
                     "innertube {} HTTP {status} ({} bytes)",
                     request.endpoint,
@@ -162,6 +189,12 @@ pub async fn post_innertube<T: DeserializeOwned>(
                 );
 
                 if status.is_success() {
+                    if text.trim_start().starts_with('<') {
+                        return Err(YtrustError::coded(
+                            ErrorCode::BotCheck,
+                            "YouTube returned an HTML page instead of JSON; cookies may be required",
+                        ));
+                    }
                     return serde_json::from_str(&text).map_err(YtrustError::from);
                 }
 
@@ -169,25 +202,22 @@ pub async fn post_innertube<T: DeserializeOwned>(
                     ErrorCode::Http,
                     format!("YouTube API returned HTTP {status}"),
                 );
-                if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                if retryable_status(status) {
                     last_error = Some(error);
                 } else {
                     return Err(error);
                 }
             }
-            Ok(Err(error)) => {
-                last_error = Some(YtrustError::from(error));
-            }
-            Err(_) => {
-                last_error = Some(YtrustError::coded(
-                    ErrorCode::Timeout,
-                    "YouTube request timed out",
-                ));
+            Err(error) => {
+                if !error.is_retryable() {
+                    return Err(error);
+                }
+                last_error = Some(error);
             }
         }
 
         if attempt < 2 {
-            tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            tokio::time::sleep(retry_delay(attempt, retry_after)).await;
         }
     }
 
@@ -201,6 +231,17 @@ pub async fn fetch_text(
     config: &RequestConfig,
     user_agent: &str,
     referer: Option<&str>,
+) -> Result<String> {
+    fetch_text_limited(client, url, config, user_agent, referer, MAX_HTML_BYTES).await
+}
+
+pub async fn fetch_text_limited(
+    client: &Client,
+    url: &str,
+    config: &RequestConfig,
+    user_agent: &str,
+    referer: Option<&str>,
+    limit: usize,
 ) -> Result<String> {
     let timeout = Duration::from_secs(config.timeout.max(5));
     let mut last_error = None;
@@ -218,49 +259,37 @@ pub async fn fetch_text(
         if let Some(referer) = referer {
             request = request.header(reqwest::header::REFERER, referer);
         }
-        if is_youtube_host(url)
-            && let Some(cookies) = &config.cookies
-        {
+        if let Some(cookies) = config.cookies_for(url) {
             request = request.header(reqwest::header::COOKIE, cookies);
         }
 
-        match tokio::time::timeout(timeout, request.send()).await {
-            Ok(Ok(response)) => {
-                let status = response.status();
-                if !status.is_success() {
-                    let error = YtrustError::coded(
-                        ErrorCode::Http,
-                        format!("HTTP {status} for {}", redact_url(url)),
-                    );
-                    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                        last_error = Some(error);
-                    } else {
-                        return Err(error);
-                    }
+        let mut retry_after = None;
+        match send_text(request, timeout, limit).await {
+            Ok((status, after, text)) => {
+                retry_after = after;
+                if status.is_success() {
+                    return Ok(text);
+                }
+                let error = YtrustError::coded(
+                    ErrorCode::Http,
+                    format!("HTTP {status} for {}", redact_url(url)),
+                );
+                if retryable_status(status) {
+                    last_error = Some(error);
                 } else {
-                    match tokio::time::timeout(timeout, response.text()).await {
-                        Ok(Ok(text)) => return Ok(text),
-                        Ok(Err(error)) => last_error = Some(YtrustError::from(error)),
-                        Err(_) => {
-                            last_error = Some(YtrustError::coded(
-                                ErrorCode::Timeout,
-                                format!("request timed out for {}", redact_url(url)),
-                            ));
-                        }
-                    }
+                    return Err(error);
                 }
             }
-            Ok(Err(error)) => last_error = Some(YtrustError::from(error)),
-            Err(_) => {
-                last_error = Some(YtrustError::coded(
-                    ErrorCode::Timeout,
-                    format!("request timed out for {}", redact_url(url)),
-                ));
+            Err(error) => {
+                if !error.is_retryable() {
+                    return Err(error);
+                }
+                last_error = Some(error);
             }
         }
 
         if attempt < 2 {
-            tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            tokio::time::sleep(retry_delay(attempt, retry_after)).await;
         }
     }
 
@@ -270,6 +299,94 @@ pub async fn fetch_text(
             format!("request failed for {}", redact_url(url)),
         )
     }))
+}
+
+async fn send_text(
+    builder: reqwest::RequestBuilder,
+    timeout: Duration,
+    limit: usize,
+) -> Result<(StatusCode, Option<Duration>, String)> {
+    tokio::time::timeout(timeout, async {
+        let response = builder.send().await?;
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
+        let strict = status.is_success();
+        let limit = if strict { limit } else { MAX_ERROR_BODY_BYTES };
+        let text = read_body(response, limit, strict).await?;
+        Ok((status, retry_after, text))
+    })
+    .await
+    .map_err(|_| YtrustError::coded(ErrorCode::Timeout, "YouTube request timed out"))?
+}
+
+async fn read_body(response: reqwest::Response, limit: usize, strict: bool) -> Result<String> {
+    if let Some(length) = response.content_length()
+        && length > limit as u64
+        && strict
+    {
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidResponse,
+            format!("response is too large ({length} bytes)"),
+        ));
+    }
+    let mut body =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(1024 * 1024) as usize);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len() + chunk.len() > limit {
+            if strict {
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidResponse,
+                    format!("response exceeded {limit} bytes"),
+                ));
+            }
+            let remaining = limit.saturating_sub(body.len());
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if strict {
+        String::from_utf8(body).map_err(|_| {
+            YtrustError::coded(ErrorCode::InvalidResponse, "response was not valid UTF-8")
+        })
+    } else {
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+}
+
+fn retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_EARLY
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+pub(crate) fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(retry_after) = retry_after {
+        return retry_after;
+    }
+    let base = 1u64 << attempt.min(4);
+    let jitter = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_nanos() % 250))
+        .unwrap_or(0);
+    Duration::from_millis(base * 1000 + jitter)
+}
+
+fn redact_proxy(proxy: &str) -> String {
+    let Ok(mut url) = Url::parse(proxy) else {
+        return "<invalid proxy>".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
 }
 
 pub fn authorization_header(

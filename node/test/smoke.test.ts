@@ -3,6 +3,8 @@ import { createRequire } from "node:module";
 import test from "node:test";
 import { errorCode, resolve, resolveAudio, version, YtrustError } from "../index.js";
 
+const integrationOptions = process.env.YTRUST_COOKIES ? { cookiesPath: process.env.YTRUST_COOKIES } : {};
+
 test("version", () => {
   assert.match(version(), /^\d+\.\d+\.\d+/);
 });
@@ -20,6 +22,8 @@ test("errorCode classifies common failures", () => {
   assert.equal(errorCode("format not available: 137"), "FORMAT_NOT_FOUND");
   assert.equal(errorCode("ffmpeg was not found"), "FFMPEG");
   assert.equal(errorCode("I/O: No such file or directory"), "IO");
+  assert.equal(errorCode("[IO] I/O: Connection reset by peer"), "IO");
+  assert.equal(errorCode("[BOTCHECK] Sign in to confirm you're not a bot"), "BOTCHECK");
   assert.equal(errorCode("challenge solving failed"), "CHALLENGE_FAILED");
   assert.equal(errorCode("JSON: expected value"), "INVALID_RESPONSE");
   assert.equal(errorCode("native addon is unavailable: missing"), "NATIVE_LOAD");
@@ -96,22 +100,42 @@ test("resolve validates options before calling native code", async () => {
       return true;
     },
   );
+  await assert.rejects(
+    // @ts-expect-error testing unknown option validation
+    () => resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", { cookiePath: "typo.txt" }),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "INVALID_INPUT");
+      return true;
+    },
+  );
+  await assert.rejects(
+    // @ts-expect-error testing runtime validation
+    () => resolve(null),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "INVALID_INPUT");
+      return true;
+    },
+  );
 });
 
 test("resolve single video", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
-  const result = await resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  const result = await resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", integrationOptions);
   assert.equal(result._type, "video");
   assert.equal(result.id, "dQw4w9WgXcQ");
   assert.ok(Array.isArray(result.formats));
   assert.ok(result.best_audio);
+  assert.equal(result.best_audio.playable, true);
   assert.equal(typeof result.best_audio.http_headers["User-Agent"], "string");
   assert.equal(result.best_audio.http_headers.Referer, "https://www.youtube.com/");
   assert.equal(typeof result.best_audio.expires_at, "number");
 });
 
 test("resolveAudio single video", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
-  const audio = await resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  const audio = await resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ", integrationOptions);
   assert.equal(audio.id, "dQw4w9WgXcQ");
+  assert.equal(audio.playable, true);
   assert.match(audio.url, /^https:\/\/.+googlevideo\.com\//);
   assert.match(audio.acodec, /^opus/);
   assert.equal(typeof audio.http_headers["User-Agent"], "string");
@@ -130,7 +154,10 @@ test("resolveAudio solves signatureCipher formats", {
 });
 
 test("resolveAudio ignores an attached playlist", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
-  const audio = await resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL63F0C78739B09958");
+  const audio = await resolveAudio(
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL63F0C78739B09958",
+    integrationOptions,
+  );
   assert.equal(audio.id, "dQw4w9WgXcQ");
   assert.match(audio.acodec, /^opus/);
 });

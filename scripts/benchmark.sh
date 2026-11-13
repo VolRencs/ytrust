@@ -38,11 +38,11 @@ echo
 
 # Warm up DNS/TLS/player caches.
 "$YTRUST" --skip-download -J "$VIDEO" >/dev/null 2>&1 || true
-"$YTRUST" --skip-download --flat-playlist --playlist-items "1-$ITEMS" -J "$PLAYLIST" >/dev/null 2>&1 || true
+"$YTRUST" --skip-download --flat-playlist --playlist-items "1-$ITEMS" -j "$PLAYLIST" >/dev/null 2>&1 || true
 
 measure "ytrust startup (--version)" "$YTRUST" --version
 measure "ytrust scan single video (-J)" "$YTRUST" --skip-download -J "$VIDEO"
-measure "ytrust scan playlist 1-$ITEMS (-J)" "$YTRUST" --skip-download --flat-playlist --playlist-items "1-$ITEMS" -J "$PLAYLIST"
+measure "ytrust scan playlist 1-$ITEMS (-j --flat-playlist)" "$YTRUST" --skip-download --flat-playlist --playlist-items "1-$ITEMS" -j "$PLAYLIST"
 
 if [[ -f "$ROOT/node/native.cjs" && -d "$ROOT/node/node_modules" ]]; then
   echo

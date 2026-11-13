@@ -63,7 +63,8 @@ pub async fn resolve(
             })
         }
         Target::Playlist { id, video_id } => {
-            let fetch_limit = playlist_fetch_limit(&options.playlist_items, options.playlist_limit);
+            let fetch_limit =
+                playlist_fetch_limit(&options.playlist_items, options.playlist_limit)?;
             let mut playlist = match video_id {
                 Some(video_id) => {
                     fetch_inline_playlist(&video_id, &id, config, fetch_limit).await?
@@ -88,10 +89,10 @@ pub async fn resolve(
     }
 }
 
-fn playlist_fetch_limit(items: &str, limit: u64) -> u64 {
-    max_playlist_item(items)
+fn playlist_fetch_limit(items: &str, limit: u64) -> Result<u64> {
+    Ok(max_playlist_item(items)?
         .map(|value| (value as u64).min(limit))
-        .unwrap_or(limit)
+        .unwrap_or(limit))
 }
 
 #[cfg(test)]
@@ -100,9 +101,11 @@ mod tests {
 
     #[test]
     fn computes_playlist_fetch_limit() {
-        assert_eq!(playlist_fetch_limit("1-3,5", 500), 5);
-        assert_eq!(playlist_fetch_limit("1-", 500), 500);
-        assert_eq!(playlist_fetch_limit("10-", 5), 5);
-        assert_eq!(playlist_fetch_limit("", 50), 50);
+        assert_eq!(playlist_fetch_limit("1-3,5", 500).unwrap(), 5);
+        assert_eq!(playlist_fetch_limit("1-", 500).unwrap(), 500);
+        assert_eq!(playlist_fetch_limit("10-", 5).unwrap(), 5);
+        assert_eq!(playlist_fetch_limit("", 50).unwrap(), 50);
+        assert!(playlist_fetch_limit("abc", 50).is_err());
+        assert!(playlist_fetch_limit("0", 50).is_err());
     }
 }

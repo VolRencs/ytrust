@@ -68,32 +68,32 @@ impl Filter {
             return false;
         }
         if let Some(limit) = self.height_lte
-            && value.height.unwrap_or(0) > limit
+            && value.height.is_none_or(|height| height > limit)
         {
             return false;
         }
         if let Some(limit) = self.height_gte
-            && value.height.unwrap_or(0) < limit
+            && value.height.is_none_or(|height| height < limit)
         {
             return false;
         }
         if let Some(limit) = self.width_lte
-            && value.width.unwrap_or(0) > limit
+            && value.width.is_none_or(|width| width > limit)
         {
             return false;
         }
         if let Some(limit) = self.width_gte
-            && value.width.unwrap_or(0) < limit
+            && value.width.is_none_or(|width| width < limit)
         {
             return false;
         }
         if let Some(limit) = self.fps_lte
-            && value.fps.unwrap_or(0) > limit
+            && value.fps.is_none_or(|fps| fps > limit)
         {
             return false;
         }
         if let Some(limit) = self.fps_gte
-            && value.fps.unwrap_or(0) < limit
+            && value.fps.is_none_or(|fps| fps < limit)
         {
             return false;
         }
@@ -110,80 +110,112 @@ impl Filter {
             return false;
         }
 
-        let vcodec = value
-            .video_codec
-            .as_deref()
-            .unwrap_or("none")
-            .to_lowercase();
-        let acodec = value
-            .audio_codec
-            .as_deref()
-            .unwrap_or("none")
-            .to_lowercase();
-        if let Some(expected) = &self.vcodec
-            && !vcodec.contains(expected)
-        {
-            return false;
-        }
-        if let Some(unexpected) = &self.vcodec_not
-            && vcodec.contains(unexpected)
-        {
-            return false;
-        }
-        if let Some(prefix) = &self.vcodec_prefix
-            && !vcodec.starts_with(prefix)
-        {
-            return false;
-        }
-        if let Some(expected) = &self.acodec
-            && !acodec.contains(expected)
-        {
-            return false;
-        }
-        if let Some(unexpected) = &self.acodec_not
-            && acodec.contains(unexpected)
-        {
-            return false;
-        }
-        if let Some(prefix) = &self.acodec_prefix
-            && !acodec.starts_with(prefix)
-        {
-            return false;
+        if self.has_video_codec_filter() {
+            let vcodec = value
+                .video_codec
+                .as_deref()
+                .unwrap_or("none")
+                .to_lowercase();
+            if let Some(expected) = &self.vcodec
+                && !vcodec.contains(expected)
+            {
+                return false;
+            }
+            if let Some(unexpected) = &self.vcodec_not
+                && vcodec.contains(unexpected)
+            {
+                return false;
+            }
+            if let Some(prefix) = &self.vcodec_prefix
+                && !vcodec.starts_with(prefix)
+            {
+                return false;
+            }
         }
 
-        let language = value.language.as_deref().unwrap_or("none").to_lowercase();
-        if let Some(expected) = &self.language
-            && language != *expected
-        {
-            return false;
+        if self.has_audio_codec_filter() {
+            let acodec = value
+                .audio_codec
+                .as_deref()
+                .unwrap_or("none")
+                .to_lowercase();
+            if let Some(expected) = &self.acodec
+                && !acodec.contains(expected)
+            {
+                return false;
+            }
+            if let Some(unexpected) = &self.acodec_not
+                && acodec.contains(unexpected)
+            {
+                return false;
+            }
+            if let Some(prefix) = &self.acodec_prefix
+                && !acodec.starts_with(prefix)
+            {
+                return false;
+            }
         }
-        if let Some(unexpected) = &self.language_not
-            && language == *unexpected
-        {
-            return false;
-        }
-        if let Some(prefix) = &self.language_prefix
-            && !language.starts_with(prefix)
-        {
-            return false;
-        }
-        if let Some(fragment) = &self.language_contains
-            && !language.contains(fragment)
-        {
-            return false;
+
+        if self.has_language_filter() {
+            let language = value.language.as_deref().unwrap_or("none").to_lowercase();
+            if let Some(expected) = &self.language
+                && !language_matches(&language, expected)
+            {
+                return false;
+            }
+            if let Some(unexpected) = &self.language_not
+                && language_matches(&language, unexpected)
+            {
+                return false;
+            }
+            if let Some(prefix) = &self.language_prefix
+                && !language.starts_with(prefix)
+            {
+                return false;
+            }
+            if let Some(fragment) = &self.language_contains
+                && !language.contains(fragment)
+            {
+                return false;
+            }
         }
 
         true
     }
+
+    fn has_video_codec_filter(&self) -> bool {
+        self.vcodec.is_some() || self.vcodec_not.is_some() || self.vcodec_prefix.is_some()
+    }
+
+    fn has_audio_codec_filter(&self) -> bool {
+        self.acodec.is_some() || self.acodec_not.is_some() || self.acodec_prefix.is_some()
+    }
+
+    fn has_language_filter(&self) -> bool {
+        self.language.is_some()
+            || self.language_not.is_some()
+            || self.language_prefix.is_some()
+            || self.language_contains.is_some()
+    }
+}
+
+fn language_matches(actual: &str, expected: &str) -> bool {
+    actual == expected
+        || actual
+            .strip_prefix(expected)
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 fn ext_matches(actual: &str, expected: &str) -> bool {
-    let expected = expected.trim_start_matches('.').to_ascii_lowercase();
-    if actual.eq_ignore_ascii_case(&expected) {
+    let expected = expected.trim_start_matches('.');
+    if actual.eq_ignore_ascii_case(expected) {
         return true;
     }
     matches!(
-        (actual, expected.as_str()),
+        (
+            actual.to_ascii_lowercase().as_str(),
+            expected.to_ascii_lowercase().as_str()
+        ),
         ("m4a", "mp4") | ("mp4", "m4a") | ("webm", "opus") | ("mka", "m4a")
     )
 }
@@ -193,6 +225,7 @@ struct Component {
     kind: Kind,
     filter: Filter,
     argument: String,
+    itag: Option<u64>,
 }
 
 impl Component {
@@ -218,11 +251,15 @@ impl Component {
                 ));
             }
         };
+        let itag = (kind == Kind::Exact)
+            .then(|| base.parse::<u64>().ok())
+            .flatten();
 
         Ok(Self {
             kind,
             filter,
             argument,
+            itag,
         })
     }
 }
@@ -321,62 +358,81 @@ fn apply_filter(filter: &mut Filter, expression: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn select(info: &VideoInfo, expression: &str) -> Result<FormatSelection> {
-    let expression = if expression.trim().is_empty() {
-        "bestvideo+bestaudio/best"
-    } else {
-        expression.trim()
-    };
-
-    let mut last_error = None;
-    for alternative in expression.split('/') {
-        match select_alternative(&info.formats, alternative.trim()) {
-            Ok(selection) => return Ok(selection),
-            Err(err) => last_error = Some(err),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        YtrustError::FormatNotFound(format!("no format matched {expression:?}"))
-    }))
+pub struct FormatSelector {
+    expression: String,
+    alternatives: Vec<Vec<Component>>,
 }
 
-fn select_alternative(formats: &[Format], alternative: &str) -> Result<FormatSelection> {
-    let parts: Vec<&str> = alternative
-        .split('+')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
-    if parts.is_empty() {
-        return Err(YtrustError::coded(
-            ErrorCode::InvalidInput,
-            "empty format selector",
-        ));
+impl FormatSelector {
+    pub fn parse(expression: &str) -> Result<Self> {
+        let expression = if expression.trim().is_empty() {
+            crate::constants::DEFAULT_FORMAT
+        } else {
+            expression.trim()
+        };
+        let mut alternatives = Vec::new();
+        for alternative in expression.split('/') {
+            let parts: Vec<Component> = alternative
+                .split('+')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(Component::parse)
+                .collect::<Result<_>>()?;
+            if parts.is_empty() {
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    "empty format selector",
+                ));
+            }
+            alternatives.push(parts);
+        }
+        Ok(Self {
+            expression: expression.to_string(),
+            alternatives,
+        })
     }
 
+    pub fn select(&self, formats: &[Format]) -> Result<FormatSelection> {
+        let mut last_error = None;
+        for parts in &self.alternatives {
+            match select_alternative(formats, parts) {
+                Ok(selection) => return Ok(selection),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            YtrustError::FormatNotFound(format!("no format matched {:?}", self.expression))
+        }))
+    }
+}
+
+pub fn select(info: &VideoInfo, expression: &str) -> Result<FormatSelection> {
+    FormatSelector::parse(expression)?.select(&info.formats)
+}
+
+fn select_alternative(formats: &[Format], parts: &[Component]) -> Result<FormatSelection> {
     let mut video = None;
     let mut audios = Vec::new();
-    for part in parts {
-        let component = Component::parse(part)?;
+    for component in parts {
         match component.kind {
             Kind::BestVideo | Kind::BestVideoAny | Kind::WorstVideo => {
-                let format = choose_video(formats, &component)?;
-                set_video(&mut video, format, alternative)?;
+                let format = choose_video(formats, component)?;
+                set_video(&mut video, format, &component.argument)?;
             }
             Kind::BestAudio | Kind::WorstAudio => {
-                let format = choose_audio(formats, &component)?;
+                let format = choose_audio(formats, component)?;
                 push_audio(&mut audios, format);
             }
             Kind::BestAudioAny => {
-                let format = choose_audio_any(formats, &component)?;
+                let format = choose_audio_any(formats, component)?;
                 push_audio(&mut audios, format);
             }
             Kind::Best | Kind::BestAny | Kind::Worst | Kind::BestExt | Kind::Exact => {
-                let format = choose_single(formats, &component)?;
+                let format = choose_single(formats, component)?;
                 if is_audio_only(&format) {
                     push_audio(&mut audios, format);
                 } else {
-                    set_video(&mut video, format, alternative)?;
+                    set_video(&mut video, format, &component.argument)?;
                 }
             }
         }
@@ -384,7 +440,12 @@ fn select_alternative(formats: &[Format], alternative: &str) -> Result<FormatSel
 
     if video.is_none() && audios.is_empty() {
         return Err(YtrustError::FormatNotFound(format!(
-            "no format matched {alternative:?}"
+            "no format matched {:?}",
+            parts
+                .iter()
+                .map(|part| part.argument.as_str())
+                .collect::<Vec<_>>()
+                .join("+")
         )));
     }
 
@@ -414,108 +475,63 @@ fn push_audio(audios: &mut Vec<Format>, format: Format) {
 }
 
 fn choose_single(formats: &[Format], component: &Component) -> Result<Format> {
-    let mut candidates: Vec<&Format> = formats
-        .iter()
-        .filter(|format| {
-            component.filter.matches(format)
-                && format_matches_kind(format, component)
-                && !(matches!(component.kind, Kind::Worst) && format.is_hls)
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return Err(YtrustError::FormatNotFound(component.argument.clone()));
-    }
-
-    candidates.sort_by(|a, b| compare_video(a, b));
+    let candidates = formats.iter().filter(|format| {
+        component.filter.matches(format)
+            && format_matches_kind(format, component)
+            && !(matches!(component.kind, Kind::Worst) && format.is_hls)
+    });
     let selected = if matches!(component.kind, Kind::Worst) {
-        candidates.first()
+        candidates.min_by(|a, b| compare_video(a, b))
     } else {
-        candidates.last()
+        candidates.max_by(|a, b| compare_video(a, b))
     };
-
-    Ok((*selected.expect("non-empty candidate list")).clone())
+    selected
+        .cloned()
+        .ok_or_else(|| YtrustError::FormatNotFound(component.argument.clone()))
 }
 
 fn choose_video(formats: &[Format], component: &Component) -> Result<Format> {
-    let mut candidates: Vec<&Format> = formats
-        .iter()
-        .filter(|format| {
-            format.has_video
-                && component.filter.matches(format)
-                && format_matches_video_kind(format, component)
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return Err(YtrustError::FormatNotFound(format!(
-            "{} (video)",
-            component.argument
-        )));
-    }
-
-    candidates.sort_by(|a, b| compare_video(a, b));
+    let candidates = formats.iter().filter(|format| {
+        format.has_video
+            && component.filter.matches(format)
+            && format_matches_video_kind(format, component)
+    });
     let selected = if matches!(component.kind, Kind::WorstVideo) {
-        candidates.first()
+        candidates.min_by(|a, b| compare_video(a, b))
     } else {
-        candidates.last()
+        candidates.max_by(|a, b| compare_video(a, b))
     };
-
-    Ok((*selected.expect("non-empty candidate list")).clone())
+    selected
+        .cloned()
+        .ok_or_else(|| YtrustError::FormatNotFound(format!("{} (video)", component.argument)))
 }
 
 fn choose_audio(formats: &[Format], component: &Component) -> Result<Format> {
-    let mut candidates: Vec<&Format> = formats
+    let candidates = formats
         .iter()
-        .filter(|format| {
-            format.has_audio
-                && !format.has_video
-                && component.filter.matches(format)
-                && format_matches_audio_kind(format, component)
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return Err(YtrustError::FormatNotFound(format!(
-            "{} (audio)",
-            component.argument
-        )));
-    }
-
-    candidates.sort_by(|a, b| compare_audio(a, b));
+        .filter(|format| format.has_audio && !format.has_video && component.filter.matches(format));
     let selected = if matches!(component.kind, Kind::WorstAudio) {
-        candidates.first()
+        candidates.min_by(|a, b| compare_audio(a, b))
     } else {
-        candidates.last()
+        candidates.max_by(|a, b| compare_audio(a, b))
     };
-
-    Ok((*selected.expect("non-empty candidate list")).clone())
+    selected
+        .cloned()
+        .ok_or_else(|| YtrustError::FormatNotFound(format!("{} (audio)", component.argument)))
 }
 
 fn choose_audio_any(formats: &[Format], component: &Component) -> Result<Format> {
-    let mut candidates: Vec<&Format> = formats
+    formats
         .iter()
-        .filter(|format| {
-            format.has_audio
-                && component.filter.matches(format)
-                && format_matches_audio_kind(format, component)
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return Err(YtrustError::FormatNotFound(format!(
-            "{} (audio)",
-            component.argument
-        )));
-    }
-
-    candidates.sort_by(|a, b| compare_audio(a, b));
-    Ok((*candidates.last().expect("non-empty candidate list")).clone())
+        .filter(|format| format.has_audio && component.filter.matches(format))
+        .max_by(|a, b| compare_audio(a, b))
+        .cloned()
+        .ok_or_else(|| YtrustError::FormatNotFound(format!("{} (audio)", component.argument)))
 }
 
 fn format_matches_kind(format: &Format, component: &Component) -> bool {
     match component.kind {
-        Kind::Exact => format.itag.to_string() == component.argument,
+        Kind::Exact => component.itag == Some(format.itag),
         Kind::BestExt if is_audio_ext(&component.argument) => is_audio_only(format),
         Kind::BestExt => {
             format.has_video
@@ -535,40 +551,45 @@ fn is_audio_ext(value: &str) -> bool {
 fn format_matches_video_kind(format: &Format, component: &Component) -> bool {
     match component.kind {
         Kind::BestVideo => is_video_only(format),
-        Kind::BestVideoAny | Kind::WorstVideo => true,
-        Kind::Exact => format.itag.to_string() == component.argument,
-        Kind::BestExt => ext_matches(format_ext(format), &component.argument),
         _ => true,
     }
 }
 
-fn format_matches_audio_kind(format: &Format, component: &Component) -> bool {
-    match component.kind {
-        Kind::Exact => format.itag.to_string() == component.argument,
-        Kind::BestExt => ext_matches(format_ext(format), &component.argument),
-        _ => true,
-    }
-}
-
-/// Pick the best playable audio stream: the default audio track first,
+/// Pick the best audio stream: playable URLs first, then the default track,
 /// then audio-only over muxed, then Opus, then bitrate. HLS manifests are
 /// excluded from the first pass because callers cannot seek in them like a
 /// regular media URL.
 pub fn best_audio(info: &VideoInfo) -> Option<&Format> {
-    let rate = |format: &Format| format.audio_bitrate.unwrap_or(format.bitrate);
+    let rate = |format: &Format| {
+        format
+            .audio_bitrate
+            .filter(|rate| *rate > 0)
+            .unwrap_or(format.bitrate)
+    };
     let key = |format: &Format| {
         (
-            u8::from(!format.has_video),
             u8::from(format.audio_is_default),
+            u8::from(!format.has_video),
             u8::from(is_opus(format)),
             rate(format),
-            u8::from(!format.url.is_empty()),
         )
     };
     info.formats
         .iter()
-        .filter(|format| format.has_audio && !format.is_hls)
+        .filter(|format| format.has_audio && !format.is_hls && !format.url.is_empty())
         .max_by_key(|format| key(format))
+        .or_else(|| {
+            info.formats
+                .iter()
+                .filter(|format| format.has_audio && !format.url.is_empty())
+                .max_by_key(|format| key(format))
+        })
+        .or_else(|| {
+            info.formats
+                .iter()
+                .filter(|format| format.has_audio && !format.is_hls)
+                .max_by_key(|format| key(format))
+        })
         .or_else(|| {
             info.formats
                 .iter()
@@ -619,6 +640,12 @@ pub fn print_formats(info: &VideoInfo) -> Result<()> {
     use std::io::Write;
 
     let mut out = std::io::stdout().lock();
+    write_formats(&mut out, info)?;
+    out.flush()?;
+    Ok(())
+}
+
+pub fn write_formats(out: &mut impl std::io::Write, info: &VideoInfo) -> std::io::Result<()> {
     writeln!(
         out,
         "{:<6} {:<6} {:<12} {:<6} {:<14} {:<14} {:<8} {:>10}  NOTE",
@@ -627,15 +654,21 @@ pub fn print_formats(info: &VideoInfo) -> Result<()> {
     for format in &info.formats {
         let resolution = match (format.width, format.height) {
             (Some(w), Some(h)) => format!("{w}x{h}"),
+            (Some(w), None) => format!("{w}x?"),
             (None, Some(h)) => format!("{h}p"),
             _ if format.is_hls => String::from("HLS"),
+            _ if format.has_video => String::from("video"),
             _ => String::from("audio"),
         };
         let fps = format.fps.map(|v| v.to_string()).unwrap_or_default();
-        let size = format
-            .content_length
-            .map(format_bytes)
-            .unwrap_or_else(|| "?".to_string());
+        let size = match (
+            format.content_length,
+            format.estimated_size(info.duration_secs),
+        ) {
+            (Some(length), _) => format_bytes(length),
+            (None, Some(estimate)) => format!("~{}", format_bytes(estimate)),
+            _ => "?".to_string(),
+        };
         let note = if format.is_hls {
             "HLS"
         } else if format.is_live {
@@ -670,7 +703,6 @@ pub fn print_formats(info: &VideoInfo) -> Result<()> {
     if let Some(hls) = &info.hls_manifest_url {
         writeln!(out, "HLS manifest: {hls}")?;
     }
-    out.flush()?;
     Ok(())
 }
 
@@ -698,7 +730,6 @@ mod tests {
             signature_cipher: None,
             cipher: None,
             container: if has_video { "mp4" } else { "webm" }.to_string(),
-            mime_type: "video/mp4".to_string(),
             video_codec: has_video.then(|| "avc1".to_string()),
             audio_codec: has_audio.then(|| "opus".to_string()),
             has_video,
@@ -716,7 +747,7 @@ mod tests {
             audio_track_id: None,
             audio_is_default: false,
             language: None,
-            user_agent: "test".to_string(),
+            user_agent: "test",
         }
     }
 
@@ -827,5 +858,56 @@ mod tests {
         hls.is_hls = true;
         let info = info(vec![hls]);
         assert!(select(&info, "worst").is_err());
+    }
+
+    #[test]
+    fn matches_regional_language_tags() {
+        let mut en_us = format(251, false, true, None, Some(160_000));
+        en_us.language = Some("en-US".to_string());
+        let info = info(vec![en_us]);
+        assert!(select(&info, "bestaudio[language=en]").is_ok());
+        assert!(select(&info, "bestaudio[language!=en]").is_err());
+    }
+
+    #[test]
+    fn unknown_dimensions_do_not_pass_upper_bounds() {
+        let info = info(vec![format(137, true, false, None, None)]);
+        assert!(select(&info, "bestvideo[height<=1080]").is_err());
+        assert!(select(&info, "bestvideo[height>=1080]").is_err());
+    }
+
+    #[test]
+    fn best_audio_prefers_playable_urls() {
+        let mut playable = format(140, false, true, None, Some(64_000));
+        playable.audio_is_default = true;
+        let mut broken = format(251, false, true, None, Some(160_000));
+        broken.url.clear();
+        broken.signature_cipher = Some("s=x&url=https%3A%2F%2Fexample.com".to_string());
+        let info = info(vec![broken, playable]);
+        let best = best_audio(&info).unwrap();
+        assert_eq!(best.itag, 140);
+        assert!(!best.url.is_empty());
+    }
+
+    #[test]
+    fn best_audio_falls_back_to_unresolved_when_nothing_is_playable() {
+        let mut broken = format(251, false, true, None, Some(160_000));
+        broken.url.clear();
+        broken.signature_cipher = Some("s=x&url=https%3A%2F%2Fexample.com".to_string());
+        let info = info(vec![broken]);
+        assert_eq!(best_audio(&info).unwrap().itag, 251);
+    }
+
+    #[test]
+    fn parses_selector_once_and_reuses_it() {
+        let selector = FormatSelector::parse("bestvideo+bestaudio/best").unwrap();
+        let info = info(vec![
+            format(137, true, false, Some(1080), None),
+            format(251, false, true, None, Some(160_000)),
+        ]);
+        let selection = selector.select(&info.formats).unwrap();
+        assert!(selection.needs_merge());
+        assert_eq!(selection.video.unwrap().itag, 137);
+        assert_eq!(selection.audios[0].itag, 251);
     }
 }

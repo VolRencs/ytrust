@@ -40,9 +40,9 @@ const ERROR_CODES = [
   ["FORMAT_NOT_FOUND", /format not available|no format matched/i],
   ["TIMEOUT", /timed out|timeout/i],
   ["HTTP", /HTTP \d{3}|status \d{3}/i],
+  ["IO", /I\/O:|os error|no such file|broken pipe/i],
   ["NETWORK", /request failed|connection|dns|tls|network|unreachable/i],
   ["INVALID_RESPONSE", /JSON:|invalid JSON|no video details|no streaming data|invalid response/i],
-  ["IO", /I\/O:|os error|no such file/i],
 ];
 
 const KNOWN_CODES = new Set([
@@ -74,15 +74,17 @@ export class YtrustError extends Error {
   }
 }
 
+const ERROR_PREFIX = /^\[([A-Z_]+)\]\s*([\s\S]*)$/;
+
 export function errorCode(message) {
   const text = String(message ?? "");
+  const prefixed = ERROR_PREFIX.exec(text);
+  if (prefixed && KNOWN_CODES.has(prefixed[1])) return prefixed[1];
   for (const [code, pattern] of ERROR_CODES) {
     if (pattern.test(text)) return code;
   }
   return "UNKNOWN";
 }
-
-const ERROR_PREFIX = /^\[([A-Z_]+)\]\s*([\s\S]*)$/;
 
 function toYtrustError(error) {
   if (error instanceof YtrustError) return error;
@@ -98,24 +100,41 @@ export function version() {
   return requireNative().version();
 }
 
+const OPTION_KEYS = new Set([
+  "cookiesPath",
+  "cookiesFromBrowser",
+  "proxy",
+  "timeout",
+  "playlistLimit",
+  "playlistItems",
+  "noPlaylist",
+]);
+
 function normalizeOptions(options) {
   if (options == null) return {};
   if (typeof options !== "object" || Array.isArray(options)) {
     throw new YtrustError("INVALID_INPUT", "options must be an object");
   }
-  const normalized = { ...options };
+  const normalized = {};
+  for (const [key, value] of Object.entries(options)) {
+    if (!OPTION_KEYS.has(key)) {
+      throw new YtrustError("INVALID_INPUT", `unknown option: ${key}`);
+    }
+    if (value != null) normalized[key] = value;
+  }
   for (const key of ["timeout", "playlistLimit"]) {
     if (normalized[key] == null) continue;
-    const value = Number(normalized[key]);
-    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
-      throw new YtrustError("INVALID_INPUT", `${key} must be a non-negative integer`);
+    if (typeof normalized[key] !== "number" || !Number.isInteger(normalized[key])) {
+      throw new YtrustError("INVALID_INPUT", `${key} must be an integer`);
     }
-    normalized[key] = value;
+    if (normalized[key] < 1 || normalized[key] > 0xffffffff) {
+      throw new YtrustError("INVALID_INPUT", `${key} must be between 1 and 4294967295`);
+    }
   }
   for (const key of ["cookiesPath", "cookiesFromBrowser", "proxy", "playlistItems"]) {
     if (normalized[key] == null) continue;
-    if (typeof normalized[key] !== "string") {
-      throw new YtrustError("INVALID_INPUT", `${key} must be a string`);
+    if (typeof normalized[key] !== "string" || normalized[key].length === 0) {
+      throw new YtrustError("INVALID_INPUT", `${key} must be a non-empty string`);
     }
   }
   if (normalized.noPlaylist != null && typeof normalized.noPlaylist !== "boolean") {
@@ -124,10 +143,19 @@ function normalizeOptions(options) {
   return normalized;
 }
 
+function normalizeInput(input) {
+  if (typeof input !== "string" || input.trim().length === 0) {
+    throw new YtrustError("INVALID_INPUT", "input must be a non-empty YouTube URL or search query");
+  }
+  return input;
+}
+
 const PLAYER_JS_CACHE = new Map();
 const PREPROCESSED_PLAYER_CACHE = new Map();
 const SOLVED_N_CACHE = new Map();
 const SOLVED_SIG_CACHE = new Map();
+const INFLIGHT_SOLVES = new Map();
+const UNRESOLVED_FORMATS = new WeakSet();
 const PLAYER_JS_CACHE_LIMIT = 4;
 const CHALLENGE_CACHE_LIMIT = 2000;
 
@@ -136,6 +164,7 @@ function warn(message, error) {
 }
 
 function remember(cache, key, value, limit = CHALLENGE_CACHE_LIMIT) {
+  if (cache.has(key)) cache.delete(key);
   if (cache.size >= limit) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
@@ -166,14 +195,29 @@ function cacheKey(playerUrl, challenge) {
 
 async function playerSource(url, options) {
   const cached = PLAYER_JS_CACHE.get(url);
-  if (cached) return cached;
+  if (cached) {
+    remember(PLAYER_JS_CACHE, url, cached, PLAYER_JS_CACHE_LIMIT);
+    return cached;
+  }
   const pending = Promise.resolve()
     .then(() => requireNative().fetchPlayerJs(url, options))
     .catch((error) => {
-      PLAYER_JS_CACHE.delete(url);
+      if (PLAYER_JS_CACHE.get(url) === pending) PLAYER_JS_CACHE.delete(url);
       throw error;
     });
   remember(PLAYER_JS_CACHE, url, pending, PLAYER_JS_CACHE_LIMIT);
+  return pending;
+}
+
+async function singleFlight(key, work) {
+  const existing = INFLIGHT_SOLVES.get(key);
+  if (existing) return existing;
+  const pending = Promise.resolve()
+    .then(work)
+    .finally(() => {
+      if (INFLIGHT_SOLVES.get(key) === pending) INFLIGHT_SOLVES.delete(key);
+    });
+  INFLIGHT_SOLVES.set(key, pending);
   return pending;
 }
 
@@ -279,9 +323,10 @@ async function applyChallenges(result, options, formats = collectFormats(result)
     try {
       const player = await playerSource(playerUrl, options);
       const requests = [];
-      if (sigChallenges.size) requests.push({ type: "sig", challenges: [...sigChallenges] });
-      if (nChallenges.size) requests.push({ type: "n", challenges: [...nChallenges] });
-      const output = await solveInWorker(player, requests, playerUrl);
+      if (sigChallenges.size) requests.push({ type: "sig", challenges: [...sigChallenges].sort() });
+      if (nChallenges.size) requests.push({ type: "n", challenges: [...nChallenges].sort() });
+      const key = `${playerUrl}\u0000${JSON.stringify(requests)}`;
+      const output = await singleFlight(key, () => solveInWorker(player, requests, playerUrl));
       const responses = Array.isArray(output?.responses) ? output.responses : [];
       const solved = responseData(responses, requests);
       sigData = solved.sig ?? {};
@@ -300,6 +345,8 @@ async function applyChallenges(result, options, formats = collectFormats(result)
   let unresolved = 0;
   for (const format of formats) {
     if (!format) continue;
+    UNRESOLVED_FORMATS.delete(format);
+    let formatUnresolved = false;
     const cipher = cipherParams(format);
     if (cipher) {
       let cipherResolved = false;
@@ -323,7 +370,7 @@ async function applyChallenges(result, options, formats = collectFormats(result)
         delete format.signature_cipher;
         delete format.cipher;
       } else {
-        unresolved += 1;
+        formatUnresolved = true;
       }
     }
     if (typeof format.url === "string" && format.url) {
@@ -335,15 +382,33 @@ async function applyChallenges(result, options, formats = collectFormats(result)
           parsed.searchParams.set("n", replacement);
           format.url = parsed.toString();
         } catch {
-          unresolved += 1;
+          formatUnresolved = true;
         }
       } else if (value) {
-        unresolved += 1;
+        formatUnresolved = true;
       }
+    }
+    if (formatUnresolved) {
+      unresolved += 1;
+      UNRESOLVED_FORMATS.add(format);
     }
   }
   if (unresolved > 0) {
     warn(`${unresolved} format(s) could not be challenge-solved`);
+  }
+  return result;
+}
+
+function isPlayable(format) {
+  return Boolean(format && typeof format.url === "string" && format.url && !UNRESOLVED_FORMATS.has(format));
+}
+
+function markPlayable(result) {
+  if (result?.best_audio) result.best_audio.playable = isPlayable(result.best_audio);
+  if (Array.isArray(result?.formats)) {
+    for (const format of result.formats) {
+      if (format) format.playable = isPlayable(format);
+    }
   }
   return result;
 }
@@ -361,12 +426,12 @@ function pickPlayableAudio(formats) {
   let best = null;
   let bestKey = null;
   for (const format of formats) {
-    if (!format || typeof format.url !== "string" || !format.url) continue;
+    if (!isPlayable(format)) continue;
     const hasAudio = typeof format.acodec === "string" && format.acodec !== "none";
     if (!hasAudio && format.protocol !== "m3u8_native") continue;
     const key = [
-      format.vcodec === "none" ? 1 : 0,
       format.audio_track?.audio_is_default ? 1 : 0,
+      format.vcodec === "none" ? 1 : 0,
       isOpus(format) ? 1 : 0,
       audioRate(format),
     ];
@@ -396,8 +461,8 @@ function formatKey(format) {
 
 function audioKey(format) {
   return [
-    format.vcodec === "none" ? 1 : 0,
     format.audio_track?.audio_is_default ? 1 : 0,
+    format.vcodec === "none" ? 1 : 0,
     isOpus(format) ? 1 : 0,
     audioRate(format),
   ];
@@ -429,14 +494,15 @@ function audioCandidates(result) {
 export async function resolve(input, options = {}) {
   let result;
   try {
+    const source = normalizeInput(input);
     const nativeOptions = normalizeOptions(options);
-    result = await requireNative().resolve(String(input), nativeOptions);
+    result = await requireNative().resolve(source, nativeOptions);
     result = await applyChallenges(result, nativeOptions);
-    if (result?.best_audio && !result.best_audio.url) {
+    if (result?.best_audio && !isPlayable(result.best_audio)) {
       const fallback = pickPlayableAudio(result.formats);
       if (fallback) result.best_audio = fallback;
     }
-    return result;
+    return markPlayable(result);
   } catch (error) {
     throw toYtrustError(error);
   }
@@ -448,13 +514,14 @@ export async function resolve(input, options = {}) {
  */
 export async function resolveAudio(input, options = {}) {
   try {
+    const source = normalizeInput(input);
     const normalized = normalizeOptions(options);
-    const result = await requireNative().resolve(String(input), {
+    const result = await requireNative().resolve(source, {
       ...normalized,
       noPlaylist: true,
     });
     if (result?._type !== "video") {
-      throw new YtrustError("NO_AUDIO", `no audio format found for ${input}`);
+      throw new YtrustError("NO_AUDIO", `no audio format found for ${source}`);
     }
 
     const candidates = audioCandidates(result);
@@ -464,7 +531,7 @@ export async function resolveAudio(input, options = {}) {
     // a safety net for unusual players where the preferred format is unusable.
     for (const candidate of candidates.slice(0, 3)) {
       await applyChallenges(result, normalized, [candidate]);
-      if (typeof candidate.url === "string" && candidate.url) {
+      if (isPlayable(candidate)) {
         chosen = candidate;
         break;
       }
@@ -477,11 +544,12 @@ export async function resolveAudio(input, options = {}) {
 
     if (!chosen) {
       const code = result.best_audio ? "CHALLENGE_FAILED" : "NO_AUDIO";
-      throw new YtrustError(code, `no playable audio format found for ${input}`);
+      throw new YtrustError(code, `no playable audio format found for ${source}`);
     }
 
     return {
       ...chosen,
+      playable: true,
       id: result.id,
       title: result.title,
       duration: result.duration,

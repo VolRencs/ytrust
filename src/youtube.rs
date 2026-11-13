@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -7,12 +7,15 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::constants::{
-    TV_CLIENT_NAME, TV_CLIENT_VERSION, TV_UA, VISIONOS_CLIENT_NAME, VISIONOS_CLIENT_VERSION,
-    VISIONOS_UA, WEB_CLIENT_NAME, WEB_CLIENT_VERSION, WEB_EMBEDDED_CLIENT_NAME,
+    TV_CLIENT_ID, TV_CLIENT_VERSION, TV_UA, VISIONOS_CLIENT_ID, VISIONOS_CLIENT_VERSION,
+    VISIONOS_UA, WEB_CLIENT_ID, WEB_CLIENT_VERSION, WEB_EMBEDDED_CLIENT_ID,
     WEB_EMBEDDED_CLIENT_VERSION, WEB_EMBEDDED_UA, WEB_UA,
 };
-use crate::error::{ErrorCode, Result, YtrustError};
-use crate::http::{InnertubeRequest, client as build_client, fetch_text, post_innertube};
+use crate::error::{ErrorCode, Result, YtrustError, best_error};
+use crate::http::{
+    InnertubeRequest, MAX_PLAYER_JS_BYTES, client as build_client, fetch_text, fetch_text_limited,
+    post_innertube,
+};
 
 pub use crate::http::RequestConfig;
 
@@ -90,7 +93,6 @@ pub struct Format {
     pub signature_cipher: Option<String>,
     pub cipher: Option<String>,
     pub container: String,
-    pub mime_type: String,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub has_video: bool,
@@ -108,20 +110,24 @@ pub struct Format {
     pub audio_track_id: Option<String>,
     pub audio_is_default: bool,
     pub language: Option<String>,
-    pub user_agent: String,
+    pub user_agent: &'static str,
 }
 
 impl Format {
     /// Best available size estimate for progress reporting and JSON output.
     pub fn estimated_size(&self, duration_secs: Option<u64>) -> Option<u64> {
         self.content_length
+            .filter(|size| *size > 0)
             .or_else(|| self.progress_size(duration_secs))
     }
 
     /// Size estimate for the requested duration, ignoring a content length
     /// that describes the complete stream (for example with section downloads).
     pub fn progress_size(&self, duration_secs: Option<u64>) -> Option<u64> {
-        let bitrate = self.audio_bitrate.unwrap_or(self.bitrate);
+        let bitrate = self
+            .audio_bitrate
+            .filter(|bitrate| *bitrate > 0)
+            .unwrap_or(self.bitrate);
         duration_secs
             .filter(|duration| *duration > 0 && bitrate > 0)
             .map(|duration| bitrate.saturating_mul(duration) / 8)
@@ -174,16 +180,17 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
     }
 
     let path = parsed.path();
-    let list = parsed
-        .query_pairs()
-        .find(|(key, _)| key == "list")
-        .map(|(_, value)| value.to_string())
-        .filter(|value| !value.is_empty());
-    let query_video = parsed
-        .query_pairs()
-        .find(|(key, _)| key == "v")
-        .map(|(_, value)| value.to_string())
-        .filter(|value| !value.is_empty());
+    let mut list = None;
+    let mut query_video = None;
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            "list" if !value.is_empty() && list.is_none() => list = Some(value.into_owned()),
+            "v" if !value.is_empty() && query_video.is_none() => {
+                query_video = Some(value.into_owned());
+            }
+            _ => {}
+        }
+    }
     let path_video = video_id_from_url(&parsed);
     let video_id = query_video.as_deref().and_then(valid_id).or(path_video);
 
@@ -218,10 +225,6 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
             id: list,
             video_id: None,
         });
-    }
-
-    if let Some(id) = video_id_from_url(&parsed) {
-        return Ok(Target::Video { id });
     }
 
     if path.starts_with("/@")
@@ -269,7 +272,7 @@ pub fn video_id_from_url(url: &Url) -> Option<String> {
 }
 
 fn valid_id(id: &str) -> Option<String> {
-    let id = id.split(['&', '?', '/']).next().unwrap_or(id);
+    let id = id.trim();
     if id.len() == 11
         && id
             .chars()
@@ -331,7 +334,7 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
         return Ok(info);
     }
 
-    Err(errors.pop().unwrap_or_else(|| {
+    Err(best_error(errors).unwrap_or_else(|| {
         YtrustError::coded(
             ErrorCode::Unavailable,
             "YouTube did not return a playable response",
@@ -359,20 +362,25 @@ static PLAYER_JS_URL_CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLoc
 
 fn cached_player_js_url() -> Option<String> {
     let cache = PLAYER_JS_URL_CACHE.get_or_init(|| Mutex::new(None));
-    let guard = cache.lock().ok()?;
+    let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
     let (cached_at, url) = guard.as_ref()?;
     (cached_at.elapsed() < PLAYER_JS_URL_TTL).then(|| url.clone())
 }
 
 fn remember_player_js_url(url: &str) {
     let cache = PLAYER_JS_URL_CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some((Instant::now(), url.to_string()));
-    }
+    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    *guard = Some((Instant::now(), url.to_string()));
 }
 
 /// Resolve the current player JS URL from the watch or embed page.
 pub async fn player_js_url(video_id: &str, config: &RequestConfig) -> Result<String> {
+    if valid_id(video_id).is_none() {
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            format!("invalid video ID: {video_id}"),
+        ));
+    }
     if let Some(url) = cached_player_js_url() {
         return Ok(url);
     }
@@ -418,8 +426,22 @@ async fn fetch_player_js_url(video_id: &str, config: &RequestConfig) -> Result<S
 
 /// Fetch the player JavaScript source through the configured proxy/timeout.
 pub async fn fetch_player_source(url: &str, config: &RequestConfig) -> Result<String> {
+    let parsed = Url::parse(url)
+        .map_err(|_| YtrustError::coded(ErrorCode::InvalidInput, "invalid player JS URL"))?;
+    if parsed.scheme() != "https"
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || !parsed
+            .host_str()
+            .is_some_and(|host| host == "youtube.com" || host.ends_with(".youtube.com"))
+    {
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            "player JS URL must use https and a youtube.com host",
+        ));
+    }
     let client = build_client(config)?;
-    fetch_text(&client, url, config, WEB_UA, None).await
+    fetch_text_limited(&client, url, config, WEB_UA, None, MAX_PLAYER_JS_BYTES).await
 }
 
 fn extract_player_js_url(html: &str) -> Option<String> {
@@ -448,7 +470,10 @@ fn player_js_url_from_cfg(ytcfg: &Value) -> Option<String> {
         })
 }
 
-static SIGNATURE_TIMESTAMPS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+const SIGNATURE_CACHE_CAPACITY: usize = 8;
+const SIGNATURE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+static SIGNATURE_TIMESTAMPS: OnceLock<Mutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
 
 async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Result<VideoInfo> {
     let client = build_client(config)?;
@@ -533,7 +558,7 @@ async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Res
         InnertubeRequest {
             endpoint: "player",
             body: &body,
-            client_name: WEB_EMBEDDED_CLIENT_NAME,
+            client_name: WEB_EMBEDDED_CLIENT_ID,
             client_version,
             user_agent: WEB_EMBEDDED_UA,
             visitor_data,
@@ -543,12 +568,30 @@ async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Res
         config,
     )
     .await?;
-    parse_video_info(
+    let mut info = parse_video_info(
         video_id,
         response,
         ClientKind::WebEmbedded,
         Some(player_js_url),
-    )
+    )?;
+    if info.upload_date.is_empty() {
+        info.upload_date = upload_date_from_html(&html).unwrap_or_default();
+    }
+    Ok(info)
+}
+
+fn upload_date_from_html(html: &str) -> Option<String> {
+    for marker in ["\"uploadDate\":\"", "\"publishDate\":\""] {
+        if let Some(at) = html.find(marker) {
+            let rest = &html[at + marker.len()..];
+            let value: String = rest.chars().take(10).collect();
+            let date = normalize_upload_date(&value);
+            if date.len() == 8 {
+                return Some(date);
+            }
+        }
+    }
+    None
 }
 
 async fn signature_timestamp(
@@ -556,40 +599,79 @@ async fn signature_timestamp(
     player_js_url: &str,
     config: &RequestConfig,
 ) -> Result<u64> {
-    if let Some(cached) = SIGNATURE_TIMESTAMPS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(player_js_url).copied())
     {
-        return Ok(cached);
+        let cache = SIGNATURE_TIMESTAMPS.get_or_init(|| Mutex::new(HashMap::new()));
+        let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((cached_at, value)) = cache.get(player_js_url)
+            && cached_at.elapsed() < SIGNATURE_CACHE_TTL
+        {
+            return Ok(*value);
+        }
     }
-    let source = fetch_text(client, player_js_url, config, WEB_EMBEDDED_UA, None).await?;
-    let marker = "signatureTimestamp";
-    let at = source.find(marker).ok_or_else(|| {
+    let source = fetch_text_limited(
+        client,
+        player_js_url,
+        config,
+        WEB_EMBEDDED_UA,
+        None,
+        MAX_PLAYER_JS_BYTES,
+    )
+    .await?;
+    let value = find_signature_timestamp(&source).ok_or_else(|| {
         YtrustError::coded(
             ErrorCode::InvalidResponse,
-            "player JS has no signatureTimestamp",
+            "player JS has no valid signatureTimestamp",
         )
     })?;
-    let digits = source[at + marker.len()..]
-        .trim_start_matches([':', '=', ' '])
+    let cache = SIGNATURE_TIMESTAMPS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if cache.len() >= SIGNATURE_CACHE_CAPACITY
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (cached_at, _))| *cached_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(player_js_url.to_string(), (Instant::now(), value));
+    Ok(value)
+}
+
+fn find_signature_timestamp(source: &str) -> Option<u64> {
+    for marker in ["signatureTimestamp", "sts"] {
+        let mut from = 0;
+        while let Some(offset) = source[from..].find(marker) {
+            let at = from + offset;
+            let before = source.as_bytes()[..at].last().copied();
+            if marker == "sts"
+                && before.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                from = at + marker.len();
+                continue;
+            }
+            if let Some(value) = parse_numeric_assignment(&source[at + marker.len()..]) {
+                return Some(value);
+            }
+            from = at + marker.len();
+        }
+    }
+    None
+}
+
+fn parse_numeric_assignment(rest: &str) -> Option<u64> {
+    let rest = rest.trim_start_matches(|character: char| {
+        character.is_whitespace() || matches!(character, ':' | '=' | '"' | '\'')
+    });
+    let digits: String = rest
         .chars()
         .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    let value = digits.parse::<u64>().map_err(|_| {
-        YtrustError::coded(
-            ErrorCode::InvalidResponse,
-            "player JS signatureTimestamp is invalid",
-        )
-    })?;
-    if let Ok(mut cache) = SIGNATURE_TIMESTAMPS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-    {
-        cache.insert(player_js_url.to_string(), value);
+        .take(6)
+        .collect();
+    if digits.is_empty() {
+        return None;
     }
-    Ok(value)
+    let value = digits.parse::<u64>().ok()?;
+    (value > 0).then_some(value)
 }
 
 fn extract_ytcfg(html: &str) -> Option<Value> {
@@ -618,19 +700,21 @@ pub async fn fetch_playlist(
     };
 
     let mut entries = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
     let mut continuation = None;
     let mut title = String::from("Playlist");
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let max_pages = max_playlist_pages(limit);
+    let context = web_context();
 
     for page in 0..max_pages {
         let body = match &continuation {
             Some(token) => json!({
-                "context": web_context(),
+                "context": &context,
                 "continuation": token,
             }),
             None => json!({
-                "context": web_context(),
+                "context": &context,
                 "browseId": browse_id,
             }),
         };
@@ -640,7 +724,7 @@ pub async fn fetch_playlist(
             InnertubeRequest {
                 endpoint: "browse",
                 body: &body,
-                client_name: WEB_CLIENT_NAME,
+                client_name: WEB_CLIENT_ID,
                 client_version: WEB_CLIENT_VERSION,
                 user_agent: WEB_UA,
                 visitor_data: None,
@@ -656,14 +740,12 @@ pub async fn fetch_playlist(
         {
             title = found_title;
         }
-        collect_playlist_videos(&response, &mut entries, &mut seen, limit as usize);
-        tracing::debug!(
-            "playlist browse response: entries={}, continuation={}",
-            entries.len(),
-            find_continuation_token(&response).is_some()
-        );
+        let entries_root =
+            find_key_value(&response, "playlistVideoListRenderer").unwrap_or(&response);
+        collect_playlist_videos(entries_root, &mut entries, &mut seen, limit_usize);
+        tracing::debug!("playlist browse response: entries={}", entries.len());
 
-        if entries.len() >= limit as usize {
+        if entries.len() >= limit_usize {
             break;
         }
         continuation = find_continuation_token(&response);
@@ -704,9 +786,10 @@ pub async fn fetch_inline_playlist(
     let watch_url = watch_url.to_string();
     let html = fetch_text(&client, &watch_url, config, WEB_UA, None).await?;
     let data = extract_json_assignment(&html, "ytInitialData")?;
+    let mut data = data;
     let mut playlist = data
-        .pointer("/contents/twoColumnWatchNextResults/playlist/playlist")
-        .cloned()
+        .pointer_mut("/contents/twoColumnWatchNextResults/playlist/playlist")
+        .map(Value::take)
         .ok_or_else(|| {
             YtrustError::coded(
                 ErrorCode::InvalidResponse,
@@ -715,13 +798,15 @@ pub async fn fetch_inline_playlist(
         })?;
     let title = playlist
         .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("Playlist")
-        .to_string();
+        .and_then(value_text)
+        .or_else(|| playlist.get("titleText").and_then(value_text))
+        .unwrap_or_else(|| "Playlist".to_string());
 
     let mut entries = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let max_pages = max_playlist_pages(limit);
+    let context = web_context();
     for _ in 0..max_pages {
         let (page_entries, endpoint) = extract_inline_entries(&playlist);
         if page_entries.is_empty() {
@@ -733,27 +818,27 @@ pub async fn fetch_inline_playlist(
             }
             entry.index = entries.len() + 1;
             entries.push(entry);
-            if entries.len() >= limit as usize {
+            if entries.len() >= limit_usize {
                 break;
             }
         }
-        if entries.len() >= limit as usize {
+        if entries.len() >= limit_usize {
             break;
         }
         let Some(endpoint) = endpoint else { break };
         let body = json!({
-            "context": web_context(),
+            "context": &context,
             "playlistId": playlist_id,
             "videoId": endpoint.video_id,
             "index": endpoint.index.unwrap_or(entries.len() as u64),
             "params": endpoint.params.unwrap_or_else(|| "OAE%3D".to_string()),
         });
-        let response: Value = post_innertube(
+        let mut response: Value = post_innertube(
             &client,
             InnertubeRequest {
                 endpoint: "next",
                 body: &body,
-                client_name: WEB_CLIENT_NAME,
+                client_name: WEB_CLIENT_ID,
                 client_version: WEB_CLIENT_VERSION,
                 user_agent: WEB_UA,
                 visitor_data: None,
@@ -764,8 +849,8 @@ pub async fn fetch_inline_playlist(
         )
         .await?;
         let Some(next) = response
-            .pointer("/contents/twoColumnWatchNextResults/playlist/playlist")
-            .cloned()
+            .pointer_mut("/contents/twoColumnWatchNextResults/playlist/playlist")
+            .map(Value::take)
         else {
             break;
         };
@@ -814,7 +899,12 @@ fn extract_json_assignment(html: &str, marker: &str) -> Result<Value> {
             b'"' => in_string = true,
             b'{' => depth += 1,
             b'}' => {
-                depth -= 1;
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    YtrustError::coded(
+                        ErrorCode::InvalidResponse,
+                        format!("unbalanced JSON object after {marker}"),
+                    )
+                })?;
                 if depth == 0 {
                     let end = start + offset + 1;
                     return Ok(serde_json::from_str(&html[start..end])?);
@@ -890,8 +980,17 @@ fn extract_inline_entries(playlist: &Value) -> (Vec<PlaylistEntry>, Option<Inlin
     (entries, endpoint)
 }
 
+fn value_text(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| text_of(value))
+}
+
 fn text_of(value: &Value) -> Option<String> {
-    if let Some(text) = value.get("simpleText").and_then(Value::as_str) {
+    if let Some(text) = value.get("simpleText").and_then(Value::as_str)
+        && !text.is_empty()
+    {
         return Some(text.to_string());
     }
     let text = value
@@ -913,7 +1012,12 @@ fn thumbnails_from(renderer: &Value) -> Vec<Thumbnail> {
 
 fn parse_time_text(text: &str) -> Option<u64> {
     let mut total = 0u64;
+    let mut parts = 0usize;
     for part in text.trim().split(':') {
+        parts += 1;
+        if parts > 3 {
+            return None;
+        }
         total = total
             .checked_mul(60)?
             .checked_add(part.trim().parse::<u64>().ok()?)?;
@@ -924,18 +1028,20 @@ fn parse_time_text(text: &str) -> Option<u64> {
 pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Result<PlaylistInfo> {
     let client = build_client(config)?;
     let mut entries = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
     let mut continuation = None;
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let max_pages = max_playlist_pages(limit);
+    let context = web_context();
 
     for _ in 0..max_pages {
         let body = match &continuation {
             Some(token) => json!({
-                "context": web_context(),
+                "context": &context,
                 "continuation": token,
             }),
             None => json!({
-                "context": web_context(),
+                "context": &context,
                 "query": query,
             }),
         };
@@ -944,7 +1050,7 @@ pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Re
             InnertubeRequest {
                 endpoint: "search",
                 body: &body,
-                client_name: WEB_CLIENT_NAME,
+                client_name: WEB_CLIENT_ID,
                 client_version: WEB_CLIENT_VERSION,
                 user_agent: WEB_UA,
                 visitor_data: None,
@@ -954,8 +1060,9 @@ pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Re
             config,
         )
         .await?;
-        collect_playlist_videos(&response, &mut entries, &mut seen, limit as usize);
-        if entries.len() >= limit as usize {
+        let entries_root = find_key_value(&response, "searchResultsRenderer").unwrap_or(&response);
+        collect_playlist_videos(entries_root, &mut entries, &mut seen, limit_usize);
+        if entries.len() >= limit_usize {
             break;
         }
         continuation = find_continuation_token(&response);
@@ -975,42 +1082,86 @@ fn max_playlist_pages(limit: u64) -> usize {
     limit.div_ceil(50).clamp(40, 1_000) as usize
 }
 
-pub fn max_playlist_item(expression: &str) -> Option<usize> {
+pub fn max_playlist_item(expression: &str) -> Result<Option<usize>> {
     let mut max = None;
     for part in expression
         .split(',')
         .map(str::trim)
         .filter(|part| !part.is_empty())
     {
-        if let Some((_start, end)) = part.split_once('-') {
-            if end.trim().is_empty() {
-                return None;
+        if let Some((start, end)) = part.split_once('-') {
+            let start_raw = start.trim();
+            let end_raw = end.trim();
+            let start = if start_raw.is_empty() {
+                1
+            } else {
+                start_raw
+                    .parse::<usize>()
+                    .map_err(|_| invalid_playlist_part(part))?
+            };
+            if start == 0 {
+                return Err(invalid_playlist_part(part));
             }
-            let end = end.trim().parse::<usize>().ok()?;
+            if end_raw.is_empty() {
+                return Ok(None);
+            }
+            let end = end_raw
+                .parse::<usize>()
+                .map_err(|_| invalid_playlist_part(part))?;
+            if end == 0 || start > end {
+                return Err(invalid_playlist_part(part));
+            }
             max = Some(max.map_or(end, |current: usize| current.max(end)));
         } else {
-            let index = part.parse::<usize>().ok()?;
+            let index = part.parse::<usize>().map_err(|_| {
+                YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    format!("invalid playlist item: {part}"),
+                )
+            })?;
+            if index == 0 {
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    "playlist items start at 1",
+                ));
+            }
             max = Some(max.map_or(index, |current: usize| current.max(index)));
         }
     }
-    max
+    Ok(max)
+}
+
+fn invalid_playlist_part(part: &str) -> YtrustError {
+    YtrustError::coded(
+        ErrorCode::InvalidInput,
+        format!("invalid playlist range: {part}"),
+    )
 }
 
 pub fn filter_playlist_entries(playlist: &mut PlaylistInfo, selection: &str) -> Result<()> {
-    let selected = parse_item_ranges(selection, playlist.entries.len())?;
-    if selected.is_empty() {
+    let mask = playlist_item_mask(selection, playlist.entries.len())?;
+    if !mask.iter().any(|selected| *selected) {
         playlist.entries.clear();
         return Ok(());
     }
-    let selected: BTreeSet<usize> = selected.into_iter().collect();
     playlist
         .entries
-        .retain(|entry| selected.contains(&entry.index));
+        .retain(|entry| mask.get(entry.index).copied().unwrap_or(false));
     Ok(())
 }
 
 pub fn parse_item_ranges(expression: &str, total: usize) -> Result<Vec<usize>> {
-    let mut selected = BTreeSet::new();
+    let mask = playlist_item_mask(expression, total)?;
+    Ok(mask
+        .into_iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(index, selected)| selected.then_some(index))
+        .collect())
+}
+
+fn playlist_item_mask(expression: &str, total: usize) -> Result<Vec<bool>> {
+    let mut selected = vec![false; total.saturating_add(1)];
 
     for part in expression
         .split(',')
@@ -1023,34 +1174,25 @@ pub fn parse_item_ranges(expression: &str, total: usize) -> Result<Vec<usize>> {
             let start = if start_raw.is_empty() {
                 1
             } else {
-                start_raw.parse::<usize>().map_err(|_| {
-                    YtrustError::coded(
-                        ErrorCode::InvalidInput,
-                        format!("invalid playlist range: {part}"),
-                    )
-                })?
+                start_raw
+                    .parse::<usize>()
+                    .map_err(|_| invalid_playlist_part(part))?
             };
             let open_ended = end_raw.is_empty();
             let end = if open_ended {
                 total
             } else {
-                end_raw.parse::<usize>().map_err(|_| {
-                    YtrustError::coded(
-                        ErrorCode::InvalidInput,
-                        format!("invalid playlist range: {part}"),
-                    )
-                })?
+                end_raw
+                    .parse::<usize>()
+                    .map_err(|_| invalid_playlist_part(part))?
             };
             if start == 0 || (!open_ended && (end == 0 || start > end)) {
-                return Err(YtrustError::coded(
-                    ErrorCode::InvalidInput,
-                    format!("invalid playlist range: {part}"),
-                ));
+                return Err(invalid_playlist_part(part));
             }
             let upper = end.min(total);
             if start <= upper {
-                for index in start..=upper {
-                    selected.insert(index);
+                for flag in &mut selected[start..=upper] {
+                    *flag = true;
                 }
             }
         } else {
@@ -1066,13 +1208,13 @@ pub fn parse_item_ranges(expression: &str, total: usize) -> Result<Vec<usize>> {
                     "playlist items start at 1",
                 ));
             }
-            if index <= total {
-                selected.insert(index);
+            if let Some(flag) = selected.get_mut(index) {
+                *flag = true;
             }
         }
     }
 
-    Ok(selected.into_iter().collect())
+    Ok(selected)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1093,7 +1235,7 @@ impl ClientKind {
                     "hl": "en",
                     "gl": "US",
                 }),
-                WEB_EMBEDDED_CLIENT_NAME,
+                WEB_EMBEDDED_CLIENT_ID,
                 WEB_EMBEDDED_CLIENT_VERSION,
             ),
             Self::VisionOs => (
@@ -1108,7 +1250,7 @@ impl ClientKind {
                     "hl": "en",
                     "gl": "US",
                 }),
-                VISIONOS_CLIENT_NAME,
+                VISIONOS_CLIENT_ID,
                 VISIONOS_CLIENT_VERSION,
             ),
             Self::Tv => (
@@ -1119,7 +1261,7 @@ impl ClientKind {
                     "hl": "en",
                     "gl": "US",
                 }),
-                TV_CLIENT_NAME,
+                TV_CLIENT_ID,
                 TV_CLIENT_VERSION,
             ),
         }
@@ -1192,24 +1334,32 @@ struct PlayerResponse {
 
 #[derive(Debug, Deserialize)]
 struct PlayabilityStatus {
+    #[serde(default)]
     status: String,
+    #[serde(default)]
     reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct StreamingData {
-    formats: Option<Vec<RawFormat>>,
-    #[serde(rename = "adaptiveFormats")]
-    adaptive_formats: Option<Vec<RawFormat>>,
+    #[serde(default, deserialize_with = "deserialize_formats")]
+    formats: Vec<RawFormat>,
+    #[serde(
+        rename = "adaptiveFormats",
+        default,
+        deserialize_with = "deserialize_formats"
+    )]
+    adaptive_formats: Vec<RawFormat>,
     #[serde(rename = "hlsManifestUrl")]
     hls_manifest_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawFormat {
+    #[serde(default)]
     itag: u64,
     url: Option<String>,
-    #[serde(rename = "mimeType")]
+    #[serde(rename = "mimeType", default)]
     mime_type: String,
     bitrate: Option<u64>,
     #[serde(rename = "averageBitrate")]
@@ -1217,12 +1367,14 @@ struct RawFormat {
     width: Option<u64>,
     height: Option<u64>,
     fps: Option<u64>,
-    #[serde(rename = "contentLength")]
-    content_length: Option<String>,
+    #[serde(
+        rename = "contentLength",
+        default,
+        deserialize_with = "deserialize_u64_opt"
+    )]
+    content_length: Option<u64>,
     #[serde(rename = "qualityLabel")]
     quality_label: Option<String>,
-    #[serde(rename = "audioQuality")]
-    audio_quality: Option<String>,
     #[serde(rename = "signatureCipher")]
     signature_cipher: Option<String>,
     cipher: Option<String>,
@@ -1241,18 +1393,27 @@ struct RawAudioTrack {
 
 #[derive(Debug, Deserialize)]
 struct VideoDetails {
-    #[serde(rename = "videoId")]
+    #[serde(rename = "videoId", default)]
     video_id: String,
+    #[serde(default)]
     title: String,
     author: Option<String>,
     #[serde(rename = "ownerChannelName")]
     owner_channel_name: Option<String>,
     #[serde(rename = "shortDescription")]
     short_description: Option<String>,
-    #[serde(rename = "lengthSeconds")]
-    length_seconds: Option<String>,
-    #[serde(rename = "viewCount")]
-    view_count: Option<String>,
+    #[serde(
+        rename = "lengthSeconds",
+        default,
+        deserialize_with = "deserialize_u64_opt"
+    )]
+    length_seconds: Option<u64>,
+    #[serde(
+        rename = "viewCount",
+        default,
+        deserialize_with = "deserialize_u64_opt"
+    )]
+    view_count: Option<u64>,
     #[serde(rename = "isLiveContent")]
     is_live_content: Option<bool>,
     #[serde(rename = "channelId")]
@@ -1262,12 +1423,13 @@ struct VideoDetails {
 
 #[derive(Debug, Deserialize)]
 struct ThumbnailList {
-    thumbnails: Option<Vec<RawThumbnail>>,
+    #[serde(default, deserialize_with = "deserialize_thumbnails")]
+    thumbnails: Vec<RawThumbnail>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawThumbnail {
-    url: String,
+    url: Option<String>,
     width: Option<u64>,
     height: Option<u64>,
 }
@@ -1286,18 +1448,71 @@ struct Captions {
 
 #[derive(Debug, Deserialize)]
 struct CaptionTracklist {
-    #[serde(rename = "captionTracks")]
-    caption_tracks: Option<Vec<RawCaptionTrack>>,
+    #[serde(
+        rename = "captionTracks",
+        default,
+        deserialize_with = "deserialize_caption_tracks"
+    )]
+    caption_tracks: Vec<RawCaptionTrack>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawCaptionTrack {
-    #[serde(rename = "baseUrl")]
+    #[serde(rename = "baseUrl", default)]
     base_url: String,
-    #[serde(rename = "languageCode")]
+    #[serde(rename = "languageCode", default)]
     language_code: String,
     name: Option<Value>,
     kind: Option<String>,
+}
+
+fn deserialize_formats<'de, D>(deserializer: D) -> std::result::Result<Vec<RawFormat>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
+}
+
+fn deserialize_caption_tracks<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<RawCaptionTrack>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
+}
+
+fn deserialize_thumbnails<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<RawThumbnail>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
+}
+
+fn deserialize_u64_opt<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }))
 }
 
 fn playability_code(reason: &str) -> ErrorCode {
@@ -1334,7 +1549,7 @@ fn parse_video_info(
             status.status,
             status.reason
         );
-        if status.status != "OK" {
+        if !status.status.is_empty() && status.status != "OK" {
             let reason = status
                 .reason
                 .clone()
@@ -1368,17 +1583,15 @@ fn parse_video_info(
     })?;
     let is_live = details.is_live_content.unwrap_or(false);
 
-    let hls_manifest_url = streaming.hls_manifest_url.clone();
-    let format_count = streaming.formats.as_ref().map_or(0, Vec::len)
-        + streaming.adaptive_formats.as_ref().map_or(0, Vec::len);
+    let hls_manifest_url = streaming.hls_manifest_url;
+    let format_count = streaming.formats.len() + streaming.adaptive_formats.len();
     tracing::debug!("player response has {format_count} raw formats");
 
-    let mut formats = Vec::new();
+    let mut formats = Vec::with_capacity(format_count + usize::from(hls_manifest_url.is_some()));
     for raw in streaming
         .formats
-        .unwrap_or_default()
         .into_iter()
-        .chain(streaming.adaptive_formats.unwrap_or_default())
+        .chain(streaming.adaptive_formats)
     {
         if let Some(format) = parse_format(raw, client_kind, is_live) {
             formats.push(format);
@@ -1393,7 +1606,6 @@ fn parse_video_info(
             signature_cipher: None,
             cipher: None,
             container: "mp4".to_string(),
-            mime_type: "application/vnd.apple.mpegurl".to_string(),
             video_codec: None,
             audio_codec: None,
             has_video: true,
@@ -1411,7 +1623,7 @@ fn parse_video_info(
             audio_track_id: None,
             audio_is_default: true,
             language: None,
-            user_agent: client_kind.user_agent().to_string(),
+            user_agent: client_kind.user_agent(),
         });
     }
 
@@ -1426,27 +1638,21 @@ fn parse_video_info(
         })
         .unwrap_or_default();
 
-    let duration_secs = details
-        .length_seconds
-        .as_deref()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0);
+    let duration_secs = details.length_seconds.filter(|value| *value > 0);
 
     let thumbnails = details
         .thumbnail
-        .as_ref()
-        .and_then(|list| list.thumbnails.as_ref())
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| Thumbnail {
-                    url: item.url.clone(),
-                    width: item.width,
-                    height: item.height,
-                })
-                .collect()
+        .map(|list| list.thumbnails)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            Some(Thumbnail {
+                url: item.url?,
+                width: item.width,
+                height: item.height,
+            })
         })
-        .unwrap_or_default();
+        .collect();
 
     let (subtitles, automatic_captions) = parse_captions(captions);
     let fallback_language = default_audio_language
@@ -1480,10 +1686,7 @@ fn parse_video_info(
         channel_id: details.channel_id.unwrap_or_default(),
         description: details.short_description.unwrap_or_default(),
         duration_secs,
-        view_count: details
-            .view_count
-            .as_deref()
-            .and_then(|value| value.parse::<u64>().ok()),
+        view_count: details.view_count,
         upload_date,
         is_live,
         thumbnails,
@@ -1497,7 +1700,7 @@ fn parse_video_info(
 
 fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Option<Format> {
     let url = raw.url.unwrap_or_default();
-    if url.is_empty() && raw.signature_cipher.is_none() && raw.cipher.is_none() {
+    if raw.itag == 0 || (url.is_empty() && raw.signature_cipher.is_none() && raw.cipher.is_none()) {
         return None;
     }
 
@@ -1510,11 +1713,10 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
         .map(|id| id.split('.').next().unwrap_or(id))
         .filter(|language| !language.is_empty())
         .map(str::to_string);
-    let audio_bitrate = if has_audio && !has_video {
-        raw.audio_quality.as_ref().map(|_| raw.bitrate.unwrap_or(0))
-    } else {
-        None
-    };
+    let audio_bitrate = (has_audio && !has_video)
+        .then(|| raw.average_bitrate.or(raw.bitrate))
+        .flatten()
+        .filter(|bitrate| *bitrate > 0);
 
     Some(Format {
         itag: raw.itag,
@@ -1522,7 +1724,6 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
         signature_cipher: raw.signature_cipher,
         cipher: raw.cipher,
         container,
-        mime_type: raw.mime_type,
         video_codec,
         audio_codec,
         has_video,
@@ -1532,10 +1733,7 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
         fps: raw.fps,
         bitrate: raw.average_bitrate.or(raw.bitrate).unwrap_or(0),
         audio_bitrate,
-        content_length: raw
-            .content_length
-            .as_deref()
-            .and_then(|value| value.parse::<u64>().ok()),
+        content_length: raw.content_length,
         quality_label: raw.quality_label,
         is_hls: false,
         is_live,
@@ -1550,7 +1748,7 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
             .and_then(|track| track.audio_is_default)
             .unwrap_or(false),
         language,
-        user_agent: client_kind.user_agent().to_string(),
+        user_agent: client_kind.user_agent(),
     })
 }
 
@@ -1562,7 +1760,21 @@ fn clean_caption_language(language: &str) -> String {
 }
 
 fn normalize_upload_date(value: &str) -> String {
-    value.chars().filter(char::is_ascii_digit).collect()
+    let value = value.trim();
+    let date = value.get(..10).filter(|date| {
+        date.as_bytes().get(4) == Some(&b'-') && date.as_bytes().get(7) == Some(&b'-')
+    });
+    let digits: String = date
+        .unwrap_or(value)
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(8)
+        .collect();
+    if digits.len() == 8 {
+        digits
+    } else {
+        String::new()
+    }
 }
 
 fn parse_captions(captions: Option<Captions>) -> (Vec<SubtitleTrack>, Vec<SubtitleTrack>) {
@@ -1571,10 +1783,13 @@ fn parse_captions(captions: Option<Captions>) -> (Vec<SubtitleTrack>, Vec<Subtit
 
     let tracks = captions
         .and_then(|captions| captions.player_captions_tracklist_renderer)
-        .and_then(|tracklist| tracklist.caption_tracks)
+        .map(|tracklist| tracklist.caption_tracks)
         .unwrap_or_default();
 
     for track in tracks {
+        if track.base_url.is_empty() || track.language_code.is_empty() {
+            continue;
+        }
         let is_auto = track.kind.as_deref() == Some("asr");
         let name = track
             .name
@@ -1590,7 +1805,7 @@ fn parse_captions(captions: Option<Captions>) -> (Vec<SubtitleTrack>, Vec<Subtit
         let subtitle = SubtitleTrack {
             language: track.language_code,
             name,
-            url: track.base_url,
+            url: subtitle_url(track.base_url),
             is_auto,
         };
         if is_auto {
@@ -1603,11 +1818,20 @@ fn parse_captions(captions: Option<Captions>) -> (Vec<SubtitleTrack>, Vec<Subtit
     (subtitles, automatic)
 }
 
+fn subtitle_url(base_url: String) -> String {
+    let separator = if base_url.contains('?') { '&' } else { '?' };
+    format!("{base_url}{separator}fmt=vtt")
+}
+
 fn parse_mime_and_codecs(mime_type: &str) -> (String, Option<String>, Option<String>, bool, bool) {
-    let mime = mime_type.split(';').next().unwrap_or(mime_type).trim();
-    let mut mime_parts = mime.split('/');
-    let kind = mime_parts.next().unwrap_or_default();
-    let container = match mime_parts.next().unwrap_or_default() {
+    let mut parameters = mime_type.split(';');
+    let mime = parameters
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let (kind, subtype) = mime.split_once('/').unwrap_or((mime.as_str(), ""));
+    let container = match subtype {
         "mp4" => "mp4",
         "webm" => "webm",
         "3gpp" => "3gp",
@@ -1616,35 +1840,66 @@ fn parse_mime_and_codecs(mime_type: &str) -> (String, Option<String>, Option<Str
     }
     .to_string();
 
-    let codecs = mime_type
-        .split("codecs=\"")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .map(|value| {
-            value
-                .split(',')
-                .map(|codec| codec.trim().to_string())
-                .filter(|codec| !codec.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut codecs = Vec::new();
+    for parameter in parameters {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("codecs") {
+            continue;
+        }
+        for codec in value.trim().trim_matches('"').split(',') {
+            let codec = codec.trim();
+            if !codec.is_empty() {
+                codecs.push(codec.to_string());
+            }
+        }
+    }
 
     let has_video = kind == "video";
-    let has_audio = kind == "audio" || (has_video && codecs.len() > 1);
     let video_codec = if has_video {
-        codecs.first().cloned()
+        codecs
+            .iter()
+            .find(|codec| is_video_codec(codec))
+            .cloned()
+            .or_else(|| codecs.first().cloned())
     } else {
         None
     };
     let audio_codec = if kind == "audio" {
-        codecs.first().cloned()
-    } else if codecs.len() > 1 {
-        codecs.get(1).cloned()
+        codecs
+            .iter()
+            .find(|codec| is_audio_codec(codec))
+            .cloned()
+            .or_else(|| codecs.first().cloned())
     } else {
-        None
+        codecs.iter().find(|codec| is_audio_codec(codec)).cloned()
     };
+    let has_audio = kind == "audio" || (has_video && audio_codec.is_some());
 
     (container, video_codec, audio_codec, has_video, has_audio)
+}
+
+fn is_video_codec(codec: &str) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    codec.starts_with("avc")
+        || codec.starts_with("hev")
+        || codec.starts_with("hvc")
+        || codec.starts_with("vp")
+        || codec.starts_with("av01")
+        || codec.starts_with("dvh")
+        || codec.starts_with("theora")
+}
+
+fn is_audio_codec(codec: &str) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    codec.starts_with("mp4a")
+        || codec.starts_with("opus")
+        || codec.starts_with("vorbis")
+        || codec.starts_with("ac-3")
+        || codec.starts_with("ec-3")
+        || codec.starts_with("flac")
+        || codec.starts_with("mp3")
 }
 
 fn find_playlist_title(value: &Value) -> Option<String> {
@@ -1652,12 +1907,15 @@ fn find_playlist_title(value: &Value) -> Option<String> {
         .and_then(|metadata| metadata.get("title"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .or_else(|| find_string(value, &["playlistHeaderRenderer", "title", "simpleText"]))
+        .or_else(|| {
+            find_key_value(value, "playlistHeaderRenderer")
+                .and_then(|header| header.get("title"))
+                .and_then(text_of)
+        })
         .or_else(|| {
             value
-                .pointer("/sidebar/playlistSidebarRenderer/items/0/playlistSidebarPrimaryInfoRenderer/title/runs/0/text")
-                .and_then(Value::as_str)
-                .map(str::to_string)
+                .pointer("/sidebar/playlistSidebarRenderer/items/0/playlistSidebarPrimaryInfoRenderer/title")
+                .and_then(text_of)
         })
         .filter(|title| !title.is_empty())
 }
@@ -1678,7 +1936,7 @@ fn find_key_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
 fn collect_playlist_videos(
     value: &Value,
     entries: &mut Vec<PlaylistEntry>,
-    seen: &mut BTreeSet<String>,
+    seen: &mut HashSet<String>,
     limit: usize,
 ) {
     if entries.len() >= limit {
@@ -1690,6 +1948,9 @@ fn collect_playlist_videos(
             if let Some(renderer) = map
                 .get("videoRenderer")
                 .or_else(|| map.get("playlistVideoRenderer"))
+                .or_else(|| map.get("reelItemRenderer"))
+                .or_else(|| map.get("gridVideoRenderer"))
+                .or_else(|| map.get("compactVideoRenderer"))
                 && let Some((id, title, duration, thumbnails)) = standard_renderer_entry(renderer)
             {
                 push_playlist_entry(entries, seen, limit, &id, title, duration, thumbnails);
@@ -1705,7 +1966,8 @@ fn collect_playlist_videos(
                         renderer.pointer("/metadata/lockupMetadataViewModel/title/runs/0/text")
                     })
                     .and_then(Value::as_str)
-                    .unwrap_or("")
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or(id)
                     .to_string();
                 let duration = find_key_value(renderer, "thumbnailBadgeViewModel")
                     .and_then(|badge| badge.get("text"))
@@ -1741,8 +2003,9 @@ fn standard_renderer_entry(
     renderer: &Value,
 ) -> Option<(String, String, Option<u64>, Vec<Thumbnail>)> {
     let id = renderer.get("videoId").and_then(Value::as_str)?;
-    let title =
-        text_of(renderer.get("title").unwrap_or(&Value::Null)).unwrap_or_else(|| id.to_string());
+    let title = text_of(renderer.get("title").unwrap_or(&Value::Null))
+        .or_else(|| text_of(renderer.get("headline").unwrap_or(&Value::Null)))
+        .unwrap_or_else(|| id.to_string());
     let duration = renderer
         .get("lengthSeconds")
         .and_then(Value::as_str)
@@ -1758,7 +2021,7 @@ fn standard_renderer_entry(
 
 fn push_playlist_entry(
     entries: &mut Vec<PlaylistEntry>,
-    seen: &mut BTreeSet<String>,
+    seen: &mut HashSet<String>,
     limit: usize,
     id: &str,
     title: String,
@@ -1794,16 +2057,24 @@ fn parse_duration_text(value: &str) -> Option<u64> {
 }
 
 fn find_continuation_token(value: &Value) -> Option<String> {
-    find_continuation_token_in(value, false).or_else(|| find_continuation_token_in(value, true))
+    find_continuation_token_in(value, false)
 }
 
-fn find_continuation_token_in(value: &Value, in_playlist: bool) -> Option<String> {
+fn find_continuation_token_in(value: &Value, active: bool) -> Option<String> {
     match value {
         Value::Object(map) => {
-            let in_playlist = in_playlist
-                || map.contains_key("playlistVideoListRenderer")
-                || map.contains_key("playlistPanelRenderer");
-            if in_playlist
+            let active = active
+                || map.keys().any(|key| {
+                    matches!(
+                        key.as_str(),
+                        "playlistVideoListRenderer"
+                            | "playlistPanelRenderer"
+                            | "searchResultsRenderer"
+                            | "gridRenderer"
+                            | "reelShelfRenderer"
+                    )
+                });
+            if active
                 && let Some(token) = map
                     .get("continuationCommand")
                     .and_then(|command| command.get("token"))
@@ -1812,7 +2083,7 @@ fn find_continuation_token_in(value: &Value, in_playlist: bool) -> Option<String
                 return Some(token.to_string());
             }
             for child in map.values() {
-                if let Some(token) = find_continuation_token_in(child, in_playlist) {
+                if let Some(token) = find_continuation_token_in(child, active) {
                     return Some(token);
                 }
             }
@@ -1820,17 +2091,9 @@ fn find_continuation_token_in(value: &Value, in_playlist: bool) -> Option<String
         }
         Value::Array(items) => items
             .iter()
-            .find_map(|child| find_continuation_token_in(child, in_playlist)),
+            .find_map(|child| find_continuation_token_in(child, active)),
         _ => None,
     }
-}
-
-fn find_string(value: &Value, path: &[&str]) -> Option<String> {
-    let mut current = value;
-    for key in path {
-        current = current.get(*key)?;
-    }
-    current.as_str().map(str::to_string)
 }
 
 #[cfg(test)]
@@ -1983,5 +2246,119 @@ mod tests {
         assert_eq!(vcodec.as_deref(), Some("avc1.42001E"));
         assert_eq!(acodec.as_deref(), Some("mp4a.40.2"));
         assert!(has_video && has_audio);
+    }
+
+    #[test]
+    fn parses_unquoted_and_spaced_codecs() {
+        let (_, vcodec, acodec, has_video, has_audio) =
+            parse_mime_and_codecs("VIDEO/MP4; codecs = avc1.4d401f , mp4a.40.2");
+        assert_eq!(vcodec.as_deref(), Some("avc1.4d401f"));
+        assert_eq!(acodec.as_deref(), Some("mp4a.40.2"));
+        assert!(has_video && has_audio);
+    }
+
+    #[test]
+    fn normalizes_iso_upload_dates() {
+        assert_eq!(normalize_upload_date("2024-01-02"), "20240102");
+        assert_eq!(
+            normalize_upload_date("2024-01-02T00:00:00-08:00"),
+            "20240102"
+        );
+        assert_eq!(normalize_upload_date("not a date"), "");
+    }
+
+    #[test]
+    fn finds_signature_timestamp_variants() {
+        assert_eq!(
+            find_signature_timestamp("var a={signatureTimestamp:19369};"),
+            Some(19369)
+        );
+        assert_eq!(
+            find_signature_timestamp("var a={\"signatureTimestamp\": 19369};"),
+            Some(19369)
+        );
+        assert_eq!(find_signature_timestamp("var a={sts:19369};"), Some(19369));
+        assert_eq!(
+            find_signature_timestamp(
+                "var s=\"signatureTimestamp\";var a={signatureTimestamp:19369};"
+            ),
+            Some(19369)
+        );
+        assert_eq!(find_signature_timestamp("var stsx=1;"), None);
+    }
+
+    #[test]
+    fn parses_audio_bitrate_and_language() {
+        let raw: RawFormat = serde_json::from_value(json!({
+            "itag": 140,
+            "url": "https://rr1.googlevideo.com/videoplayback?itag=140",
+            "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+            "averageBitrate": 129000,
+            "bitRate": 128000,
+            "contentLength": "12345",
+            "audioTrack": {"id": "en-US.4", "audioIsDefault": true}
+        }))
+        .unwrap();
+        let format = parse_format(raw, ClientKind::VisionOs, false).unwrap();
+        assert_eq!(format.audio_bitrate, Some(129000));
+        assert_eq!(format.language.as_deref(), Some("en-US"));
+        assert_eq!(format.content_length, Some(12345));
+        assert!(format.audio_is_default);
+    }
+
+    #[test]
+    fn continuation_only_comes_from_known_containers() {
+        let response = json!({
+            "unrelated": {"continuationCommand": {"token": "wrong"}},
+            "contents": {
+                "playlistVideoListRenderer": {
+                    "contents": [{"continuationItemRenderer": {
+                        "continuationEndpoint": {"continuationCommand": {"token": "right"}}
+                    }}]
+                }
+            }
+        });
+        assert_eq!(find_continuation_token(&response).as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn classifies_music_and_nocookie_hosts() {
+        assert!(matches!(
+            classify("https://music.youtube.com/watch?v=dQw4w9WgXcQ", false).unwrap(),
+            Target::Video { id } if id == "dQw4w9WgXcQ"
+        ));
+        assert!(matches!(
+            classify("https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ", false).unwrap(),
+            Target::Video { id } if id == "dQw4w9WgXcQ"
+        ));
+    }
+
+    #[test]
+    fn reads_plain_and_structured_text() {
+        assert_eq!(
+            value_text(&json!("Mix - title")),
+            Some("Mix - title".to_string())
+        );
+        assert_eq!(
+            value_text(&json!({"runs": [{"text": "a"}, {"text": "b"}]})),
+            Some("ab".to_string())
+        );
+        assert_eq!(
+            value_text(&json!({"simpleText": "plain"})),
+            Some("plain".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_upload_date_from_page_html() {
+        assert_eq!(
+            upload_date_from_html(r#"{"uploadDate":"2009-10-25T07:00:00-07:00"}"#).as_deref(),
+            Some("20091025")
+        );
+        assert_eq!(
+            upload_date_from_html(r#"{"publishDate":"2024-01-02"}"#).as_deref(),
+            Some("20240102")
+        );
+        assert_eq!(upload_date_from_html("<html></html>"), None);
     }
 }

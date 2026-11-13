@@ -13,35 +13,53 @@ use ytrust::http::RequestConfig;
 use ytrust::youtube::fetch_player_source;
 
 const COOKIE_CACHE_TTL: Duration = Duration::from_secs(60);
+const COOKIE_CACHE_CAPACITY: usize = 8;
 type CookieCache = Mutex<HashMap<(Option<String>, Option<String>), (Instant, LoadedCookies)>>;
 static COOKIE_CACHE: OnceLock<CookieCache> = OnceLock::new();
 
-fn load_cookies(options: &ResolveOptions) -> ytrust::error::Result<LoadedCookies> {
-    let key = (
-        options.cookies_path.clone(),
-        options.cookies_from_browser.clone(),
-    );
+async fn load_cookies(options: ResolveOptions) -> ytrust::error::Result<LoadedCookies> {
+    let key = (options.cookies_path, options.cookies_from_browser);
     if key.0.is_none() && key.1.is_none() {
         return cookies::load(None, None);
     }
     let cache = COOKIE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(cache) = cache.lock()
-        && let Some((loaded_at, loaded)) = cache.get(&key)
-        && loaded_at.elapsed() < COOKIE_CACHE_TTL
     {
-        return Ok(loaded.clone());
+        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        cache.retain(|_, (loaded_at, _)| loaded_at.elapsed() < COOKIE_CACHE_TTL);
+        if let Some((_, loaded)) = cache.get(&key) {
+            return Ok(loaded.clone());
+        }
     }
-    let loaded = cookies::load(
-        options.cookies_path.as_deref().map(std::path::Path::new),
-        options.cookies_from_browser.as_deref(),
-    )?;
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(key, (Instant::now(), loaded.clone()));
+    let path = key.0.clone();
+    let browser = key.1.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        cookies::load(
+            path.as_deref().map(std::path::Path::new),
+            browser.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| {
+        YtrustError::coded(
+            ytrust::error::ErrorCode::Cookies,
+            format!("cookie loading task failed: {error}"),
+        )
+    })??;
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if cache.len() >= COOKIE_CACHE_CAPACITY
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (loaded_at, _))| *loaded_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
     }
+    cache.insert(key, (Instant::now(), loaded.clone()));
     Ok(loaded)
 }
 
 #[napi(object)]
+#[derive(Clone)]
 pub struct ResolveOptions {
     pub cookies_path: Option<String>,
     pub cookies_from_browser: Option<String>,
@@ -70,14 +88,15 @@ fn napi_error(error: YtrustError) -> napi::Error {
     napi::Error::from_reason(format!("[{}] {error}", error.code().as_str()))
 }
 
-fn request_config(
+async fn request_config(
     options: &ResolveOptions,
 ) -> ytrust::error::Result<(RequestConfig, CoreResolveOptions)> {
-    let cookies = load_cookies(options)?;
+    let cookies = load_cookies(options.clone()).await?;
     let timeout = u64::from(options.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS as u32));
     let config = RequestConfig {
         proxy: options.proxy.clone(),
         cookies: cookies.header,
+        cookie_jar: Some(cookies.cookie_jar),
         sapisid: cookies.sapisid,
         sapisid1p: cookies.sapisid1p,
         sapisid3p: cookies.sapisid3p,
@@ -106,7 +125,7 @@ pub fn version() -> String {
 #[napi]
 pub async fn resolve(input: String, options: Option<ResolveOptions>) -> Result<Value> {
     let options = options.unwrap_or_default();
-    let (config, core_options) = request_config(&options).map_err(napi_error)?;
+    let (config, core_options) = request_config(&options).await.map_err(napi_error)?;
     let resolved = api::resolve(&input, &config, &core_options)
         .await
         .map_err(napi_error)?;
@@ -117,7 +136,7 @@ pub async fn resolve(input: String, options: Option<ResolveOptions>) -> Result<V
 #[napi]
 pub async fn fetch_player_js(url: String, options: Option<ResolveOptions>) -> Result<String> {
     let options = options.unwrap_or_default();
-    let (config, _) = request_config(&options).map_err(napi_error)?;
+    let (config, _) = request_config(&options).await.map_err(napi_error)?;
     fetch_player_source(&url, &config).await.map_err(napi_error)
 }
 
@@ -125,7 +144,7 @@ pub async fn fetch_player_js(url: String, options: Option<ResolveOptions>) -> Re
 #[napi]
 pub async fn player_js_url(video_id: String, options: Option<ResolveOptions>) -> Result<String> {
     let options = options.unwrap_or_default();
-    let (config, _) = request_config(&options).map_err(napi_error)?;
+    let (config, _) = request_config(&options).await.map_err(napi_error)?;
     ytrust::youtube::player_js_url(&video_id, &config)
         .await
         .map_err(napi_error)

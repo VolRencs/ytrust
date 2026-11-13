@@ -219,8 +219,11 @@ pub fn sanitize_component(value: &str, restrict: bool) -> String {
         trimmed.insert(0, '_');
     }
     truncate_utf8(&mut trimmed, 180);
-    while trimmed.ends_with(' ') {
+    while trimmed.ends_with(' ') || trimmed.ends_with('.') {
         trimmed.pop();
+    }
+    if trimmed.is_empty() {
+        trimmed.push('_');
     }
     trimmed
 }

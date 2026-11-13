@@ -2,11 +2,14 @@ import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 
 const TASK_TIMEOUT_MS = 20_000;
+const MAX_QUEUE = 64;
 const configured = Number.parseInt(process.env.YTRUST_SOLVER_THREADS ?? "", 10);
 const MAX_WORKERS = Math.max(
   1,
   Math.min(4, Number.isFinite(configured) && configured > 0 ? configured : availableParallelism()),
 );
+
+const workerEnv = { ...process.env, NODE_OPTIONS: "" };
 
 const slots = [];
 const queue = [];
@@ -14,6 +17,8 @@ let nextId = 1;
 
 function createSlot() {
   const worker = new Worker(new URL("./worker.js", import.meta.url), {
+    execArgv: [],
+    env: workerEnv,
     resourceLimits: {
       maxOldGenerationSizeMb: 256,
       stackSizeMb: 4,
@@ -94,6 +99,10 @@ function dispatch() {
 
 export function solve(player, requests, options = {}) {
   return new Promise((resolveTask, rejectTask) => {
+    if (queue.length >= MAX_QUEUE) {
+      rejectTask(new Error("challenge solver queue is full"));
+      return;
+    }
     queue.push({
       id: nextId++,
       player,

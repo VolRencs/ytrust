@@ -6,7 +6,27 @@ use crate::util::unix_time;
 use crate::youtube::{Format, PlaylistEntry, PlaylistInfo, SubtitleTrack, Thumbnail, VideoInfo};
 
 pub fn video_json(info: &VideoInfo, original_url: &str) -> Value {
+    video_json_with_playlist(info, original_url, None)
+}
+
+pub fn video_json_with_playlist(
+    info: &VideoInfo,
+    original_url: &str,
+    playlist: Option<(&str, usize, usize)>,
+) -> Value {
     let thumbnails = thumbnails_json(&info.thumbnails);
+    let formats: Vec<Value> = info
+        .formats
+        .iter()
+        .map(|format| format_json(format, info.duration_secs))
+        .collect();
+    let best_audio = best_audio(info)
+        .and_then(|best| {
+            info.formats
+                .iter()
+                .position(|format| std::ptr::eq(format, best))
+        })
+        .and_then(|index| formats.get(index).cloned());
     json!({
         "_type": "video",
         "id": info.id,
@@ -22,17 +42,17 @@ pub fn video_json(info: &VideoInfo, original_url: &str) -> Value {
         "channel_id": info.channel_id,
         "upload_date": info.upload_date,
         "view_count": info.view_count,
+        "playlist_title": playlist.map(|(title, _, _)| title),
+        "playlist_index": playlist.map(|(_, index, _)| index),
+        "playlist_count": playlist.map(|(_, _, count)| count),
         "is_live": info.is_live,
         "extractor": "youtube",
         "extractor_key": "Youtube",
         "epoch": unix_time(),
-        "formats": info
-            .formats
-            .iter()
-            .map(|format| format_json(format, info.duration_secs))
-            .collect::<Vec<_>>(),
-        "best_audio": best_audio(info).map(|format| format_json(format, info.duration_secs)),
+        "formats": formats,
+        "best_audio": best_audio,
         "player_js_url": info.player_js_url,
+        "hls_manifest_url": info.hls_manifest_url,
         "subtitles": subtitles_json(&info.subtitles),
         "automatic_captions": subtitles_json(&info.automatic_captions),
     })
@@ -94,7 +114,13 @@ fn format_json(format: &Format, duration_secs: Option<u64>) -> Value {
         "signature_cipher": format.signature_cipher,
         "cipher": format.cipher,
         "ext": ext,
-        "protocol": if format.is_hls { "m3u8_native" } else { "https" },
+        "protocol": if format.is_hls {
+            "m3u8_native"
+        } else if format.url.is_empty() {
+            "https+cipher"
+        } else {
+            "https"
+        },
         "is_hls": format.is_hls,
         "vcodec": format.video_codec.clone().unwrap_or_else(|| "none".to_string()),
         "acodec": format.audio_codec.clone().unwrap_or_else(|| "none".to_string()),
@@ -148,10 +174,13 @@ fn cipher_expires_at(cipher: &str) -> Option<u64> {
 }
 
 fn format_expires_at(raw: &str) -> Option<u64> {
-    let url = url::Url::parse(raw).ok()?;
-    url.query_pairs()
-        .find(|(key, _)| key == "expire")
-        .and_then(|(_, value)| value.parse::<u64>().ok())
+    let query = raw.split_once('?')?.1.split('#').next().unwrap_or_default();
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "expire")
+            .then(|| value.parse::<u64>().ok())
+            .flatten()
+    })
 }
 
 fn thumbnails_json(thumbnails: &[Thumbnail]) -> Vec<Value> {
@@ -168,21 +197,24 @@ fn thumbnails_json(thumbnails: &[Thumbnail]) -> Vec<Value> {
 }
 
 fn subtitles_json(tracks: &[SubtitleTrack]) -> Value {
-    let mut result = serde_json::Map::new();
+    let mut result: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
     for track in tracks {
-        let entry = json!({
-            "ext": "vtt",
-            "url": track.url,
-            "name": track.name,
-        });
         result
             .entry(track.language.clone())
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .expect("subtitle entry is an array")
-            .push(entry);
+            .or_default()
+            .push(json!({
+                "ext": "vtt",
+                "url": track.url,
+                "name": track.name,
+            }));
     }
-    Value::Object(result)
+    Value::Object(
+        result
+            .into_iter()
+            .map(|(language, entries)| (language, Value::Array(entries)))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -208,7 +240,6 @@ mod tests {
             } else {
                 "mp4".to_string()
             },
-            mime_type: "audio/mp4".to_string(),
             video_codec: has_video.then(|| "avc1.640028".to_string()),
             audio_codec: audio_codec.map(str::to_string),
             has_video,
@@ -226,7 +257,7 @@ mod tests {
             audio_track_id: None,
             audio_is_default: false,
             language: None,
-            user_agent: "test-agent".to_string(),
+            user_agent: "test-agent",
         }
     }
 
@@ -322,5 +353,34 @@ mod tests {
             None
         );
         assert_eq!(format_expires_at("not a url"), None);
+    }
+
+    #[test]
+    fn video_json_includes_playlist_context() {
+        let info = video_info(vec![format(18, Some("mp4a.40.2"), true, 500_000, None)]);
+        let value = video_json_with_playlist(&info, &info.webpage_url, Some(("Mix", 2, 10)));
+        assert_eq!(value["playlist_title"], "Mix");
+        assert_eq!(value["playlist_index"], 2);
+        assert_eq!(value["playlist_count"], 10);
+    }
+
+    #[test]
+    fn groups_subtitles_without_panicking() {
+        let tracks = vec![
+            SubtitleTrack {
+                language: "en".to_string(),
+                name: "English".to_string(),
+                url: "https://www.youtube.com/api/timedtext?fmt=vtt".to_string(),
+                is_auto: false,
+            },
+            SubtitleTrack {
+                language: "en".to_string(),
+                name: "English (auto)".to_string(),
+                url: "https://www.youtube.com/api/timedtext?fmt=vtt&t=1".to_string(),
+                is_auto: true,
+            },
+        ];
+        let value = subtitles_json(&tracks);
+        assert_eq!(value["en"].as_array().unwrap().len(), 2);
     }
 }

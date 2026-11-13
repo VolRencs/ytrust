@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.1.0
+
+### Fixed
+
+- Media downloads now validate `Content-Range` before resuming, retry
+  connection/body failures, and retry transient `403`/`410` CDN responses.
+  ffmpeg, merge and audio-conversion outputs are written to a temporary file and
+  atomically renamed, so interrupted postprocessing cannot leave a corrupt final
+  file. ffmpeg children are killed on cancellation and their stderr is bounded.
+- `-o -` now sends the range header required by googlevideo, exits cleanly on a
+  closed pipe, and rejects playlists/multiple URLs before network access.
+- `best_audio` only recommends playable URLs, audio bitrate is used correctly,
+  upload dates are parsed from ISO timestamps when YouTube reports one, and
+  `language=en` matches `en-US` tracks.
+- Error selection now prefers `BOTCHECK`/`AGE_RESTRICTED`/`PRIVATE` over generic
+  network failures; broken-pipe detection survives playlist context wrapping.
+- `resolveAudio` never returns a URL with an unresolved `n`/signature challenge.
+  Challenge workers ignore problematic `NODE_OPTIONS` values, and the CLI reuses
+  one persistent solver process instead of starting Node for every video.
+- Cookie headers are scoped by host and path, oversized cookies can no longer
+  exceed the header cap, and Firefox profiles are found on Windows/macOS.
+
+### Changed
+
+- Progress JSON throttles before aggregation, emits phase progress during
+  ffmpeg/HLS work, includes playlist metadata on all per-item events, and no
+  longer blocks downloads on a slow stdout consumer.
+- Playlist/search responses are traversed once per page; format selectors are
+  parsed once and candidates are chosen in linear time.
+- Node options are validated strictly (unknown keys and zero timeout are
+  rejected), caches are bounded, and cookie loading no longer blocks the event
+  loop.
+- `--embed-subs` implies subtitle download, and audio-only multi-track and
+  `--remux-video`/`--embed-subs` combinations are validated up front.
+
 ## 1.0.1
 
 ### Fixed

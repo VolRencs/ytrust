@@ -1,6 +1,7 @@
 mod cli;
 
 use std::collections::BTreeSet;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -13,15 +14,16 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use ytrust::api::{self, ResolveOptions, Resolved};
 use ytrust::challenge::{ChallengeSolver, SolveReport};
-use ytrust::constants::DEFAULT_FORMAT;
+use ytrust::constants::{DEFAULT_AUDIO_FORMAT, DEFAULT_FORMAT};
 use ytrust::cookies;
 use ytrust::download::{DownloadConfig, DownloadRange, Downloader, audio_codec, parse_range};
 use ytrust::error::{ErrorCode, Result, YtrustError};
-use ytrust::format::{FormatSelection, print_formats, select};
+use ytrust::format::{FormatSelection, FormatSelector, print_formats};
 use ytrust::http::RequestConfig;
 use ytrust::json;
 use ytrust::output::{
-    TemplateContext, format_duration, format_ext, merged_ext_multi, render_path, write_json,
+    TemplateContext, format_duration, format_ext, merged_ext_multi, render_path,
+    sanitize_component, write_json,
 };
 use ytrust::progress::{
     ComponentSpec, EventSink, ExtraFile, Progress, ProgressMeta, emit_error, emit_playlist,
@@ -33,7 +35,7 @@ use crate::cli::Cli;
 macro_rules! status {
     ($cli:expr, $($arg:tt)*) => {
         if !$cli.quiet {
-            eprintln!($($arg)*);
+            let _ = writeln!(std::io::stderr(), $($arg)*);
         }
     };
 }
@@ -50,32 +52,54 @@ struct RunReport {
     failed: usize,
 }
 
-#[tokio::main]
-async fn main() {
+#[derive(Debug, Clone)]
+struct PlaylistContext {
+    title: String,
+    index: usize,
+    count: usize,
+}
+
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     init_logging(&cli);
+    if let Err(error) = cli.validate() {
+        let _ = writeln!(std::io::stderr(), "error: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
     let events = cli.progress_json.then(EventSink::new);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "error: failed to start async runtime: {error}"
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
-    match run(cli, events.clone()).await {
-        Ok(report) if report.failed > 0 => std::process::exit(1),
-        Ok(_) => {}
+    match runtime.block_on(run(cli, events.clone())) {
+        Ok(report) if report.failed > 0 => std::process::ExitCode::FAILURE,
+        Ok(_) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             if err.is_broken_pipe() {
-                return;
+                return std::process::ExitCode::SUCCESS;
             }
             if let Some(events) = &events {
                 emit_error(events, err.code().as_str(), &err.to_string());
             }
-            eprintln!("error: {err}");
-            std::process::exit(1);
+            let _ = writeln!(std::io::stderr(), "error: {err}");
+            std::process::ExitCode::FAILURE
         }
     }
 }
 
-async fn run(cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
-    let cookies = cookies::load(cli.cookies.as_deref(), cli.cookies_from_browser.as_deref())?;
-    if cookies.header.is_some() {
-        debug!("loaded cookies");
+async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
+    if cli.embed_subs && !cli.write_subs && !cli.write_auto_subs {
+        cli.write_subs = true;
     }
     if let Some(audio_format) = &cli.audio_format {
         audio_codec(audio_format.trim_start_matches('.'))?;
@@ -91,6 +115,10 @@ async fn run(cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
             format!("unsupported output encoding: {encoding}; only UTF-8 is supported"),
         ));
     }
+    let cookies = cookies::load(cli.cookies.as_deref(), cli.cookies_from_browser.as_deref())?;
+    if cookies.header.is_some() {
+        debug!("loaded cookies");
+    }
     if cli.retry_sleep.is_some() || cli.concurrent_fragments.is_some() {
         debug!("yt-dlp compatibility options are accepted but do not change ytrust scheduling");
     }
@@ -98,6 +126,7 @@ async fn run(cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
     let request_config = RequestConfig {
         proxy: cli.proxy.clone(),
         cookies: cookies.header.clone(),
+        cookie_jar: Some(cookies.cookie_jar.clone()),
         sapisid: cookies.sapisid.clone(),
         sapisid1p: cookies.sapisid1p.clone(),
         sapisid3p: cookies.sapisid3p.clone(),
@@ -109,6 +138,7 @@ async fn run(cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
         timeout,
         proxy: cli.proxy.clone(),
         cookies: cookies.header,
+        cookie_jar: Some(cookies.cookie_jar),
         ffmpeg: cli.ffmpeg_location.clone(),
         force_overwrites: cli.force_overwrites,
         quiet: cli.quiet,
@@ -130,12 +160,19 @@ async fn run(cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
         playlist_limit: cli.playlist_limit,
         playlist_items: cli.playlist_items.clone(),
     };
+    let format_expression = if cli.extract_audio || cli.audio_format.is_some() {
+        cli.format.as_deref().unwrap_or(DEFAULT_AUDIO_FORMAT)
+    } else {
+        cli.format.as_deref().unwrap_or(DEFAULT_FORMAT)
+    };
+    let selector = FormatSelector::parse(format_expression)?;
 
     let context = RunContext {
         cli: &cli,
         request_config: &request_config,
         downloader: &downloader,
         solver: &solver,
+        selector: &selector,
         json_mode,
         simulate,
         skip_media,
@@ -160,6 +197,9 @@ async fn run(cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
         }
         .await;
         if let Err(error) = result {
+            if error.is_broken_pipe() {
+                return Err(error);
+            }
             if cli.ignore_errors {
                 report_error(context.events, &error);
                 report.failed += 1;
@@ -177,6 +217,7 @@ struct RunContext<'a> {
     request_config: &'a RequestConfig,
     downloader: &'a Downloader,
     solver: &'a ChallengeSolver,
+    selector: &'a FormatSelector,
     json_mode: JsonMode,
     simulate: bool,
     skip_media: bool,
@@ -192,6 +233,13 @@ async fn process_playlist(
     if context.json_mode == JsonMode::Single {
         write_json(&json::playlist_json(&playlist, original_url))?;
         return Ok(0);
+    }
+
+    if context.cli.output == "-" && context.json_mode == JsonMode::None {
+        return Err(YtrustError::coded(
+            ErrorCode::InvalidInput,
+            "stdout output cannot be used with a playlist; resolve a single video or write to files",
+        ));
     }
 
     if let Some(events) = context.events {
@@ -214,46 +262,28 @@ async fn process_playlist(
         return Ok(0);
     }
 
-    if context.json_mode == JsonMode::PerVideo {
-        let mut failed = 0;
-        for entry in &playlist.entries {
-            let result = process_playlist_entry(entry, &playlist, context).await;
-            if let Err(error) = result {
-                let error = error.context(format!("playlist item {}", entry.index));
-                if context.cli.ignore_errors {
-                    report_error(context.events, &error);
-                    failed += 1;
-                } else {
-                    return Err(error);
-                }
-            }
-        }
-        return Ok(failed);
-    }
-
     if playlist.entries.is_empty() {
         warn!("playlist {:?} has no matching entries", playlist.title);
         return Ok(0);
     }
 
+    let total = playlist.entries.len();
     info!(
-        "playlist {:?} ({}): downloading {} entries",
-        playlist.title,
-        playlist.id,
-        playlist.entries.len()
+        "playlist {:?} ({}): processing {} entries",
+        playlist.title, playlist.id, total
     );
 
     let mut failed = 0;
     for (position, entry) in playlist.entries.iter().enumerate() {
-        info!(
-            "[{}/{}] {}",
-            position + 1,
-            playlist.entries.len(),
-            entry.title
-        );
+        if context.json_mode != JsonMode::PerVideo {
+            info!("[{}/{}] {}", position + 1, total, entry.title);
+        }
         let result = process_playlist_entry(entry, &playlist, context).await;
         if let Err(error) = result {
             let error = error.context(format!("playlist item {}", entry.index));
+            if error.is_broken_pipe() {
+                return Err(error);
+            }
             if context.cli.ignore_errors {
                 report_error(context.events, &error);
                 failed += 1;
@@ -271,14 +301,18 @@ async fn process_playlist_entry(
     context: &RunContext<'_>,
 ) -> Result<()> {
     let original = format!("https://www.youtube.com/watch?v={}", entry.id);
-    let playlist_context = (playlist.title.clone(), entry.index);
-    process_video_id(&entry.id, &original, Some(playlist_context), context).await
+    let playlist_context = PlaylistContext {
+        title: playlist.title.clone(),
+        index: entry.index,
+        count: playlist.entries.len(),
+    };
+    process_video_id(&entry.id, &original, Some(&playlist_context), context).await
 }
 
 async fn process_video_id(
     video_id: &str,
     original_url: &str,
-    playlist: Option<(String, usize)>,
+    playlist: Option<&PlaylistContext>,
     context: &RunContext<'_>,
 ) -> Result<()> {
     let info = fetch_video(video_id, context.request_config).await?;
@@ -288,7 +322,7 @@ async fn process_video_id(
 async fn process_info(
     mut info: VideoInfo,
     original_url: &str,
-    playlist: Option<(String, usize)>,
+    playlist: Option<&PlaylistContext>,
     context: &RunContext<'_>,
 ) -> Result<()> {
     let cli = context.cli;
@@ -317,7 +351,12 @@ async fn process_info(
     };
 
     if context.json_mode != JsonMode::None {
-        write_json(&json::video_json(&info, original_url))?;
+        let value = json::video_json_with_playlist(
+            &info,
+            original_url,
+            playlist.map(|playlist| (playlist.title.as_str(), playlist.index, playlist.count)),
+        );
+        write_json(&value)?;
         return Ok(());
     }
 
@@ -335,13 +374,7 @@ async fn process_info(
     }
 
     if context.simulate {
-        let progress = make_progress(
-            context.events,
-            &info,
-            original_url,
-            playlist.as_ref(),
-            Vec::new(),
-        );
+        let progress = make_progress(context.events, &info, original_url, playlist, Vec::new());
         if let Some(progress) = &progress {
             progress.done(None, "media", false, true, None);
         }
@@ -356,15 +389,8 @@ async fn process_info(
                 "stdout output requires a media download",
             ));
         }
-        let progress = make_progress(
-            context.events,
-            &info,
-            original_url,
-            playlist.as_ref(),
-            Vec::new(),
-        );
-        let extras =
-            write_extras(&info, playlist.as_ref(), cli, downloader, progress.as_ref()).await?;
+        let progress = make_progress(context.events, &info, original_url, playlist, Vec::new());
+        let extras = write_extras(&info, playlist, cli, downloader, progress.as_ref()).await?;
         if let Some(progress) = &progress {
             if extras.is_empty() {
                 progress.done(None, "skip", false, false, None);
@@ -383,16 +409,17 @@ async fn process_info(
         return Ok(());
     }
 
-    let expression = if context.extract_audio() {
-        cli.format.as_deref().unwrap_or("bestaudio/best")
-    } else {
-        cli.format.as_deref().unwrap_or(DEFAULT_FORMAT)
-    };
-    let selection = select(&info, expression)
+    let selection = context
+        .selector
+        .select(&info.formats)
         .map_err(|error| challenge_context(error, solve_report.as_ref()))?;
     let audio_mode = context.extract_audio() || selection.video.is_none();
 
-    if selection.video.is_some() && selection.audios.len() > 1 && !cli.audio_multistreams {
+    if !audio_mode
+        && selection.video.is_some()
+        && selection.audios.len() > 1
+        && !cli.audio_multistreams
+    {
         return Err(YtrustError::coded(
             ErrorCode::InvalidInput,
             "multiple audio tracks selected; pass --audio-multistreams to merge them",
@@ -429,13 +456,7 @@ async fn process_info(
     } else {
         video_components(&selection, duration_secs, use_content_length)
     };
-    let progress = make_progress(
-        context.events,
-        &info,
-        original_url,
-        playlist.as_ref(),
-        components,
-    );
+    let progress = make_progress(context.events, &info, original_url, playlist, components);
 
     if cli.output == "-" {
         if cli.embed_subs || cli.remux_video.is_some() {
@@ -461,7 +482,7 @@ async fn process_info(
             .await;
     }
 
-    let extras = write_extras(&info, playlist.as_ref(), cli, downloader, progress.as_ref()).await?;
+    let extras = write_extras(&info, playlist, cli, downloader, progress.as_ref()).await?;
 
     if audio_mode {
         return download_audio_only(
@@ -501,7 +522,7 @@ impl RunContext<'_> {
 async fn download_video(
     info: &VideoInfo,
     selection: &FormatSelection,
-    playlist: Option<(String, usize)>,
+    playlist: Option<&PlaylistContext>,
     cli: &Cli,
     downloader: &Downloader,
     duration_secs: Option<u64>,
@@ -530,8 +551,8 @@ async fn download_video(
     };
 
     let mut context = TemplateContext::from_info(info, &ext).with_format(&context_format);
-    if let Some((name, index)) = &playlist {
-        context = context.with_playlist(name, Some(*index));
+    if let Some(playlist) = playlist {
+        context = context.with_playlist(&playlist.title, Some(playlist.index));
     }
     let destination = render_path(
         &cli.output,
@@ -547,7 +568,7 @@ async fn download_video(
         ));
     }
 
-    if destination.exists() && !cli.force_overwrites {
+    if path_is_file(&destination).await && !cli.force_overwrites {
         status!(cli, "already downloaded: {}", destination.to_string_lossy());
         if let Some(progress) = progress {
             progress.done(Some(&destination), "video", true, false, None);
@@ -605,11 +626,20 @@ async fn download_video(
         return Ok(());
     }
 
-    let video_path = intermediate_path(&destination, "video", video.itag, format_ext(video));
+    let video_path = intermediate_path(&destination, "video", video.itag, None, format_ext(video));
     let audio_paths: Vec<PathBuf> = selection
         .audios
         .iter()
-        .map(|audio| intermediate_path(&destination, "audio", audio.itag, format_ext(audio)))
+        .enumerate()
+        .map(|(index, audio)| {
+            intermediate_path(
+                &destination,
+                "audio",
+                audio.itag,
+                Some(index),
+                format_ext(audio),
+            )
+        })
         .collect();
 
     if let Some(parent) = destination.parent() {
@@ -725,7 +755,7 @@ async fn postprocess_video(
 async fn download_audio_only(
     info: &VideoInfo,
     selection: &FormatSelection,
-    playlist: Option<(String, usize)>,
+    playlist: Option<&PlaylistContext>,
     cli: &Cli,
     downloader: &Downloader,
     duration_secs: Option<u64>,
@@ -760,8 +790,8 @@ async fn download_audio_only(
         let convert = extracted || (cli.audio_format.is_some() && target_ext != source_ext);
 
         let mut context = TemplateContext::from_info(info, &target_ext).with_format(audio);
-        if let Some((name, index)) = &playlist {
-            context = context.with_playlist(name, Some(*index));
+        if let Some(playlist) = playlist {
+            context = context.with_playlist(&playlist.title, Some(playlist.index));
         }
         let mut destination = render_path(
             &cli.output,
@@ -788,7 +818,7 @@ async fn download_audio_only(
             ));
         }
 
-        if destination.exists() && !cli.force_overwrites {
+        if path_is_file(&destination).await && !cli.force_overwrites {
             status!(cli, "already downloaded: {}", destination.to_string_lossy());
             if let Some(progress) = progress {
                 progress.done(
@@ -814,6 +844,13 @@ async fn download_audio_only(
         };
 
         if !convert {
+            if cli.audio_quality.is_some() {
+                status!(
+                    cli,
+                    "note: --audio-quality is ignored because the source audio is already {}",
+                    target_ext
+                );
+            }
             downloader
                 .download_format(
                     audio,
@@ -841,7 +878,8 @@ async fn download_audio_only(
             return Err(YtrustError::FfmpegMissing);
         }
 
-        let source_path = intermediate_path(&destination, "source", audio.itag, source_ext);
+        let source_path =
+            intermediate_path(&destination, "source", audio.itag, Some(index), source_ext);
         downloader
             .download_format(
                 audio,
@@ -882,7 +920,7 @@ async fn download_audio_only(
 
 async fn write_extras(
     info: &VideoInfo,
-    playlist: Option<&(String, usize)>,
+    playlist: Option<&PlaylistContext>,
     cli: &Cli,
     downloader: &Downloader,
     progress: Option<&Progress>,
@@ -894,8 +932,8 @@ async fn write_extras(
     }
 
     let mut ctx = TemplateContext::from_info(info, "jpg");
-    if let Some((name, index)) = playlist {
-        ctx = ctx.with_playlist(name, Some(*index));
+    if let Some(playlist) = playlist {
+        ctx = ctx.with_playlist(&playlist.title, Some(playlist.index));
     }
 
     if cli.write_all_thumbnails {
@@ -930,7 +968,10 @@ async fn write_extras(
             });
         }
     } else if cli.write_thumbnail
-        && let Some(thumb) = info.thumbnails.last()
+        && let Some(thumb) = info
+            .thumbnails
+            .iter()
+            .max_by_key(|thumb| thumb.width.unwrap_or(0) * thumb.height.unwrap_or(0))
     {
         let ext = thumbnail_ext(&thumb.url);
         let base = render_path(
@@ -983,13 +1024,6 @@ async fn write_extras(
         if !subtitle_language_selected(&cli.sub_langs, &track.language) {
             continue;
         }
-        let url = with_subtitle_format(&track.url, "vtt")?;
-        let body = downloader.fetch_text(&url).await?;
-        let body = if format == "srt" {
-            vtt_to_srt(&body)
-        } else {
-            body
-        };
         let base = render_path(
             &cli.output,
             &ctx.clone().with_ext(format.clone()),
@@ -1006,17 +1040,29 @@ async fn write_extras(
             suffix.push_str(&format!(".{}", *count));
         }
         let destination = append_to_stem(&base, &suffix, &format);
-        if destination.exists() && !cli.force_overwrites {
+        if path_is_file(&destination).await && !cli.force_overwrites {
             status!(
                 cli,
                 "subtitle already exists: {}",
                 destination.to_string_lossy()
             );
         } else {
+            let url = with_subtitle_format(&track.url, "vtt")?;
+            let body = downloader.fetch_text(&url).await?;
+            let body = if format == "srt" {
+                vtt_to_srt(&body)
+            } else {
+                body
+            };
             if let Some(parent) = destination.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::write(&destination, body).await?;
+            let temp = destination.with_extension(format!("{format}.part"));
+            tokio::fs::write(&temp, body).await?;
+            if path_is_file(&destination).await {
+                let _ = tokio::fs::remove_file(&destination).await;
+            }
+            tokio::fs::rename(&temp, &destination).await?;
             status!(cli, "subtitle: {}", destination.to_string_lossy());
         }
         if let Some(progress) = progress {
@@ -1096,6 +1142,12 @@ fn append_to_stem(path: &Path, suffix: &str, ext: &str) -> PathBuf {
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download".to_string());
+    let suffix = sanitize_component(suffix, true);
+    let suffix = if suffix.is_empty() {
+        "file".to_string()
+    } else {
+        suffix
+    };
     path.with_file_name(format!("{stem}.{suffix}.{ext}"))
 }
 
@@ -1346,7 +1398,7 @@ fn make_progress(
     events: Option<&EventSink>,
     info: &VideoInfo,
     original_url: &str,
-    playlist: Option<&(String, usize)>,
+    playlist: Option<&PlaylistContext>,
     components: Vec<ComponentSpec>,
 ) -> Option<Progress> {
     events.map(|events| {
@@ -1356,8 +1408,8 @@ fn make_progress(
                 id: info.id.clone(),
                 title: info.title.clone(),
                 original_url: original_url.to_string(),
-                playlist_index: playlist.map(|(_, index)| *index),
-                playlist_count: None,
+                playlist_index: playlist.map(|playlist| playlist.index),
+                playlist_count: playlist.map(|playlist| playlist.count),
             },
             components,
         )
@@ -1368,7 +1420,7 @@ fn report_error(events: Option<&EventSink>, error: &YtrustError) {
     if let Some(events) = events {
         emit_error(events, error.code().as_str(), &error.to_string());
     } else {
-        eprintln!("error: {error}");
+        let _ = writeln!(std::io::stderr(), "error: {error}");
     }
 }
 
@@ -1402,13 +1454,30 @@ fn challenge_context(error: YtrustError, report: Option<&SolveReport>) -> Ytrust
     error
 }
 
-fn intermediate_path(destination: &Path, kind: &str, itag: u64, ext: &str) -> PathBuf {
+async fn path_is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn intermediate_path(
+    destination: &Path,
+    kind: &str,
+    itag: u64,
+    index: Option<usize>,
+    ext: &str,
+) -> PathBuf {
     let name = destination
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download".to_string());
+    let index = index
+        .map(|index| format!(".{}", index + 1))
+        .unwrap_or_default();
+    let pid = std::process::id();
 
-    destination.with_file_name(format!(".{name}.{kind}.{itag}.{ext}"))
+    destination.with_file_name(format!(".{name}.{kind}.{itag}{index}.{pid}.{ext}"))
 }
 
 fn init_logging(cli: &Cli) {
@@ -1416,7 +1485,6 @@ fn init_logging(cli: &Cli) {
         "error"
     } else {
         match cli.verbose {
-            0 if cli.no_warnings => "info",
             0 => "warn",
             1 => "info",
             2 => "debug",
@@ -1431,6 +1499,7 @@ fn init_logging(cli: &Cli) {
     let suppress_warnings = cli.no_warnings && !cli.quiet;
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .with_filter(filter);
     let no_warnings =

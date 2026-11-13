@@ -5,6 +5,31 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, YtrustError>;
 
+/// Higher values are more useful to callers when several client attempts fail.
+pub const fn error_priority(code: ErrorCode) -> u8 {
+    match code {
+        ErrorCode::BotCheck => 10,
+        ErrorCode::AgeRestricted => 9,
+        ErrorCode::Private => 8,
+        ErrorCode::Cookies => 7,
+        ErrorCode::ChallengeFailed => 6,
+        ErrorCode::Unavailable => 5,
+        ErrorCode::Timeout => 4,
+        ErrorCode::Network => 3,
+        ErrorCode::InvalidResponse => 2,
+        ErrorCode::Http => 1,
+        _ => 0,
+    }
+}
+
+/// Pick the most actionable error from a set of failed attempts instead of
+/// blindly returning the last one.
+pub fn best_error(errors: Vec<YtrustError>) -> Option<YtrustError> {
+    errors
+        .into_iter()
+        .max_by_key(|error| error_priority(error.code()))
+}
+
 /// Stable, machine-readable error codes exposed by the Node module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
@@ -85,6 +110,13 @@ pub enum YtrustError {
     #[error("{message}")]
     Coded { code: ErrorCode, message: String },
 
+    #[error("{context}: {source}")]
+    Context {
+        context: String,
+        #[source]
+        source: Box<YtrustError>,
+    },
+
     #[error("format not available: {0}")]
     FormatNotFound(String),
 
@@ -118,17 +150,20 @@ impl YtrustError {
         }
     }
 
-    /// Wrap an error with context while preserving its stable code.
+    /// Wrap an error with context while preserving its stable code and source.
     pub fn context(self, context: impl fmt::Display) -> Self {
-        let code = self.code();
-        Self::Coded {
-            code,
-            message: format!("{context}: {self}"),
+        Self::Context {
+            context: context.to_string(),
+            source: Box::new(self),
         }
     }
 
     pub fn is_broken_pipe(&self) -> bool {
-        matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+        match self {
+            Self::Io(error) => error.kind() == std::io::ErrorKind::BrokenPipe,
+            Self::Context { source, .. } => source.is_broken_pipe(),
+            _ => false,
+        }
     }
 
     pub fn is_retryable(&self) -> bool {
@@ -136,12 +171,17 @@ impl YtrustError {
             Self::Http(error) => {
                 error.is_timeout()
                     || error.is_connect()
-                    || error
-                        .status()
-                        .is_some_and(|status| status == 429 || status.is_server_error())
+                    || error.is_body()
+                    || (error.is_request() && !error.is_builder())
+                    || error.status().is_some_and(|status| {
+                        status == 408 || status == 429 || status == 425 || status.is_server_error()
+                    })
             }
-            Self::HttpStatus { status, .. } => *status == 429 || *status >= 500,
+            Self::HttpStatus { status, .. } => {
+                *status == 408 || *status == 425 || *status == 429 || *status >= 500
+            }
             Self::Coded { code, .. } => matches!(code, ErrorCode::Timeout | ErrorCode::Network),
+            Self::Context { source, .. } => source.is_retryable(),
             Self::Io(error) => matches!(
                 error.kind(),
                 std::io::ErrorKind::Interrupted
@@ -166,6 +206,7 @@ impl YtrustError {
             Self::Sqlite(_) => ErrorCode::Cookies,
             Self::Url(_) => ErrorCode::InvalidInput,
             Self::Coded { code, .. } => *code,
+            Self::Context { source, .. } => source.code(),
             Self::FormatNotFound(_) => ErrorCode::FormatNotFound,
             Self::FfmpegMissing | Self::Ffmpeg { .. } => ErrorCode::Ffmpeg,
             Self::InvalidOutput(_) => ErrorCode::InvalidInput,
@@ -226,5 +267,34 @@ mod tests {
         let error = YtrustError::coded(ErrorCode::Cookies, "bad").context("load");
         assert_eq!(error.code(), ErrorCode::Cookies);
         assert!(error.to_string().contains("load: bad"));
+    }
+
+    #[test]
+    fn context_preserves_broken_pipe() {
+        let error = YtrustError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "closed",
+        ))
+        .context("playlist item 1");
+        assert!(error.is_broken_pipe());
+        assert_eq!(error.code(), ErrorCode::Io);
+    }
+
+    #[test]
+    fn retries_request_timeouts() {
+        assert!(
+            YtrustError::HttpStatus {
+                status: 408,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !YtrustError::HttpStatus {
+                status: 403,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
     }
 }

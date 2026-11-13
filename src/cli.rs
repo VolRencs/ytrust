@@ -6,6 +6,7 @@ use ytrust::constants::{
     DEFAULT_OUTPUT, DEFAULT_PLAYLIST_ITEMS, DEFAULT_PLAYLIST_LIMIT, DEFAULT_RETRIES,
     DEFAULT_SUB_FORMAT, DEFAULT_SUB_LANGS, DEFAULT_TIMEOUT_SECS,
 };
+use ytrust::error::{ErrorCode, Result, YtrustError};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -34,7 +35,7 @@ pub struct Cli {
     pub output_dir: Option<PathBuf>,
 
     /// List available formats and exit
-    #[arg(short = 'F', long)]
+    #[arg(short = 'F', long, conflicts_with_all = ["dump_json", "dump_single_json", "list_audio_tracks", "progress_json"])]
     pub list_formats: bool,
 
     /// Extract audio only
@@ -46,7 +47,12 @@ pub struct Cli {
     pub audio_format: Option<String>,
 
     /// Print one JSON object per video and do not download
-    #[arg(short = 'j', long = "dump-json", alias = "print-json")]
+    #[arg(
+        short = 'j',
+        long = "dump-json",
+        alias = "print-json",
+        conflicts_with = "dump_single_json"
+    )]
     pub dump_json: bool,
 
     /// Print one JSON object for the whole input and do not download
@@ -58,7 +64,7 @@ pub struct Cli {
     pub skip_download: bool,
 
     /// Resolve playlists without fetching every video (flat metadata)
-    #[arg(long)]
+    #[arg(long, requires = "dump_json")]
     pub flat_playlist: bool,
 
     /// Print machine-readable newline-delimited JSON progress events
@@ -250,4 +256,120 @@ pub struct Cli {
     /// Increase log verbosity (-v, -vv)
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+}
+
+impl Cli {
+    /// Validate mode combinations before cookies, network access or runtime
+    /// creation so invalid commands fail fast.
+    pub fn validate(&self) -> Result<()> {
+        if self.timeout == 0 {
+            return Err(invalid("--timeout must be at least 1 second"));
+        }
+        if self.playlist_limit == 0 {
+            return Err(invalid("--playlist-limit must be at least 1"));
+        }
+        ytrust::youtube::max_playlist_item(&self.playlist_items)?;
+        if self.audio_quality.is_some() && !self.extract_audio && self.audio_format.is_none() {
+            return Err(invalid(
+                "--audio-quality requires -x/--extract-audio or --audio-format",
+            ));
+        }
+        if let Some(quality) = &self.audio_quality {
+            validate_audio_quality(quality)?;
+        }
+        let subtitle_format = self
+            .convert_subs
+            .as_deref()
+            .unwrap_or(&self.sub_format)
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if subtitle_format != "vtt" && subtitle_format != "srt" {
+            return Err(invalid("--sub-format/--convert-subs supports vtt or srt"));
+        }
+        let media_mode = !self.dump_json
+            && !self.dump_single_json
+            && !self.list_formats
+            && !self.list_audio_tracks
+            && !self.simulate;
+        if self.output == "-" {
+            if self.urls.len() > 1 {
+                return Err(invalid(
+                    "stdout output supports exactly one input URL; use a file template instead",
+                ));
+            }
+            for url in &self.urls {
+                if media_mode
+                    && matches!(
+                        ytrust::youtube::classify(url, self.no_playlist)?,
+                        ytrust::youtube::Target::Playlist { .. }
+                            | ytrust::youtube::Target::Search { .. }
+                    )
+                {
+                    return Err(invalid(
+                        "stdout output requires a single video URL, not a playlist or search",
+                    ));
+                }
+            }
+            if self.progress_json {
+                return Err(invalid(
+                    "--progress-json cannot be combined with streaming media to stdout",
+                ));
+            }
+            if media_mode
+                && (self.extract_audio
+                    || self.audio_format.is_some()
+                    || self.write_thumbnail
+                    || self.write_all_thumbnails
+                    || self.write_subs
+                    || self.write_auto_subs
+                    || self.embed_subs
+                    || self.remux_video.is_some())
+            {
+                return Err(invalid(
+                    "stdout output does not support audio extraction, subtitles, thumbnails, embedding or remuxing",
+                ));
+            }
+        }
+        if self.embed_subs && (self.extract_audio || self.audio_format.is_some()) {
+            return Err(invalid("--embed-subs is not supported in audio-only mode"));
+        }
+        if self.remux_video.is_some() && (self.extract_audio || self.audio_format.is_some()) {
+            return Err(invalid("--remux-video is not supported in audio-only mode"));
+        }
+        Ok(())
+    }
+}
+
+fn invalid(message: impl Into<String>) -> YtrustError {
+    YtrustError::coded(ErrorCode::InvalidInput, message)
+}
+
+fn validate_audio_quality(quality: &str) -> Result<()> {
+    let quality = quality.trim();
+    if quality.is_empty() {
+        return Err(invalid("--audio-quality cannot be empty"));
+    }
+    if let Some(value) = quality
+        .strip_suffix('k')
+        .or_else(|| quality.strip_suffix('K'))
+        .or_else(|| quality.strip_suffix('m'))
+        .or_else(|| quality.strip_suffix('M'))
+        .filter(|value| !value.is_empty())
+    {
+        if value
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .is_none()
+        {
+            return Err(invalid(format!("invalid audio bitrate: {quality}")));
+        }
+        return Ok(());
+    }
+    match quality.parse::<u8>() {
+        Ok(value) if value <= 10 => Ok(()),
+        _ => Err(invalid(
+            "--audio-quality must be 0-10 (VBR) or a bitrate such as 192K",
+        )),
+    }
 }

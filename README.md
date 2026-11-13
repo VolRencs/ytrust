@@ -77,10 +77,12 @@ writes nothing.
 `--progress-json` writes newline-delimited JSON to stdout. Human status and
 progress bars stay on stderr. Events are versioned with `"v": 1` and include
 `start`, `progress`, `postprocess`, `file`, `done`, `error` and `playlist`.
-Every `done` event contains an absolute `filepath` for the final media file.
-Bytes, speed and ETA are aggregated across separate video/audio downloads; the
-`components` array exposes per-stream progress. `--progress-json` conflicts with
-`-j`, `-J`, `-F`, `--list-audio-tracks` and `-o -`.
+Every `done` event contains an absolute `filepath` for the final media file
+when a file was written; simulate/skip events may report `null`. Bytes, speed
+and ETA are aggregated across separate video/audio downloads; the
+`components` array exposes per-stream progress, and playlist events include
+`playlist_index`/`playlist_count`. `--progress-json` conflicts with `-j`, `-J`,
+`-F`, `--list-audio-tracks` and `-o -`.
 
 ### Audio tracks and formats
 
@@ -96,9 +98,10 @@ Every format in `-J` output includes `language`, and `audio_track` includes
 
 Multiple audio tracks require `--audio-multistreams` in video mode and are
 merged with language metadata. In audio-only mode (`-x`) each selected language
-is written to its own file instead. `--embed-subs` muxes downloaded subtitles
-into the final container, `--remux-video` selects the final container, and
-`--audio-quality` accepts `0`-`10` (VBR) or a bitrate such as `192K`.
+is written to its own file instead. `--embed-subs` downloads the selected
+subtitle tracks automatically, `--remux-video` selects the final container, and
+`--audio-quality` accepts `0`-`10` (VBR for mp3/vorbis, mapped to an equivalent
+bitrate for other codecs) or a bitrate such as `192K`.
 
 ## Node.js module
 
@@ -134,7 +137,8 @@ Returns the same shape as `yt-dlp -J`: `_type: "video"` for a single video or
 - `expires_at` — Unix timestamp parsed from the googlevideo `expire` parameter;
 - `is_hls` — true for HLS manifest entries;
 - `language` — audio track language when YouTube reports one;
-- `filesize_approx` — estimated size when the exact size is unknown.
+- `filesize_approx` — estimated size when the exact size is unknown;
+- `playable` — false when a signature/`n` challenge is still unresolved.
 
 ### `resolveAudio(input, options?)`
 
@@ -151,8 +155,8 @@ attached to a watch URL.
 | `cookiesPath` | — | Netscape `cookies.txt` file |
 | `cookiesFromBrowser` | — | Browser profile, e.g. `firefox`, `firefox:profile` or `firefox:/path` |
 | `proxy` | — | `http`, `https` or `socks5` proxy URL |
-| `timeout` | `30` | HTTP timeout in seconds |
-| `playlistLimit` | `500` | Maximum playlist entries to fetch |
+| `timeout` | `30` | HTTP timeout in seconds (minimum `1`) |
+| `playlistLimit` | `500` | Maximum playlist entries to fetch (minimum `1`) |
 | `playlistItems` | `"1-"` | Playlist ranges, e.g. `1-10,15` |
 | `noPlaylist` | `false` | Ignore a playlist attached to a watch URL |
 

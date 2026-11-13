@@ -49,6 +49,7 @@ struct Cookie {
     name: String,
     value: String,
     expiry: i64,
+    host_only: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,22 +59,33 @@ pub struct CookieJar {
 
 impl CookieJar {
     pub fn header_for(&self, host: &str) -> Option<String> {
+        self.header_for_path(host, "/")
+    }
+
+    pub fn header_for_url(&self, url: &str) -> Option<String> {
+        let url = url::Url::parse(url).ok()?;
+        self.header_for_path(url.host_str()?, url.path())
+    }
+
+    fn header_for_path(&self, host: &str, path: &str) -> Option<String> {
         let now = unix_time_i64();
         let mut matched: Vec<&Cookie> = self
             .cookies
             .iter()
             .filter(|cookie| {
                 (cookie.expiry == 0 || cookie.expiry >= now)
-                    && domain_matches(host, &cookie.domain)
+                    && domain_matches(host, &cookie.domain, cookie.host_only)
+                    && path_matches(path, &cookie.path)
                     && !is_discarded_cookie(&cookie.name)
             })
             .collect();
 
-        // Browsers send the most specific path first. Keep the first value for each name.
+        // Browsers send host-only and longer-path cookies first. Keep the first
+        // value for each cookie name.
         matched.sort_by(|a, b| {
-            b.path
-                .len()
-                .cmp(&a.path.len())
+            b.host_only
+                .cmp(&a.host_only)
+                .then_with(|| b.path.len().cmp(&a.path.len()))
                 .then_with(|| b.expiry.cmp(&a.expiry))
         });
 
@@ -100,10 +112,7 @@ impl CookieJar {
             let entry = format!("{}={}", cookie.name, cookie.value);
             let separator = if values.is_empty() { 0 } else { 2 };
             let needed = entry.len() + separator;
-            let essential = ESSENTIAL_COOKIE_NAMES
-                .iter()
-                .any(|name| cookie.name.eq_ignore_ascii_case(name));
-            if !essential && bytes + needed > MAX_COOKIE_HEADER_BYTES {
+            if bytes + needed > MAX_COOKIE_HEADER_BYTES {
                 continue;
             }
             bytes += needed;
@@ -117,25 +126,47 @@ impl CookieJar {
         self.cookies.append(&mut other.cookies);
     }
 
-    fn insert(&mut self, domain: &str, path: &str, name: &str, value: &str, expiry: i64) {
-        if name.is_empty() || is_discarded_cookie(name) {
+    fn insert(
+        &mut self,
+        domain: &str,
+        path: &str,
+        name: &str,
+        value: &str,
+        expiry: i64,
+        host_only: bool,
+    ) {
+        if name.is_empty()
+            || is_discarded_cookie(name)
+            || name.chars().any(|character| {
+                character.is_control() || matches!(character, ';' | ',' | '=' | '\r' | '\n')
+            })
+            || value
+                .chars()
+                .any(|character| character.is_control() || matches!(character, ';' | '\r' | '\n'))
+        {
             return;
         }
+        let path = if path.starts_with('/') { path } else { "/" };
         self.cookies.push(Cookie {
             domain: domain.trim_start_matches('.').to_ascii_lowercase(),
             path: path.to_string(),
             name: name.to_string(),
             value: value.to_string(),
             expiry,
+            host_only,
         });
     }
 
-    fn value(&self, name: &str) -> Option<String> {
+    fn value_for_host(&self, name: &str, host: &str) -> Option<String> {
         let now = unix_time_i64();
         self.cookies
             .iter()
-            .filter(|cookie| cookie.name == name && (cookie.expiry == 0 || cookie.expiry >= now))
-            .max_by_key(|cookie| (cookie.path.len(), cookie.expiry))
+            .filter(|cookie| {
+                cookie.name == name
+                    && (cookie.expiry == 0 || cookie.expiry >= now)
+                    && domain_matches(host, &cookie.domain, cookie.host_only)
+            })
+            .max_by_key(|cookie| (cookie.host_only, cookie.path.len(), cookie.expiry))
             .map(|cookie| cookie.value.clone())
     }
 }
@@ -143,6 +174,7 @@ impl CookieJar {
 #[derive(Debug, Clone, Default)]
 pub struct LoadedCookies {
     pub header: Option<String>,
+    pub cookie_jar: CookieJar,
     pub sapisid: Option<String>,
     pub sapisid1p: Option<String>,
     pub sapisid3p: Option<String>,
@@ -170,9 +202,10 @@ pub fn load(cookie_file: Option<&Path>, from_browser: Option<&str>) -> Result<Lo
 
     Ok(LoadedCookies {
         header: jar.header_for("www.youtube.com"),
-        sapisid: jar.value("SAPISID"),
-        sapisid1p: jar.value("__Secure-1PAPISID"),
-        sapisid3p: jar.value("__Secure-3PAPISID"),
+        sapisid: jar.value_for_host("SAPISID", "www.youtube.com"),
+        sapisid1p: jar.value_for_host("__Secure-1PAPISID", "www.youtube.com"),
+        sapisid3p: jar.value_for_host("__Secure-3PAPISID", "www.youtube.com"),
+        cookie_jar: jar,
     })
 }
 
@@ -194,8 +227,11 @@ fn load_netscape(path: &Path) -> Result<CookieJar> {
         if !relevant_domain(domain) {
             continue;
         }
-        let expiry = fields[4].parse::<i64>().unwrap_or(0);
-        jar.insert(domain, fields[2], fields[5], fields[6], expiry);
+        let Ok(expiry) = fields[4].parse::<i64>() else {
+            continue;
+        };
+        let host_only = !fields[1].eq_ignore_ascii_case("TRUE");
+        jar.insert(domain, fields[2], fields[5], fields[6], expiry, host_only);
     }
 
     Ok(jar)
@@ -311,7 +347,8 @@ fn load_firefox_db(path: &Path) -> Result<CookieJar> {
         if !relevant_domain(&host) {
             continue;
         }
-        jar.insert(&host, &path, &name, &value, expiry);
+        let host_only = !host.starts_with('.');
+        jar.insert(&host, &path, &name, &value, expiry, host_only);
     }
 
     Ok(jar)
@@ -396,6 +433,11 @@ fn firefox_candidates() -> Vec<PathBuf> {
 }
 
 fn collect_firefox_profiles(base: &Path, out: &mut Vec<PathBuf>) {
+    collect_profiles_in(base, out);
+    collect_profiles_in(&base.join("Profiles"), out);
+}
+
+fn collect_profiles_in(base: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(base) else {
         return;
     };
@@ -666,7 +708,8 @@ fn load_chromium_db(path: &Path) -> Result<CookieJar> {
         } else {
             0
         };
-        jar.insert(&host, &path, &name, &value, expiry);
+        let host_only = !host.starts_with('.');
+        jar.insert(&host, &path, &name, &value, expiry, host_only);
     }
 
     if jar.cookies.is_empty() && skipped_encrypted > 0 {
@@ -717,7 +760,7 @@ fn decrypt_chromium_cookie(encrypted: &[u8], host: &str) -> Option<String> {
         .ok()?;
 
     let host_hash = Sha256::digest(host.as_bytes());
-    let plain = if plain.len() > 32 && plain[..32] == host_hash[..] {
+    let plain = if plain.len() >= 32 && plain[..32] == host_hash[..] {
         &plain[32..]
     } else {
         plain
@@ -744,17 +787,35 @@ fn is_discarded_cookie(name: &str) -> bool {
 }
 
 fn relevant_domain(host: &str) -> bool {
-    let host = host.trim_start_matches('.');
+    let host = host.trim_start_matches('.').to_ascii_lowercase();
     host == "youtube.com"
         || host.ends_with(".youtube.com")
+        || host == "youtube-nocookie.com"
         || host.ends_with(".youtube-nocookie.com")
 }
 
-fn domain_matches(host: &str, domain: &str) -> bool {
-    host.eq_ignore_ascii_case(domain)
-        || host
+fn domain_matches(host: &str, domain: &str, host_only: bool) -> bool {
+    if host.eq_ignore_ascii_case(domain) {
+        return true;
+    }
+    !host_only
+        && host
             .to_ascii_lowercase()
             .ends_with(&format!(".{}", domain.to_ascii_lowercase()))
+}
+
+fn path_matches(request_path: &str, cookie_path: &str) -> bool {
+    if request_path == cookie_path {
+        return true;
+    }
+    if !request_path.starts_with(cookie_path) {
+        return false;
+    }
+    cookie_path.ends_with('/')
+        || request_path
+            .as_bytes()
+            .get(cookie_path.len())
+            .is_some_and(|byte| *byte == b'/')
 }
 
 #[cfg(test)]
@@ -843,16 +904,16 @@ mod tests {
     #[test]
     fn builds_youtube_header() {
         let mut jar = CookieJar::default();
-        jar.insert(".youtube.com", "/", "SID", "secret", 0);
-        jar.insert(".google.com", "/", "SID", "wrong", 0);
+        jar.insert(".youtube.com", "/", "SID", "secret", 0, false);
+        jar.insert(".google.com", "/", "SID", "wrong", 0, false);
         assert_eq!(jar.header_for("www.youtube.com"), Some("SID=secret".into()));
     }
 
     #[test]
     fn drops_large_st_cookies() {
         let mut jar = CookieJar::default();
-        jar.insert(".youtube.com", "/", "ST-1", &"x".repeat(400_000), 0);
-        jar.insert(".youtube.com", "/", "SID", "auth", 0);
+        jar.insert(".youtube.com", "/", "ST-1", &"x".repeat(400_000), 0, false);
+        jar.insert(".youtube.com", "/", "SID", "auth", 0, false);
         let header = jar.header_for("www.youtube.com").unwrap();
         assert_eq!(header, "SID=auth");
         assert!(header.len() < MAX_COOKIE_HEADER_BYTES);
@@ -861,7 +922,7 @@ mod tests {
     #[test]
     fn caps_cookie_header_size() {
         let mut jar = CookieJar::default();
-        jar.insert(".youtube.com", "/", "SID", "auth", 0);
+        jar.insert(".youtube.com", "/", "SID", "auth", 0, false);
         for index in 0..20 {
             jar.insert(
                 ".youtube.com",
@@ -869,6 +930,7 @@ mod tests {
                 &format!("BIG{index}"),
                 &"y".repeat(4_000),
                 0,
+                false,
             );
         }
         let header = jar.header_for("www.youtube.com").unwrap();
@@ -879,10 +941,45 @@ mod tests {
     #[test]
     fn prioritizes_essential_cookies() {
         let mut jar = CookieJar::default();
-        jar.insert(".youtube.com", "/", "OTHER", "first", 0);
-        jar.insert(".youtube.com", "/", "SID", "auth", 0);
-        jar.insert(".youtube.com", "/", "HSID", "auth2", 0);
+        jar.insert(".youtube.com", "/", "OTHER", "first", 0, false);
+        jar.insert(".youtube.com", "/", "SID", "auth", 0, false);
+        jar.insert(".youtube.com", "/", "HSID", "auth2", 0, false);
         let header = jar.header_for("www.youtube.com").unwrap();
         assert!(header.starts_with("SID=auth; HSID=auth2"));
+    }
+
+    #[test]
+    fn does_not_leak_host_only_cookies_to_subdomains() {
+        let mut jar = CookieJar::default();
+        jar.insert("www.youtube.com", "/", "SID", "www-only", 0, true);
+        jar.insert(".youtube.com", "/", "PREF", "shared", 0, false);
+        let header = jar.header_for("m.youtube.com").unwrap();
+        assert!(!header.contains("SID="));
+        assert!(header.contains("PREF=shared"));
+        let header = jar.header_for("www.youtube.com").unwrap();
+        assert!(header.contains("SID=www-only"));
+    }
+
+    #[test]
+    fn respects_cookie_paths() {
+        let mut jar = CookieJar::default();
+        jar.insert(".youtube.com", "/account", "AUTH", "yes", 0, false);
+        assert!(
+            jar.header_for_url("https://www.youtube.com/account")
+                .is_some_and(|header| header.contains("AUTH=yes"))
+        );
+        assert!(
+            jar.header_for_url("https://www.youtube.com/watch?v=x")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn caps_oversized_essential_cookies() {
+        let mut jar = CookieJar::default();
+        jar.insert(".youtube.com", "/", "SID", &"s".repeat(20_000), 0, false);
+        jar.insert(".youtube.com", "/", "PREF", "ok", 0, false);
+        let header = jar.header_for("www.youtube.com");
+        assert!(header.is_none() || header.unwrap().len() <= MAX_COOKIE_HEADER_BYTES);
     }
 }

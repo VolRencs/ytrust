@@ -1,11 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::OnceCell as AsyncOnceCell;
 use tracing::{debug, warn};
 use url::Url;
 
@@ -14,7 +15,7 @@ use crate::http::RequestConfig;
 use crate::youtube::{self, Format, VideoInfo};
 
 const SOLVER_TIMEOUT: Duration = Duration::from_secs(30);
-const SOLVER_CLI: &str = include_str!("../node/solver/cli.js");
+const SOLVER_SERVER: &str = include_str!("../node/solver/server.js");
 const SOLVER_INDEX: &str = include_str!("../node/solver/index.js");
 const SOLVER_LIB: &str = include_str!("../node/solver/lib.min.js");
 const SOLVER_CORE: &str = include_str!("../node/solver/core.min.js");
@@ -28,8 +29,17 @@ pub struct SolveReport {
 }
 
 pub struct ChallengeSolver {
-    runtime: Option<String>,
+    runtime: AsyncOnceCell<Option<String>>,
+    explicit: bool,
+    spec: Option<String>,
     cache: Mutex<SolverCache>,
+    server: tokio::sync::Mutex<Option<SolverServer>>,
+}
+
+struct SolverServer {
+    _child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
 }
 
 #[derive(Default)]
@@ -39,6 +49,8 @@ struct SolverCache {
     sig: HashMap<(String, String), String>,
     n: HashMap<(String, String), String>,
 }
+
+const SOLVER_CACHE_ENTRIES: usize = 4096;
 
 struct CipherParams {
     url: String,
@@ -85,13 +97,42 @@ impl ChallengeSolver {
         });
         if disabled {
             return Ok(Self {
-                runtime: None,
+                runtime: AsyncOnceCell::from(None),
+                explicit: false,
+                spec: None,
                 cache: Mutex::new(SolverCache::default()),
+                server: tokio::sync::Mutex::new(None),
             });
         }
 
         let explicit = spec.is_some();
-        let candidates: Vec<String> = spec
+        let solver = Self {
+            runtime: AsyncOnceCell::new(),
+            explicit,
+            spec: spec.map(str::to_string),
+            cache: Mutex::new(SolverCache::default()),
+            server: tokio::sync::Mutex::new(None),
+        };
+        if explicit {
+            // Probe early only when the user explicitly requested a runtime so
+            // a typo fails before any network work. The default Node probe is
+            // lazy and costs nothing for metadata-only runs.
+            let runtime = solver.probe().await;
+            if runtime.is_none() {
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    "no usable JavaScript runtime found; install Node.js 20+ or pass --js-runtimes node:<path>",
+                ));
+            }
+            let _ = solver.runtime.set(runtime);
+        }
+        Ok(solver)
+    }
+
+    async fn probe(&self) -> Option<String> {
+        let candidates: Vec<String> = self
+            .spec
+            .as_deref()
             .map(|spec| {
                 spec.split(',')
                     .map(str::trim)
@@ -101,33 +142,34 @@ impl ChallengeSolver {
             })
             .unwrap_or_else(|| vec!["node".to_string()]);
 
-        let mut runtime = None;
         for candidate in candidates {
             if let Some(found) = probe_runtime(&candidate).await {
-                runtime = Some(found);
-                break;
+                return Some(found);
             }
         }
-        if runtime.is_none() && explicit {
-            return Err(YtrustError::coded(
-                ErrorCode::InvalidInput,
-                "no usable JavaScript runtime found; install Node.js 20+ or pass --js-runtimes node:<path>",
-            ));
-        }
-        if let Some(runtime) = &runtime {
-            debug!("challenge solver runtime: {runtime}");
-        } else {
-            debug!("no JavaScript runtime found; ciphered formats will be skipped");
-        }
+        None
+    }
 
-        Ok(Self {
-            runtime,
-            cache: Mutex::new(SolverCache::default()),
-        })
+    async fn runtime(&self) -> Option<&str> {
+        let runtime = self
+            .runtime
+            .get_or_init(|| async {
+                let runtime = self.probe().await;
+                if let Some(runtime) = &runtime {
+                    debug!("challenge solver runtime: {runtime}");
+                } else if self.explicit {
+                    warn!("no usable JavaScript runtime found");
+                } else {
+                    debug!("no JavaScript runtime found; ciphered formats will be skipped");
+                }
+                runtime
+            })
+            .await;
+        runtime.as_deref()
     }
 
     pub fn available(&self) -> bool {
-        self.runtime.is_some()
+        self.runtime.get().is_some_and(Option::is_some)
     }
 
     pub async fn solve_formats(
@@ -139,7 +181,7 @@ impl ChallengeSolver {
         if !needs_challenges(info) {
             return Ok(report);
         }
-        let Some(runtime) = self.runtime.as_deref() else {
+        let Some(runtime) = self.runtime().await else {
             report.runtime_missing = true;
             warn!("ciphered formats require a JavaScript runtime (Node.js 20+)");
             return Ok(report);
@@ -162,40 +204,56 @@ impl ChallengeSolver {
 
         let (requests, sig_challenges, n_challenges) =
             collect_requests(info, &player_url, &self.cache);
+        debug!(
+            "challenge solve: player={}, sig={}, n={}",
+            player_url,
+            sig_challenges.len(),
+            n_challenges.len()
+        );
         let mut sig_values = cached_values(&self.cache, &player_url, true);
         let mut n_values = cached_values(&self.cache, &player_url, false);
 
         if !requests.is_empty() {
-            let source = {
-                let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
-                cache.sources.get(&player_url).cloned()
-            };
-            let source = match source {
-                Some(source) => source,
-                None => match youtube::fetch_player_source(&player_url, config).await {
-                    Ok(source) => {
-                        let mut cache =
-                            self.cache.lock().unwrap_or_else(|error| error.into_inner());
-                        if cache.sources.len() >= 4 && !cache.sources.contains_key(&player_url) {
-                            cache.sources.clear();
-                        }
-                        cache.sources.insert(player_url.clone(), source.clone());
-                        source
-                    }
-                    Err(error) => {
-                        report.error = Some(format!("could not fetch player JS: {error}"));
-                        warn!("{}", report.error.as_deref().unwrap_or_default());
-                        report.unresolved = apply_values(info, &sig_values, &n_values);
-                        return Ok(report);
-                    }
-                },
-            };
             let preprocessed = {
                 let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
                 cache.preprocessed.get(&player_url).cloned()
             };
+            // The preprocessed player is all the solver needs. Fetching the
+            // multi-megabyte raw source as well is pure overhead.
+            let source = if preprocessed.is_some() {
+                String::new()
+            } else {
+                let source = {
+                    let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+                    cache.sources.get(&player_url).cloned()
+                };
+                match source {
+                    Some(source) => source,
+                    None => match youtube::fetch_player_source(&player_url, config).await {
+                        Ok(source) => {
+                            let mut cache =
+                                self.cache.lock().unwrap_or_else(|error| error.into_inner());
+                            if cache.sources.len() >= 4 && !cache.sources.contains_key(&player_url)
+                            {
+                                cache.sources.clear();
+                            }
+                            cache.sources.insert(player_url.clone(), source.clone());
+                            source
+                        }
+                        Err(error) => {
+                            report.error = Some(format!("could not fetch player JS: {error}"));
+                            warn!("{}", report.error.as_deref().unwrap_or_default());
+                            report.unresolved = apply_values(info, &sig_values, &n_values);
+                            return Ok(report);
+                        }
+                    },
+                }
+            };
             report.attempted = true;
-            match run_solver(runtime, &source, preprocessed.as_deref(), &requests).await {
+            match self
+                .run_solver(runtime, &source, preprocessed.as_deref(), &requests)
+                .await
+            {
                 Ok(output) => {
                     if output.kind == "error" {
                         report.error = Some(
@@ -235,13 +293,20 @@ impl ChallengeSolver {
                                             .cache
                                             .lock()
                                             .unwrap_or_else(|error| error.into_inner());
+                                        if cache.sig.len() >= SOLVER_CACHE_ENTRIES {
+                                            cache.sig.clear();
+                                        }
                                         cache.sig.insert((player_url.clone(), challenge), value);
                                     } else if is_n {
+                                        debug!("n challenge {challenge} solved as {value}");
                                         n_values.insert(challenge.clone(), value.clone());
                                         let mut cache = self
                                             .cache
                                             .lock()
                                             .unwrap_or_else(|error| error.into_inner());
+                                        if cache.n.len() >= SOLVER_CACHE_ENTRIES {
+                                            cache.n.clear();
+                                        }
                                         cache.n.insert((player_url.clone(), challenge), value);
                                     }
                                 }
@@ -432,17 +497,42 @@ fn challenge_value(raw: &str, key: &str) -> Option<String> {
 }
 
 fn set_query_param(raw: &str, key: &str, value: &str) -> Option<String> {
-    let mut url = Url::parse(raw).ok()?;
-    let pairs: Vec<(String, String)> = url
-        .query_pairs()
-        .filter(|(candidate, _)| candidate != key)
-        .map(|(candidate, value)| (candidate.into_owned(), value.into_owned()))
-        .collect();
-    url.query_pairs_mut()
-        .clear()
-        .extend_pairs(pairs)
-        .append_pair(key, value);
-    Some(url.to_string())
+    let (base, query) = raw.split_once('?').unwrap_or((raw, ""));
+    let encoded = encode_query_value(value);
+    let mut result = String::with_capacity(raw.len() + encoded.len() + key.len() + 2);
+    result.push_str(base);
+    result.push('?');
+    let mut first = true;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        if pair.split_once('=').map(|(candidate, _)| candidate) == Some(key) {
+            continue;
+        }
+        if !first {
+            result.push('&');
+        }
+        result.push_str(pair);
+        first = false;
+    }
+    if !first {
+        result.push('&');
+    }
+    result.push_str(key);
+    result.push('=');
+    result.push_str(&encoded);
+    Some(result)
+}
+
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 async fn probe_runtime(raw: &str) -> Option<String> {
@@ -458,6 +548,7 @@ async fn probe_runtime(raw: &str) -> Option<String> {
         tokio::process::Command::new(command)
             .arg("--version")
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -476,71 +567,116 @@ async fn probe_runtime(raw: &str) -> Option<String> {
     (major >= 20).then(|| command.to_string())
 }
 
-async fn run_solver(
-    runtime: &str,
-    player: &str,
-    preprocessed: Option<&str>,
-    requests: &[SolverRequest],
-) -> std::result::Result<SolverOutput, String> {
-    let dir = solver_dir()?;
-    let input = serde_json::to_vec(&SolverInput {
-        player,
-        preprocessed,
-        requests,
-    })
-    .map_err(|error| format!("could not encode solver input: {error}"))?;
+impl ChallengeSolver {
+    async fn run_solver(
+        &self,
+        runtime: &str,
+        player: &str,
+        preprocessed: Option<&str>,
+        requests: &[SolverRequest],
+    ) -> std::result::Result<SolverOutput, String> {
+        let dir = solver_dir()?;
+        debug!(
+            "solver input: player={} bytes, preprocessed={}, requests={}",
+            player.len(),
+            preprocessed.is_some(),
+            requests.len()
+        );
+        let mut input = serde_json::to_vec(&SolverInput {
+            player,
+            preprocessed,
+            requests,
+        })
+        .map_err(|error| format!("could not encode solver input: {error}"))?;
+        input.push(b'\n');
 
-    let mut child = tokio::process::Command::new(runtime)
-        .arg(dir.join("cli.js"))
-        .current_dir(&dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("could not start JavaScript runtime: {error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "solver stdin unavailable".to_string())?;
-
-    let output = tokio::time::timeout(SOLVER_TIMEOUT, async {
-        stdin
-            .write_all(&input)
-            .await
-            .map_err(|error| format!("could not write solver input: {error}"))?;
-        drop(stdin);
-        child
-            .wait_with_output()
-            .await
-            .map_err(|error| format!("solver process failed: {error}"))
-    })
-    .await
-    .map_err(|_| {
-        format!(
-            "challenge solver timed out after {}s",
-            SOLVER_TIMEOUT.as_secs()
-        )
-    })??;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail: String = stderr
-            .chars()
-            .rev()
-            .take(4000)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        return Err(format!(
-            "solver exited with {}: {}",
-            output.status,
-            detail.trim()
-        ));
+        let mut server = self.server.lock().await;
+        let mut last_error = String::from("challenge solver failed");
+        for attempt in 0..2 {
+            if server.is_none() {
+                match SolverServer::spawn(runtime, &dir).await {
+                    Ok(spawned) => *server = Some(spawned),
+                    Err(error) => {
+                        last_error = error;
+                        continue;
+                    }
+                }
+            }
+            let Some(process) = server.as_mut() else {
+                continue;
+            };
+            let result = tokio::time::timeout(SOLVER_TIMEOUT, async {
+                process
+                    .stdin
+                    .write_all(&input)
+                    .await
+                    .map_err(|error| format!("could not write solver input: {error}"))?;
+                process
+                    .stdin
+                    .flush()
+                    .await
+                    .map_err(|error| format!("could not flush solver input: {error}"))?;
+                let mut line = String::new();
+                let read = process
+                    .stdout
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|error| format!("could not read solver output: {error}"))?;
+                if read == 0 {
+                    return Err("solver process exited unexpectedly".to_string());
+                }
+                serde_json::from_str::<SolverOutput>(&line)
+                    .map_err(|error| format!("could not decode solver output: {error}"))
+            })
+            .await;
+            match result {
+                Ok(Ok(output)) => return Ok(output),
+                Ok(Err(error)) => {
+                    last_error = error;
+                    *server = None;
+                    if attempt == 0 {
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    *server = None;
+                    return Err(format!(
+                        "challenge solver timed out after {}s",
+                        SOLVER_TIMEOUT.as_secs()
+                    ));
+                }
+            }
+        }
+        Err(last_error)
     }
-    serde_json::from_slice::<SolverOutput>(&output.stdout)
-        .map_err(|error| format!("could not decode solver output: {error}"))
+}
+
+impl SolverServer {
+    async fn spawn(runtime: &str, dir: &Path) -> std::result::Result<Self, String> {
+        let mut child = tokio::process::Command::new(runtime)
+            .arg(dir.join("server.js"))
+            .current_dir(dir)
+            .env_remove("NODE_OPTIONS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("could not start JavaScript runtime: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "solver stdin unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "solver stdout unavailable".to_string())?;
+        Ok(Self {
+            _child: child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
 }
 
 fn solver_dir() -> std::result::Result<PathBuf, String> {
@@ -549,7 +685,7 @@ fn solver_dir() -> std::result::Result<PathBuf, String> {
         let dir = tempfile::tempdir().map_err(|error| format!("temp dir failed: {error}"))?;
         for (name, contents) in [
             ("package.json", "{\"type\":\"module\"}"),
-            ("cli.js", SOLVER_CLI),
+            ("server.js", SOLVER_SERVER),
             ("index.js", SOLVER_INDEX),
             ("lib.min.js", SOLVER_LIB),
             ("core.min.js", SOLVER_CORE),
@@ -578,7 +714,6 @@ mod tests {
             signature_cipher: None,
             cipher: None,
             container: "webm".to_string(),
-            mime_type: "audio/webm".to_string(),
             video_codec: None,
             audio_codec: Some("opus".to_string()),
             has_video: false,
@@ -596,7 +731,7 @@ mod tests {
             audio_track_id: None,
             audio_is_default: true,
             language: Some("en".to_string()),
-            user_agent: "test".to_string(),
+            user_agent: "test",
         }
     }
 
@@ -625,6 +760,27 @@ mod tests {
             "new value"
         );
         assert!(url.query_pairs().any(|(key, _)| key == "expire"));
+    }
+
+    #[test]
+    fn preserves_raw_query_bytes_when_replacing() {
+        let url = set_query_param(
+            "https://rr1.googlevideo.com/videoplayback?expire=42&x=a%2Fb&n=old&y=1",
+            "n",
+            "abc",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://rr1.googlevideo.com/videoplayback?expire=42&x=a%2Fb&y=1&n=abc"
+        );
+        let url = set_query_param(
+            "https://rr1.googlevideo.com/videoplayback?expire=42",
+            "sig",
+            "a b",
+        )
+        .unwrap();
+        assert!(url.ends_with("&sig=a%20b"));
     }
 
     #[test]

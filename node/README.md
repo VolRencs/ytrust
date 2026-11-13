@@ -25,13 +25,14 @@ const { resolveAudio } = require("ytrust");
 - `YtrustError` — error class with a stable `code`.
 - `errorCode(message)` — classify a raw error message.
 
-Every format includes `http_headers`, `expires_at`, `is_hls`, `language` and
-`filesize_approx` (when it can be estimated). Ciphered
-formats are solved with yt-dlp's EJS bundle in a bounded worker pool, and
-player JS is fetched through the same proxy/timeout/cookies configuration as
-the API requests. This keeps challenge solving off the Node event loop. Player
-JS URLs are cached for 30 minutes, and the preprocessed EJS player is reused
-across videos, so subsequent resolves skip most of the solver warm-up cost.
+Every format includes `http_headers`, `expires_at`, `is_hls`, `language`,
+`filesize_approx` (when it can be estimated) and `playable` (false while a
+signature/`n` challenge is unresolved). Ciphered formats are solved with
+yt-dlp's EJS bundle in a bounded worker pool, and player JS is fetched through
+the same proxy/timeout/cookies configuration as the API requests. This keeps
+challenge solving off the Node event loop. Player JS URLs are cached for 30
+minutes, and the preprocessed EJS player is reused across videos, so subsequent
+resolves skip most of the solver warm-up cost.
 
 ## Browser cookies
 
