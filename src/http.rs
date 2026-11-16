@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::fmt::Write as _;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -11,6 +12,7 @@ use url::Url;
 
 use crate::constants::{DEFAULT_TIMEOUT_SECS, WEB_UA};
 use crate::error::{ErrorCode, Result, YtrustError};
+use crate::sync::MutexExt;
 use crate::util::unix_time;
 
 pub(crate) const MAX_HTML_BYTES: usize = 16 * 1024 * 1024;
@@ -29,9 +31,16 @@ pub struct RequestConfig {
     pub sapisid1p: Option<String>,
     pub sapisid3p: Option<String>,
     pub timeout: u64,
+    /// Prefer the JSLess VisionOS client when no challenge solver is available.
+    pub prefer_jsless: bool,
 }
 
 impl RequestConfig {
+    /// True when the cookie set contains YouTube account credentials.
+    pub fn is_authenticated(&self) -> bool {
+        self.sapisid.is_some() || self.sapisid1p.is_some() || self.sapisid3p.is_some()
+    }
+
     pub fn cookies_for(&self, url: &str) -> Option<String> {
         if let Some(jar) = &self.cookie_jar {
             return jar.header_for_url(url);
@@ -54,13 +63,14 @@ impl Default for RequestConfig {
             sapisid1p: None,
             sapisid3p: None,
             timeout: DEFAULT_TIMEOUT_SECS,
+            prefer_jsless: false,
         }
     }
 }
 
 type ClientCache = Mutex<HashMap<(Option<String>, u64), (Instant, Client)>>;
 
-static CLIENTS: OnceLock<ClientCache> = OnceLock::new();
+static CLIENTS: LazyLock<ClientCache> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Reuse the same client for resolve and download paths instead of building a
 // second connection pool.
@@ -79,9 +89,9 @@ pub fn client_for_config(proxy: Option<&str>, timeout: u64) -> Result<Client> {
 /// per call. The cache is bounded because Node callers control `timeout`.
 pub fn client(config: &RequestConfig) -> Result<Client> {
     let key = (config.proxy.clone(), config.timeout.max(5));
-    let cache = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = &*CLIENTS;
     {
-        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        let mut cache = cache.lock_unpoisoned();
         if let Some((inserted, client)) = cache.get_mut(&key) {
             *inserted = Instant::now();
             return Ok(client.clone());
@@ -102,7 +112,7 @@ pub fn client(config: &RequestConfig) -> Result<Client> {
         })?);
     }
     let client = builder.build()?;
-    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let mut cache = cache.lock_unpoisoned();
     if cache.len() >= CLIENT_CACHE_CAPACITY
         && let Some(oldest) = cache
             .iter()
@@ -124,9 +134,10 @@ pub struct InnertubeRequest<'a> {
     pub visitor_data: Option<&'a str>,
     pub user_session_id: Option<&'a str>,
     pub browser: bool,
+    /// VisionOS ignores cookies, so only cookie-capable clients should send them.
+    pub send_cookies: bool,
 }
 
-#[allow(clippy::too_many_lines)]
 pub async fn post_innertube<T: DeserializeOwned>(
     client: &Client,
     request: InnertubeRequest<'_>,
@@ -164,13 +175,17 @@ pub async fn post_innertube<T: DeserializeOwned>(
                 .header("Sec-Fetch-Mode", "navigate");
         }
         let mut builder = builder.json(request.body);
-        if let Some(cookies) = config.cookies_for("https://www.youtube.com/youtubei/v1/") {
+        if request.send_cookies
+            && let Some(cookies) = config.cookies_for("https://www.youtube.com/youtubei/v1/")
+        {
             builder = builder.header(reqwest::header::COOKIE, cookies);
         }
         if let Some(visitor_data) = request.visitor_data {
             builder = builder.header("X-Goog-Visitor-Id", visitor_data);
         }
-        if let Some(auth) = authorization_header(config, request.user_session_id) {
+        if request.send_cookies
+            && let Some(auth) = authorization_header(config, request.user_session_id)
+        {
             builder = builder
                 .header(reqwest::header::AUTHORIZATION, auth)
                 .header("X-Origin", "https://www.youtube.com")
@@ -194,6 +209,16 @@ pub async fn post_innertube<T: DeserializeOwned>(
                             ErrorCode::BotCheck,
                             "YouTube returned an HTML page instead of JSON; cookies may be required",
                         ));
+                    }
+                    if request.endpoint == "player" {
+                        let _ = std::fs::write(
+                            format!(
+                                "/tmp/opencode/player-{}-{}.json",
+                                request.client_name,
+                                std::process::id()
+                            ),
+                            &text,
+                        );
                     }
                     return serde_json::from_str(&text).map_err(YtrustError::from);
                 }
@@ -357,7 +382,7 @@ async fn read_body(response: reqwest::Response, limit: usize, strict: bool) -> R
             YtrustError::coded(ErrorCode::InvalidResponse, "response was not valid UTF-8")
         })
     } else {
-        Ok(String::from_utf8_lossy(&body).into_owned())
+        Ok(String::from_utf8_lossy_owned(body))
     }
 }
 
@@ -480,11 +505,11 @@ pub fn authorization_header(
     let hash = |sid: &str| {
         let mut hasher = Sha1::new();
         hasher.update(format!("{extra}{timestamp} {sid} {origin}"));
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+        let mut hash = String::with_capacity(40);
+        for byte in hasher.finalize() {
+            let _ = write!(hash, "{byte:02x}");
+        }
+        hash
     };
     let mut parts = Vec::new();
     if let Some(sid) = &config.sapisid {

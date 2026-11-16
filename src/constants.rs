@@ -16,14 +16,14 @@ pub const DEFAULT_RETRIES: u32 = 5;
 pub const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 pub const WEB_EMBEDDED_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 pub const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
-pub const TV_UA: &str = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)";
+pub const TV_SAMSUNG_UA: &str = "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1";
 
 pub const WEB_CLIENT_VERSION: &str = "2.20260708.00.00";
 pub const WEB_EMBEDDED_CLIENT_VERSION: &str = "2.20261110.01.00";
 pub const VISIONOS_CLIENT_VERSION: &str = "1.02";
-pub const TV_CLIENT_VERSION: &str = "7.20260707.07.00";
+pub const TV_SAMSUNG_CLIENT_VERSION: &str = "5.20260707";
 
 pub const VISIONOS_CLIENT_ID: &str = "101";
-pub const TV_CLIENT_ID: &str = "7";
+pub const TV_SAMSUNG_CLIENT_ID: &str = "7";
 pub const WEB_CLIENT_ID: &str = "1";
 pub const WEB_EMBEDDED_CLIENT_ID: &str = "56";

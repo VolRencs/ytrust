@@ -231,19 +231,19 @@ struct Component {
 impl Component {
     fn parse(raw: &str) -> Result<Self> {
         let (base, filter) = parse_filter(raw)?;
-        let base = base.trim().to_ascii_lowercase();
-        let (kind, argument) = match base.as_str() {
-            "b" | "best" => (Kind::Best, base.clone()),
-            "b*" | "best*" => (Kind::BestAny, base.clone()),
-            "bv" | "bestvideo" => (Kind::BestVideo, base.clone()),
-            "bv*" | "bestvideo*" => (Kind::BestVideoAny, base.clone()),
-            "ba" | "bestaudio" | "audio" => (Kind::BestAudio, base.clone()),
-            "ba*" | "bestaudio*" => (Kind::BestAudioAny, base.clone()),
-            "w" | "worst" => (Kind::Worst, base.clone()),
-            "wv" | "worstvideo" => (Kind::WorstVideo, base.clone()),
-            "wa" | "worstaudio" => (Kind::WorstAudio, base.clone()),
-            _ if base.chars().all(|c| c.is_ascii_digit()) => (Kind::Exact, base.clone()),
-            _ if is_known_ext(&base) => (Kind::BestExt, base.clone()),
+        let argument = base.trim().to_ascii_lowercase();
+        let kind = match argument.as_str() {
+            "b" | "best" => Kind::Best,
+            "b*" | "best*" => Kind::BestAny,
+            "bv" | "bestvideo" => Kind::BestVideo,
+            "bv*" | "bestvideo*" => Kind::BestVideoAny,
+            "ba" | "bestaudio" | "audio" => Kind::BestAudio,
+            "ba*" | "bestaudio*" => Kind::BestAudioAny,
+            "w" | "worst" => Kind::Worst,
+            "wv" | "worstvideo" => Kind::WorstVideo,
+            "wa" | "worstaudio" => Kind::WorstAudio,
+            _ if argument.chars().all(|c| c.is_ascii_digit()) => Kind::Exact,
+            _ if is_known_ext(&argument) => Kind::BestExt,
             _ => {
                 return Err(YtrustError::coded(
                     ErrorCode::InvalidInput,
@@ -251,9 +251,11 @@ impl Component {
                 ));
             }
         };
-        let itag = (kind == Kind::Exact)
-            .then(|| base.parse::<u64>().ok())
-            .flatten();
+        let itag = if kind == Kind::Exact {
+            argument.parse().ok()
+        } else {
+            None
+        };
 
         Ok(Self {
             kind,

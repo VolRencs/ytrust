@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -7,15 +7,16 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::constants::{
-    TV_CLIENT_ID, TV_CLIENT_VERSION, TV_UA, VISIONOS_CLIENT_ID, VISIONOS_CLIENT_VERSION,
-    VISIONOS_UA, WEB_CLIENT_ID, WEB_CLIENT_VERSION, WEB_EMBEDDED_CLIENT_ID,
-    WEB_EMBEDDED_CLIENT_VERSION, WEB_EMBEDDED_UA, WEB_UA,
+    TV_SAMSUNG_CLIENT_ID, TV_SAMSUNG_CLIENT_VERSION, TV_SAMSUNG_UA, VISIONOS_CLIENT_ID,
+    VISIONOS_CLIENT_VERSION, VISIONOS_UA, WEB_CLIENT_ID, WEB_CLIENT_VERSION,
+    WEB_EMBEDDED_CLIENT_ID, WEB_EMBEDDED_CLIENT_VERSION, WEB_EMBEDDED_UA, WEB_UA,
 };
 use crate::error::{ErrorCode, Result, YtrustError, best_error};
 use crate::http::{
     InnertubeRequest, MAX_PLAYER_JS_BYTES, client as build_client, fetch_text, fetch_text_limited,
     post_innertube,
 };
+use crate::sync::MutexExt;
 
 pub use crate::http::RequestConfig;
 
@@ -289,30 +290,48 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
     let mut errors = Vec::new();
     let mut fallback = None;
 
-    for client_kind in [ClientKind::VisionOs, ClientKind::Tv] {
+    for &client_kind in client_order(config) {
+        tracing::debug!("trying YouTube player client {client_kind:?}");
         match fetch_player_response(&client, video_id, client_kind, config).await {
-            Ok(response) => match parse_video_info(video_id, response, client_kind, None) {
-                Ok(mut info) if !info.formats.is_empty() => {
-                    if !needs_player_js(&info) {
-                        return Ok(info);
-                    }
-                    match player_js_url(video_id, config).await {
-                        Ok(url) => {
-                            info.player_js_url = Some(url);
+            Ok(fetched) => {
+                let PlayerFetch {
+                    response,
+                    watch_metadata,
+                } = fetched;
+                match parse_video_info(video_id, response, client_kind, None) {
+                    Ok(mut info) if !info.formats.is_empty() => {
+                        if let Some(watch) = watch_metadata {
+                            merge_watch_metadata(&mut info, watch);
+                        }
+                        if info.title.is_empty()
+                            && let Some(html) = fetch_watch_html(video_id, config).await
+                            && let Ok(value) =
+                                extract_json_assignment(&html, "ytInitialPlayerResponse")
+                            && let Ok(watch) = serde_json::from_value::<PlayerResponse>(value)
+                        {
+                            merge_watch_metadata(&mut info, watch);
+                        }
+                        if !needs_player_js(&info) {
                             return Ok(info);
                         }
-                        Err(error) => errors.push(error),
+                        match player_js_url(video_id, config).await {
+                            Ok(url) => {
+                                info.player_js_url = Some(url);
+                                return Ok(info);
+                            }
+                            Err(error) => errors.push(error),
+                        }
+                        fallback = Some(info);
                     }
-                    fallback = Some(info);
+                    Ok(_) => {
+                        errors.push(YtrustError::coded(
+                            ErrorCode::Unavailable,
+                            "YouTube returned no formats",
+                        ));
+                    }
+                    Err(error) => errors.push(error),
                 }
-                Ok(_) => {
-                    errors.push(YtrustError::coded(
-                        ErrorCode::Unavailable,
-                        "YouTube returned no formats",
-                    ));
-                }
-                Err(error) => errors.push(error),
-            },
+            }
             Err(error) => errors.push(error),
         }
     }
@@ -342,6 +361,76 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
     }))
 }
 
+async fn fetch_watch_html(video_id: &str, config: &RequestConfig) -> Option<String> {
+    let client = build_client(config).ok()?;
+    let watch_url = format!("https://www.youtube.com/watch?v={video_id}&hl=en&gl=US");
+    fetch_text(&client, &watch_url, config, WEB_UA, None)
+        .await
+        .ok()
+}
+
+fn merge_watch_metadata(info: &mut VideoInfo, response: PlayerResponse) {
+    let Some(details) = response.video_details else {
+        return;
+    };
+    if info.title.is_empty() {
+        info.title = details.title;
+    }
+    if info.uploader.is_empty() {
+        info.uploader = details.author.unwrap_or_default();
+    }
+    if info.channel.is_empty() {
+        info.channel = details.owner_channel_name.unwrap_or_default();
+    }
+    if info.channel_id.is_empty() {
+        info.channel_id = details.channel_id.unwrap_or_default();
+    }
+    if info.description.is_empty() {
+        info.description = details.short_description.unwrap_or_default();
+    }
+    if info.duration_secs.is_none() {
+        info.duration_secs = details.length_seconds.filter(|value| *value > 0);
+    }
+    if info.view_count.is_none() {
+        info.view_count = details.view_count;
+    }
+    if info.thumbnails.is_empty()
+        && let Some(list) = details.thumbnail
+    {
+        info.thumbnails = list
+            .thumbnails
+            .into_iter()
+            .filter_map(|item| {
+                Some(Thumbnail {
+                    url: item.url?,
+                    width: item.width,
+                    height: item.height,
+                })
+            })
+            .collect();
+    }
+    if let Some(renderer) = response
+        .microformat
+        .and_then(|microformat| microformat.player_microformat_renderer)
+    {
+        if info.upload_date.is_empty() {
+            info.upload_date = renderer
+                .get("uploadDate")
+                .or_else(|| renderer.get("publishDate"))
+                .and_then(Value::as_str)
+                .map(normalize_upload_date)
+                .unwrap_or_default();
+        }
+        if info.channel.is_empty() {
+            info.channel = renderer
+                .get("ownerChannelName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
+    }
+}
+
 fn needs_player_js(info: &VideoInfo) -> bool {
     info.formats.iter().any(|format| {
         format.signature_cipher.is_some()
@@ -356,20 +445,21 @@ fn url_has_n(url: &str) -> bool {
         .is_some_and(|url| url.query_pairs().any(|(key, _)| key == "n"))
 }
 
-const PLAYER_JS_URL_TTL: Duration = Duration::from_secs(30 * 60);
+const PLAYER_JS_URL_TTL: Duration = Duration::from_mins(30);
 
-static PLAYER_JS_URL_CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+static PLAYER_JS_URL_CACHE: LazyLock<Mutex<Option<(Instant, String)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 fn cached_player_js_url() -> Option<String> {
-    let cache = PLAYER_JS_URL_CACHE.get_or_init(|| Mutex::new(None));
-    let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let cache = &*PLAYER_JS_URL_CACHE;
+    let guard = cache.lock_unpoisoned();
     let (cached_at, url) = guard.as_ref()?;
     (cached_at.elapsed() < PLAYER_JS_URL_TTL).then(|| url.clone())
 }
 
 fn remember_player_js_url(url: &str) {
-    let cache = PLAYER_JS_URL_CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let cache = &*PLAYER_JS_URL_CACHE;
+    let mut guard = cache.lock_unpoisoned();
     *guard = Some((Instant::now(), url.to_string()));
 }
 
@@ -471,9 +561,10 @@ fn player_js_url_from_cfg(ytcfg: &Value) -> Option<String> {
 }
 
 const SIGNATURE_CACHE_CAPACITY: usize = 8;
-const SIGNATURE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const SIGNATURE_CACHE_TTL: Duration = Duration::from_hours(6);
 
-static SIGNATURE_TIMESTAMPS: OnceLock<Mutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
+static SIGNATURE_TIMESTAMPS: LazyLock<Mutex<HashMap<String, (Instant, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Result<VideoInfo> {
     let client = build_client(config)?;
@@ -564,6 +655,7 @@ async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Res
             visitor_data,
             user_session_id: ytcfg.get("USER_SESSION_ID").and_then(Value::as_str),
             browser: true,
+            send_cookies: true,
         },
         config,
     )
@@ -600,8 +692,8 @@ async fn signature_timestamp(
     config: &RequestConfig,
 ) -> Result<u64> {
     {
-        let cache = SIGNATURE_TIMESTAMPS.get_or_init(|| Mutex::new(HashMap::new()));
-        let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        let cache = &*SIGNATURE_TIMESTAMPS;
+        let cache = cache.lock_unpoisoned();
         if let Some((cached_at, value)) = cache.get(player_js_url)
             && cached_at.elapsed() < SIGNATURE_CACHE_TTL
         {
@@ -623,8 +715,8 @@ async fn signature_timestamp(
             "player JS has no valid signatureTimestamp",
         )
     })?;
-    let cache = SIGNATURE_TIMESTAMPS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let cache = &*SIGNATURE_TIMESTAMPS;
+    let mut cache = cache.lock_unpoisoned();
     if cache.len() >= SIGNATURE_CACHE_CAPACITY
         && let Some(oldest) = cache
             .iter()
@@ -730,6 +822,7 @@ pub async fn fetch_playlist(
                 visitor_data: None,
                 user_session_id: None,
                 browser: false,
+                send_cookies: true,
             },
             config,
         )
@@ -844,6 +937,7 @@ pub async fn fetch_inline_playlist(
                 visitor_data: None,
                 user_session_id: None,
                 browser: false,
+                send_cookies: true,
             },
             config,
         )
@@ -1056,6 +1150,7 @@ pub async fn fetch_search(query: &str, limit: u64, config: &RequestConfig) -> Re
                 visitor_data: None,
                 user_session_id: None,
                 browser: false,
+                send_cookies: true,
             },
             config,
         )
@@ -1217,11 +1312,29 @@ fn playlist_item_mask(expression: &str, total: usize) -> Result<Vec<bool>> {
     Ok(selected)
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Client order follows yt-dlp's current defaults: the cookie-capable,
+/// PO-token-free TV client first, with the JSLess VisionOS client as a
+/// fallback. VisionOS is skipped for authenticated sessions because YouTube
+/// does not support cookies for it.
+fn client_order(config: &RequestConfig) -> &'static [ClientKind] {
+    const AUTHENTICATED: &[ClientKind] = &[ClientKind::TvSamsung];
+    const ANONYMOUS: &[ClientKind] = &[ClientKind::TvSamsung, ClientKind::VisionOs];
+    const JS_LESS: &[ClientKind] = &[ClientKind::VisionOs, ClientKind::TvSamsung];
+
+    if config.prefer_jsless {
+        JS_LESS
+    } else if config.is_authenticated() {
+        AUTHENTICATED
+    } else {
+        ANONYMOUS
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientKind {
     WebEmbedded,
     VisionOs,
-    Tv,
+    TvSamsung,
 }
 
 impl ClientKind {
@@ -1253,16 +1366,20 @@ impl ClientKind {
                 VISIONOS_CLIENT_ID,
                 VISIONOS_CLIENT_VERSION,
             ),
-            Self::Tv => (
+            Self::TvSamsung => (
                 json!({
                     "clientName": "TVHTML5",
-                    "clientVersion": TV_CLIENT_VERSION,
-                    "userAgent": TV_UA,
+                    "clientVersion": TV_SAMSUNG_CLIENT_VERSION,
+                    "deviceMake": "Samsung",
+                    "deviceModel": "UKS9800",
+                    "userAgent": TV_SAMSUNG_UA,
+                    "osName": "Tizen",
+                    "osVersion": "2.4.0",
                     "hl": "en",
                     "gl": "US",
                 }),
-                TV_CLIENT_ID,
-                TV_CLIENT_VERSION,
+                TV_SAMSUNG_CLIENT_ID,
+                TV_SAMSUNG_CLIENT_VERSION,
             ),
         }
     }
@@ -1271,8 +1388,12 @@ impl ClientKind {
         match self {
             Self::VisionOs => VISIONOS_UA,
             Self::WebEmbedded => WEB_EMBEDDED_UA,
-            Self::Tv => TV_UA,
+            Self::TvSamsung => TV_SAMSUNG_UA,
         }
+    }
+
+    fn supports_cookies(self) -> bool {
+        !matches!(self, Self::VisionOs)
     }
 }
 
@@ -1288,21 +1409,59 @@ fn web_context() -> Value {
     })
 }
 
+struct PlayerFetch {
+    response: PlayerResponse,
+    watch_metadata: Option<PlayerResponse>,
+}
+
 async fn fetch_player_response(
     client: &reqwest::Client,
     video_id: &str,
     client_kind: ClientKind,
     config: &RequestConfig,
-) -> Result<PlayerResponse> {
+) -> Result<PlayerFetch> {
     let (context, client_name, client_version) = client_kind.context();
-    let body = json!({
+    let mut body = json!({
         "context": {"client": context},
         "videoId": video_id,
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
+    let mut watch_metadata = None;
+    if client_kind == ClientKind::TvSamsung {
+        // TVHTML5 clients reject requests without a playback context and a
+        // current signature timestamp. yt-dlp sends the same fields. The watch
+        // page also supplies the metadata TVHTML5 omits from its response.
+        let watch_html = fetch_watch_html(video_id, config).await;
+        if let Some(html) = &watch_html
+            && let Ok(value) = extract_json_assignment(html, "ytInitialPlayerResponse")
+        {
+            watch_metadata = serde_json::from_value(value).ok();
+        }
+        let player_url = watch_html
+            .as_ref()
+            .and_then(|html| extract_ytcfg(html))
+            .and_then(|config| player_js_url_from_cfg(&config))
+            .or_else(cached_player_js_url);
+        if let Some(player_url) = player_url {
+            remember_player_js_url(&player_url);
+            match signature_timestamp(client, &player_url, config).await {
+                Ok(timestamp) => {
+                    body["playbackContext"] = json!({
+                        "contentPlaybackContext": {
+                            "html5Preference": "HTML5_PREF_WANTS",
+                            "signatureTimestamp": timestamp,
+                        }
+                    });
+                }
+                Err(error) => tracing::debug!("TvSamsung signature timestamp unavailable: {error}"),
+            }
+        } else {
+            tracing::debug!("TvSamsung player JS URL unavailable");
+        }
+    }
 
-    post_innertube(
+    let response = post_innertube(
         client,
         InnertubeRequest {
             endpoint: "player",
@@ -1313,10 +1472,15 @@ async fn fetch_player_response(
             visitor_data: None,
             user_session_id: None,
             browser: false,
+            send_cookies: client_kind.supports_cookies(),
         },
         config,
     )
-    .await
+    .await?;
+    Ok(PlayerFetch {
+        response,
+        watch_metadata,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2347,6 +2511,95 @@ mod tests {
             value_text(&json!({"simpleText": "plain"})),
             Some("plain".to_string())
         );
+    }
+
+    #[test]
+    fn merges_metadata_omitted_by_tv_samsung() {
+        let mut info = VideoInfo {
+            id: "dQw4w9WgXcQ".to_string(),
+            title: String::new(),
+            uploader: String::new(),
+            channel: String::new(),
+            channel_id: String::new(),
+            webpage_url: String::new(),
+            description: String::new(),
+            duration_secs: Some(213),
+            view_count: None,
+            upload_date: String::new(),
+            is_live: false,
+            thumbnails: Vec::new(),
+            subtitles: Vec::new(),
+            automatic_captions: Vec::new(),
+            formats: Vec::new(),
+            hls_manifest_url: None,
+            player_js_url: None,
+        };
+        let response: PlayerResponse = serde_json::from_value(json!({
+            "videoDetails": {
+                "videoId": "dQw4w9WgXcQ",
+                "title": "Title",
+                "author": "Uploader",
+                "ownerChannelName": "Channel",
+                "channelId": "UC123",
+                "shortDescription": "Description",
+                "lengthSeconds": "213",
+                "viewCount": "42"
+            },
+            "microformat": {
+                "playerMicroformatRenderer": {
+                    "uploadDate": "2009-10-24T23:57:33-07:00",
+                    "ownerChannelName": "Channel"
+                }
+            }
+        }))
+        .unwrap();
+        merge_watch_metadata(&mut info, response);
+        assert_eq!(info.title, "Title");
+        assert_eq!(info.uploader, "Uploader");
+        assert_eq!(info.channel, "Channel");
+        assert_eq!(info.channel_id, "UC123");
+        assert_eq!(info.description, "Description");
+        assert_eq!(info.view_count, Some(42));
+        assert_eq!(info.upload_date, "20091024");
+    }
+
+    #[test]
+    fn orders_player_clients_for_auth_and_jsless() {
+        let mut config = RequestConfig::default();
+        assert_eq!(
+            client_order(&config),
+            &[ClientKind::TvSamsung, ClientKind::VisionOs]
+        );
+
+        config.sapisid = Some("sid".to_string());
+        assert_eq!(client_order(&config), &[ClientKind::TvSamsung]);
+
+        config.prefer_jsless = true;
+        assert_eq!(
+            client_order(&config),
+            &[ClientKind::VisionOs, ClientKind::TvSamsung]
+        );
+    }
+
+    #[test]
+    fn tv_samsung_context_matches_yt_dlp() {
+        let (context, client_id, client_version) = ClientKind::TvSamsung.context();
+        assert_eq!(client_id, "7");
+        assert_eq!(client_version, "5.20260707");
+        assert_eq!(context["clientName"], "TVHTML5");
+        assert_eq!(context["clientVersion"], "5.20260707");
+        assert_eq!(context["deviceMake"], "Samsung");
+        assert_eq!(context["deviceModel"], "UKS9800");
+        assert_eq!(context["osName"], "Tizen");
+        assert_eq!(context["osVersion"], "2.4.0");
+        assert_eq!(context["userAgent"], TV_SAMSUNG_UA);
+    }
+
+    #[test]
+    fn only_cookie_capable_clients_send_cookies() {
+        assert!(ClientKind::TvSamsung.supports_cookies());
+        assert!(ClientKind::WebEmbedded.supports_cookies());
+        assert!(!ClientKind::VisionOs.supports_cookies());
     }
 
     #[test]

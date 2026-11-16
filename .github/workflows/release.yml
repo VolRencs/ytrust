@@ -29,7 +29,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.99.1
+          toolchain: 1.100.0
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -87,7 +87,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.99.1
+          toolchain: 1.100.0
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
@@ -138,7 +138,7 @@ jobs:
 
       - uses: pnpm/action-setup@v6
         with:
-          version: 12.18.0
+          version: 12.21.0
 
       - uses: actions/setup-node@v7
         with:
@@ -148,7 +148,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.99.1
+          toolchain: 1.100.0
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2

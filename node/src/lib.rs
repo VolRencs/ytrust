@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use napi::bindgen_prelude::Result;
@@ -10,21 +10,22 @@ use ytrust::constants::{DEFAULT_PLAYLIST_ITEMS, DEFAULT_PLAYLIST_LIMIT, DEFAULT_
 use ytrust::cookies::{self, LoadedCookies};
 use ytrust::error::YtrustError;
 use ytrust::http::RequestConfig;
+use ytrust::sync::MutexExt;
 use ytrust::youtube::fetch_player_source;
 
-const COOKIE_CACHE_TTL: Duration = Duration::from_secs(60);
+const COOKIE_CACHE_TTL: Duration = Duration::from_mins(1);
 const COOKIE_CACHE_CAPACITY: usize = 8;
 type CookieCache = Mutex<HashMap<(Option<String>, Option<String>), (Instant, LoadedCookies)>>;
-static COOKIE_CACHE: OnceLock<CookieCache> = OnceLock::new();
+static COOKIE_CACHE: LazyLock<CookieCache> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 async fn load_cookies(options: ResolveOptions) -> ytrust::error::Result<LoadedCookies> {
     let key = (options.cookies_path, options.cookies_from_browser);
     if key.0.is_none() && key.1.is_none() {
         return cookies::load(None, None);
     }
-    let cache = COOKIE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = &*COOKIE_CACHE;
     {
-        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        let mut cache = cache.lock_unpoisoned();
         cache.retain(|_, (loaded_at, _)| loaded_at.elapsed() < COOKIE_CACHE_TTL);
         if let Some((_, loaded)) = cache.get(&key) {
             return Ok(loaded.clone());
@@ -45,7 +46,7 @@ async fn load_cookies(options: ResolveOptions) -> ytrust::error::Result<LoadedCo
             format!("cookie loading task failed: {error}"),
         )
     })??;
-    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let mut cache = cache.lock_unpoisoned();
     if cache.len() >= COOKIE_CACHE_CAPACITY
         && let Some(oldest) = cache
             .iter()
@@ -101,6 +102,7 @@ async fn request_config(
         sapisid1p: cookies.sapisid1p,
         sapisid3p: cookies.sapisid3p,
         timeout,
+        prefer_jsless: false,
     };
     let core = CoreResolveOptions {
         no_playlist: options.no_playlist.unwrap_or(false),

@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.2.0
+
+### Added
+
+- Added the `tv_samsung` TVHTML5 client as the primary player client, matching
+  current yt-dlp defaults. It supports cookies and does not require a GVS PO
+  token, so age-restricted and authenticated videos keep adaptive formats.
+  TVHTML5 omits title/description metadata, so it is merged from the watch
+  page's initial player response.
+- Player requests now send cookies and authorization headers only to clients
+  that support them; VisionOS requests no longer carry account cookies.
+
+### Changed
+
+- Raised the minimum Rust version to 1.100 and modernized internals to current
+  standard-library APIs (`LazyLock`, `Mutex::clear_poison`, `Duration::from_mins`,
+  `String::from_utf8_lossy_owned`, `floor_char_boundary`).
+- Updated `rusqlite` to 0.43, the Rust dependency graph, pnpm to 12.21 and
+  Biome to 2.6.8.
+- The player client order is now `tv_samsung → visionos` for anonymous
+  requests and `tv_samsung` for authenticated requests. VisionOS remains first
+  when the JavaScript challenge solver is explicitly disabled.
+- Removed the legacy Cobalt TVHTML5 client; `tv_samsung` now covers the
+  PO-token-free TV path.
+
 ## 1.1.2
 
 ### Fixed

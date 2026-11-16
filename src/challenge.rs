@@ -1,7 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,7 @@ use url::Url;
 
 use crate::error::{ErrorCode, Result, YtrustError};
 use crate::http::RequestConfig;
+use crate::sync::MutexExt;
 use crate::youtube::{self, Format, VideoInfo};
 
 const SOLVER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -215,7 +217,7 @@ impl ChallengeSolver {
 
         if !requests.is_empty() {
             let preprocessed = {
-                let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+                let cache = self.cache.lock_unpoisoned();
                 cache.preprocessed.get(&player_url).cloned()
             };
             // The preprocessed player is all the solver needs. Fetching the
@@ -224,15 +226,14 @@ impl ChallengeSolver {
                 String::new()
             } else {
                 let source = {
-                    let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+                    let cache = self.cache.lock_unpoisoned();
                     cache.sources.get(&player_url).cloned()
                 };
                 match source {
                     Some(source) => source,
                     None => match youtube::fetch_player_source(&player_url, config).await {
                         Ok(source) => {
-                            let mut cache =
-                                self.cache.lock().unwrap_or_else(|error| error.into_inner());
+                            let mut cache = self.cache.lock_unpoisoned();
                             if cache.sources.len() >= 4 && !cache.sources.contains_key(&player_url)
                             {
                                 cache.sources.clear();
@@ -264,8 +265,7 @@ impl ChallengeSolver {
                         warn!("{}", report.error.as_deref().unwrap_or_default());
                     } else {
                         if let Some(preprocessed) = output.preprocessed_player {
-                            let mut cache =
-                                self.cache.lock().unwrap_or_else(|error| error.into_inner());
+                            let mut cache = self.cache.lock_unpoisoned();
                             if cache.preprocessed.len() >= 4
                                 && !cache.preprocessed.contains_key(&player_url)
                             {
@@ -289,10 +289,7 @@ impl ChallengeSolver {
                                     let is_n = n_challenges.contains(&challenge);
                                     if is_sig {
                                         sig_values.insert(challenge.clone(), value.clone());
-                                        let mut cache = self
-                                            .cache
-                                            .lock()
-                                            .unwrap_or_else(|error| error.into_inner());
+                                        let mut cache = self.cache.lock_unpoisoned();
                                         if cache.sig.len() >= SOLVER_CACHE_ENTRIES {
                                             cache.sig.clear();
                                         }
@@ -300,10 +297,7 @@ impl ChallengeSolver {
                                     } else if is_n {
                                         debug!("n challenge {challenge} solved as {value}");
                                         n_values.insert(challenge.clone(), value.clone());
-                                        let mut cache = self
-                                            .cache
-                                            .lock()
-                                            .unwrap_or_else(|error| error.into_inner());
+                                        let mut cache = self.cache.lock_unpoisoned();
                                         if cache.n.len() >= SOLVER_CACHE_ENTRIES {
                                             cache.n.clear();
                                         }
@@ -345,7 +339,7 @@ fn collect_requests(
     player_url: &str,
     cache: &Mutex<SolverCache>,
 ) -> (Vec<SolverRequest>, BTreeSet<String>, BTreeSet<String>) {
-    let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let cache = cache.lock_unpoisoned();
     let mut sig = BTreeSet::new();
     let mut n = BTreeSet::new();
     for format in &info.formats {
@@ -391,7 +385,7 @@ fn cached_values(
     player_url: &str,
     signature: bool,
 ) -> HashMap<String, String> {
-    let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let cache = cache.lock_unpoisoned();
     let values = if signature { &cache.sig } else { &cache.n };
     values
         .iter()
@@ -529,7 +523,7 @@ fn encode_query_value(value: &str) -> String {
             encoded.push(byte as char);
         } else {
             encoded.push('%');
-            encoded.push_str(&format!("{byte:02X}"));
+            let _ = write!(encoded, "{byte:02X}");
         }
     }
     encoded
@@ -557,7 +551,7 @@ async fn probe_runtime(raw: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let version = String::from_utf8_lossy(&output.stdout);
+    let version = String::from_utf8_lossy_owned(output.stdout);
     let major = version
         .trim()
         .trim_start_matches('v')
@@ -680,8 +674,7 @@ impl SolverServer {
 }
 
 fn solver_dir() -> std::result::Result<PathBuf, String> {
-    static DIR: OnceLock<std::result::Result<tempfile::TempDir, String>> = OnceLock::new();
-    match DIR.get_or_init(|| {
+    static DIR: LazyLock<std::result::Result<tempfile::TempDir, String>> = LazyLock::new(|| {
         let dir = tempfile::tempdir().map_err(|error| format!("temp dir failed: {error}"))?;
         for (name, contents) in [
             ("package.json", "{\"type\":\"module\"}"),
@@ -694,7 +687,8 @@ fn solver_dir() -> std::result::Result<PathBuf, String> {
                 .map_err(|error| format!("could not write {name}: {error}"))?;
         }
         Ok(dir)
-    }) {
+    });
+    match &*DIR {
         Ok(dir) => Ok(dir.path().to_path_buf()),
         Err(error) => Err(error.clone()),
     }

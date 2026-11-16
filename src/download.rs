@@ -159,7 +159,7 @@ impl Downloader {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn download_format(
         &self,
         format: &Format,
@@ -564,7 +564,7 @@ impl Downloader {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn convert_audio(
         &self,
         input: &Path,
@@ -1371,7 +1371,7 @@ fn duration_style() -> ProgressStyle {
     .progress_chars("━╸─")
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn run_ffmpeg_to_path(
     command: Command,
     bar: ProgressBar,
@@ -1551,10 +1551,7 @@ fn push_bounded(text: &mut String, line: &str, max: usize) {
         text.push_str(line);
         text.push('\n');
     } else {
-        let mut end = remaining.saturating_sub(1).min(line.len());
-        while !line.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = line.floor_char_boundary(remaining.saturating_sub(1).min(line.len()));
         text.push_str(&line[..end]);
         text.push_str("…\n");
     }

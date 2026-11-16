@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use aes::Aes128;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
@@ -766,16 +766,16 @@ fn decrypt_chromium_cookie(encrypted: &[u8], host: &str) -> Option<String> {
         plain
     };
 
-    String::from_utf8(plain.to_vec()).ok()
+    std::str::from_utf8(plain).ok().map(str::to_owned)
 }
 
 fn chromium_key() -> &'static [u8; 16] {
-    static KEY: OnceLock<[u8; 16]> = OnceLock::new();
-    KEY.get_or_init(|| {
+    static KEY: LazyLock<[u8; 16]> = LazyLock::new(|| {
         let mut key = [0u8; 16];
         pbkdf2_hmac::<Sha1>(b"peanuts", b"saltysalt", 1, &mut key);
         key
-    })
+    });
+    LazyLock::force(&KEY)
 }
 
 /// Google's `ST-*` secure-token cookies are unrelated to YouTube auth and can

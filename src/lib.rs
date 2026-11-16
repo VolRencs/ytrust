@@ -9,6 +9,7 @@ pub mod http;
 pub mod json;
 pub mod output;
 pub mod progress;
+pub mod sync;
 pub mod util;
 pub mod youtube;
 

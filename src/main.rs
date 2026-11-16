@@ -133,6 +133,7 @@ async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
         sapisid1p: cookies.sapisid1p.clone(),
         sapisid3p: cookies.sapisid3p.clone(),
         timeout,
+        prefer_jsless: cli.prefer_jsless(),
     };
     let retries = cli.fragment_retries.unwrap_or(cli.retries);
     let downloader = Downloader::new(DownloadConfig {
@@ -444,7 +445,6 @@ async fn process_info(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn download_selection(
     info: &VideoInfo,
     selection: &FormatSelection,
@@ -608,7 +608,7 @@ impl RunContext<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn download_video(
     info: &VideoInfo,
     selection: &FormatSelection,
@@ -841,7 +841,7 @@ async fn postprocess_video(
     Ok(current)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn download_audio_only(
     info: &VideoInfo,
     selection: &FormatSelection,

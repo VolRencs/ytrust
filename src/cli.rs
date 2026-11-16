@@ -263,6 +263,14 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// True when the user explicitly disabled the JavaScript challenge solver.
+    pub fn prefer_jsless(&self) -> bool {
+        self.js_runtimes.as_deref().is_some_and(|spec| {
+            let spec = spec.trim();
+            spec.eq_ignore_ascii_case("none") || spec.eq_ignore_ascii_case("off")
+        })
+    }
+
     /// Validate mode combinations before cookies, network access or runtime
     /// creation so invalid commands fail fast.
     pub fn validate(&self) -> Result<()> {
@@ -381,6 +389,21 @@ fn validate_audio_quality(quality: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_jsless_runtime_selection() {
+        let cli = Cli::try_parse_from([
+            "ytrust",
+            "--js-runtimes",
+            "none",
+            "https://www.youtube.com/watch?v=x",
+        ])
+        .unwrap();
+        assert!(cli.prefer_jsless());
+
+        let cli = Cli::try_parse_from(["ytrust", "https://www.youtube.com/watch?v=x"]).unwrap();
+        assert!(!cli.prefer_jsless());
+    }
 
     #[test]
     fn parses_no_fallback_flag() {

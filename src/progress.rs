@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::sync::MutexExt;
+
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 
 /// Writes newline-delimited JSON events to stdout.
@@ -33,11 +35,7 @@ impl EventSink {
         if self.inner.broken.load(Ordering::Relaxed) {
             return;
         }
-        let _guard = self
-            .inner
-            .lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _guard = self.inner.lock.lock_unpoisoned();
         if self.inner.broken.load(Ordering::Relaxed) {
             return;
         }
@@ -146,7 +144,7 @@ impl Progress {
     }
 
     fn emit_start(&self) {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock_unpoisoned();
         let total = total_if_known(&state.components);
         let estimate = estimated_total(&state.components);
         let components: Vec<Value> = state
@@ -180,7 +178,7 @@ impl Progress {
         if delta == 0 {
             return;
         }
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         let Some(index) = self.index.get(component).copied() else {
             return;
         };
@@ -195,7 +193,7 @@ impl Progress {
     }
 
     pub fn set_total(&self, component: &str, total: u64) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         let Some(index) = self.index.get(component).copied() else {
             return;
         };
@@ -207,7 +205,7 @@ impl Progress {
     }
 
     pub fn set_done(&self, component: &str, done: u64) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         let Some(index) = self.index.get(component).copied() else {
             return;
         };
@@ -219,7 +217,7 @@ impl Progress {
     }
 
     pub fn finish_component(&self, component: &str) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         let Some(index) = self.index.get(component).copied() else {
             return;
         };
@@ -233,7 +231,7 @@ impl Progress {
     }
 
     pub fn phase_started(&self, processor: &str) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         state.phase = Some(PhaseState {
             processor: processor.to_string(),
             percent: None,
@@ -246,7 +244,7 @@ impl Progress {
 
     pub fn phase_progress(&self, percent: f64) {
         let percent = percent.clamp(0.0, 100.0);
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         let Some(phase) = state.phase.as_mut() else {
             return;
         };
@@ -268,7 +266,7 @@ impl Progress {
     }
 
     pub fn phase_finished(&self, processor: &str) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         if let Some(phase) = state.phase.as_mut() {
             phase.percent = Some(100.0);
         }
@@ -282,7 +280,7 @@ impl Progress {
     }
 
     pub fn phase_failed(&self, processor: &str) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         state.phase = None;
         let value = postprocess_value(&state, processor, "failed", None);
         drop(state);
@@ -290,7 +288,7 @@ impl Progress {
     }
 
     pub fn file(&self, kind: &str, path: &Path, language: Option<&str>, auto: bool) {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock_unpoisoned();
         let value = json!({
             "v": 1,
             "event": "file",
@@ -319,7 +317,7 @@ impl Progress {
             .as_ref()
             .and_then(|path| std::fs::metadata(path).ok())
             .map(|metadata| metadata.len());
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock_unpoisoned();
         let value = json!({
             "v": 1,
             "event": "done",
@@ -343,7 +341,7 @@ impl Progress {
     }
 
     pub fn error(&self, code: &str, message: &str) {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock_unpoisoned();
         let value = json!({
             "v": 1,
             "event": "error",

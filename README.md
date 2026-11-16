@@ -8,12 +8,17 @@ separate audio/video streams, cookies and proxies.
 applications can resolve YouTube metadata and media URLs without spawning an
 external binary.
 
+Player formats are resolved through YouTube's TVHTML5 (`tv_samsung`) client
+first, with VisionOS as a JSLess fallback. Cookies are only sent to clients
+that support them, and `web_embedded` remains a last resort.
+
 ## Requirements
 
-- Rust 1.99+ to build from source
+- Rust 1.100+ to build from source
 - Node.js 26+ for the native module (prebuilt addon targets `linux-x64-gnu`, glibc 2.35+)
 - Node.js 20+ for `signatureCipher`/`n` solving in the CLI (optional; needed only
-  when YouTube exposes ciphered formats)
+  when YouTube exposes ciphered formats). If Node.js is unavailable, pass
+  `--js-runtimes none` so ytrust prefers the JSLess VisionOS client first.
 - ffmpeg with the codecs you need when converting or merging media
 
 ## Build

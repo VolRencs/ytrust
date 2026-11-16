@@ -122,8 +122,8 @@ fn format_json(format: &Format, duration_secs: Option<u64>) -> Value {
             "https"
         },
         "is_hls": format.is_hls,
-        "vcodec": format.video_codec.clone().unwrap_or_else(|| "none".to_string()),
-        "acodec": format.audio_codec.clone().unwrap_or_else(|| "none".to_string()),
+        "vcodec": format.video_codec.as_deref().unwrap_or("none"),
+        "acodec": format.audio_codec.as_deref().unwrap_or("none"),
         "width": format.width,
         "height": format.height,
         "fps": format.fps,
