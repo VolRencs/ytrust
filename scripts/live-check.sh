@@ -32,6 +32,17 @@ assert data["best_audio"].get("url"), "best_audio has no URL"
 print(f"  {data['id']}: {len(data['formats'])} formats, best={data['best_audio']['format_id']}")
 PY
 
+echo "metadata without solving"
+"$YTRUST" "${args[@]}" -J --no-solve "$VIDEO" >"$TMP/no-solve.json"
+python3 - "$TMP/no-solve.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data["_type"] == "video", data.get("_type")
+assert data["formats"], "no formats"
+assert all("needs_challenge" in format for format in data["formats"])
+print(f"  {len(data['formats'])} formats")
+PY
+
 echo "formats"
 "$YTRUST" "${args[@]}" -F "$VIDEO" >/dev/null
 

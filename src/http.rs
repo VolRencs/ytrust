@@ -26,7 +26,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub struct RequestConfig {
     pub proxy: Option<String>,
     pub cookies: Option<String>,
-    pub cookie_jar: Option<crate::cookies::CookieJar>,
+    pub cookie_jar: Option<std::sync::Arc<crate::cookies::CookieJar>>,
     pub sapisid: Option<String>,
     pub sapisid1p: Option<String>,
     pub sapisid3p: Option<String>,

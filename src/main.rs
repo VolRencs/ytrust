@@ -121,19 +121,21 @@ async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
     if cookies.header.is_some() {
         debug!("loaded cookies");
     }
-    if cli.retry_sleep.is_some() || cli.concurrent_fragments.is_some() {
-        debug!("yt-dlp compatibility options are accepted but do not change ytrust scheduling");
+    if cli.retry_sleep.is_some() {
+        debug!(
+            "yt-dlp compatibility retry-sleep is accepted but does not change ytrust scheduling"
+        );
     }
     let timeout = cli.socket_timeout.unwrap_or(cli.timeout);
     let request_config = RequestConfig {
         proxy: cli.proxy.clone(),
         cookies: cookies.header.clone(),
-        cookie_jar: Some(cookies.cookie_jar.clone()),
+        cookie_jar: Some(std::sync::Arc::clone(&cookies.cookie_jar)),
         sapisid: cookies.sapisid.clone(),
         sapisid1p: cookies.sapisid1p.clone(),
         sapisid3p: cookies.sapisid3p.clone(),
         timeout,
-        prefer_jsless: cli.prefer_jsless(),
+        prefer_jsless: cli.prefer_jsless() || cli.no_solve,
     };
     let retries = cli.fragment_retries.unwrap_or(cli.retries);
     let downloader = Downloader::new(DownloadConfig {
@@ -145,6 +147,7 @@ async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
         ffmpeg: cli.ffmpeg_location.clone(),
         force_overwrites: cli.force_overwrites,
         quiet: cli.quiet,
+        concurrent_fragments: cli.concurrent_fragments.unwrap_or(1),
     })?;
     let solver = ChallengeSolver::new(cli.js_runtimes.as_deref()).await?;
 
@@ -340,8 +343,9 @@ async fn process_info(
         apply_audio_tracks(&mut info, &cli.audio_tracks)?;
     }
 
-    let solve_needed = context.json_mode != JsonMode::None
-        || (!cli.list_formats && !context.simulate && !context.skip_media);
+    let solve_needed = !cli.no_solve
+        && (context.json_mode != JsonMode::None
+            || (!cli.list_formats && !context.simulate && !context.skip_media));
     let solve_report = if solve_needed {
         Some(
             context

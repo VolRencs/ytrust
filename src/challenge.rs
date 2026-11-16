@@ -46,7 +46,6 @@ struct SolverServer {
 
 #[derive(Default)]
 struct SolverCache {
-    sources: HashMap<String, String>,
     preprocessed: HashMap<String, String>,
     sig: HashMap<(String, String), String>,
     n: HashMap<(String, String), String>,
@@ -225,20 +224,11 @@ impl ChallengeSolver {
             let source = if preprocessed.is_some() {
                 String::new()
             } else {
-                let source = {
-                    let cache = self.cache.lock_unpoisoned();
-                    cache.sources.get(&player_url).cloned()
-                };
-                match source {
+                match youtube::cached_player_source(&player_url) {
                     Some(source) => source,
                     None => match youtube::fetch_player_source(&player_url, config).await {
                         Ok(source) => {
-                            let mut cache = self.cache.lock_unpoisoned();
-                            if cache.sources.len() >= 4 && !cache.sources.contains_key(&player_url)
-                            {
-                                cache.sources.clear();
-                            }
-                            cache.sources.insert(player_url.clone(), source.clone());
+                            youtube::remember_player_source(&player_url, &source);
                             source
                         }
                         Err(error) => {
@@ -446,6 +436,7 @@ fn apply_values(
             }
         }
 
+        format.needs_challenge = format_unresolved;
         if format_unresolved {
             unresolved += 1;
         }
@@ -725,6 +716,7 @@ mod tests {
             audio_track_id: None,
             audio_is_default: true,
             language: Some("en".to_string()),
+            needs_challenge: false,
             user_agent: "test",
         }
     }
@@ -815,6 +807,7 @@ mod tests {
         let pairs: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(pairs.get("sig").map(String::as_str), Some("solved"));
         assert_eq!(pairs.get("n").map(String::as_str), Some("fresh"));
+        assert!(!format.needs_challenge);
     }
 
     #[test]
@@ -842,5 +835,6 @@ mod tests {
             player_js_url: None,
         };
         assert_eq!(apply_values(&mut info, &HashMap::new(), &HashMap::new()), 1);
+        assert!(info.formats[0].needs_challenge);
     }
 }

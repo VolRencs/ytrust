@@ -102,6 +102,7 @@ pub fn playlist_entry_json(
 fn format_json(format: &Format, duration_secs: Option<u64>) -> Value {
     let ext = format_ext(format);
     let filesize_approx = format.estimated_size(duration_secs);
+    let needs_challenge = format.needs_challenge;
     let resolution = match (format.width, format.height) {
         (Some(width), Some(height)) => Some(format!("{width}x{height}")),
         (None, Some(height)) => Some(format!("{height}p")),
@@ -134,6 +135,8 @@ fn format_json(format: &Format, duration_secs: Option<u64>) -> Value {
         "resolution": resolution,
         "format_note": format.quality_label,
         "is_live": format.is_live,
+        "needs_challenge": needs_challenge,
+        "playable": !needs_challenge,
         "http_headers": http_headers(format),
         "expires_at": format_expires_at(&format.url)
             .or_else(|| format.signature_cipher.as_deref().and_then(cipher_expires_at))
@@ -257,6 +260,7 @@ mod tests {
             audio_track_id: None,
             audio_is_default: false,
             language: None,
+            needs_challenge: false,
             user_agent: "test-agent",
         }
     }

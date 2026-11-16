@@ -52,6 +52,12 @@ ytrust -x --audio-format opus "https://youtu.be/dQw4w9WgXcQ"
 # Metadata only
 ytrust -J "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
+# Metadata without solving signature/n challenges (fast, URLs may be unresolved)
+ytrust -J --no-solve "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+# Parallel range downloads for direct HTTP media (1-8 connections)
+ytrust --concurrent-fragments 4 "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
 # Playlist items 1-10
 ytrust --playlist-items 1-10 "https://www.youtube.com/playlist?list=..."
 
@@ -72,8 +78,11 @@ ytrust --js-runtimes node:/usr/bin/node "https://www.youtube.com/watch?v=..."
 Run `ytrust --help` for the full list of options. The CLI bundles the same EJS
 challenge solver as the Node module and runs it through a detected Node.js
 runtime; pass `--js-runtimes none` to disable it, or `node:PATH` to select a
-specific binary. `--download-sections` accepts one range such as `*120-inf` or
-`*1:00-2:30`. `-j` prints one JSON object per video, while `-J` prints one object
+specific binary. `--no-solve` skips challenge solving for `-J`, `-F`,
+`--simulate` and `--skip-download`; unresolved formats are marked with
+`needs_challenge: true` and `playable: false`. `--concurrent-fragments N`
+enables parallel range requests for direct HTTP media (1-8, default 1).
+`--download-sections` accepts one range such as `*120-inf` or `*1:00-2:30`. `-j` prints one JSON object per video, while `-J` prints one object
 per URL (a playlist object for playlists). `-j --flat-playlist` emits playlist
 entries without fetching every video. `--ignore-errors` continues after a
 per-item failure and exits with status 1 when anything failed. `--skip-download`
@@ -154,6 +163,7 @@ Returns the same shape as `yt-dlp -J`: `_type: "video"` for a single video or
 - `is_hls` — true for HLS manifest entries;
 - `language` — audio track language when YouTube reports one;
 - `filesize_approx` — estimated size when the exact size is unknown;
+- `needs_challenge` — true when a signature/`n` challenge is still unresolved;
 - `playable` — false when a signature/`n` challenge is still unresolved.
 
 ### `resolveAudio(input, options?)`
@@ -175,6 +185,7 @@ attached to a watch URL.
 | `playlistLimit` | `500` | Maximum playlist entries to fetch (minimum `1`) |
 | `playlistItems` | `"1-"` | Playlist ranges, e.g. `1-10,15` |
 | `noPlaylist` | `false` | Ignore a playlist attached to a watch URL |
+| `solveChallenges` | `true` | `resolve` only: set `false` to skip signature/`n` solving; unresolved formats are marked `playable: false` |
 | `ensurePlayable` | `false` | `resolveAudio` only: retry transient googlevideo `403`s and return the URL only after it responds successfully |
 
 ### Errors

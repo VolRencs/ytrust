@@ -59,6 +59,10 @@ pub struct Cli {
     )]
     pub dump_json: bool,
 
+    /// Resolve formats without solving signature/n challenges
+    #[arg(long)]
+    pub no_solve: bool,
+
     /// Print one JSON object for the whole input and do not download
     #[arg(short = 'J', long = "dump-single-json")]
     pub dump_single_json: bool,
@@ -141,8 +145,8 @@ pub struct Cli {
     #[arg(long, value_name = "EXPR", hide = true)]
     pub retry_sleep: Option<String>,
 
-    /// yt-dlp compatibility: accepted for compatibility; ytrust streams sequentially
-    #[arg(long, value_name = "N", hide = true)]
+    /// Number of parallel range requests for direct HTTP downloads (1-8)
+    #[arg(long, value_name = "N")]
     pub concurrent_fragments: Option<u32>,
 
     /// yt-dlp compatibility: accepted for compatibility
@@ -277,8 +281,25 @@ impl Cli {
         if self.timeout == 0 {
             return Err(invalid("--timeout must be at least 1 second"));
         }
+        if self
+            .concurrent_fragments
+            .is_some_and(|value| !(1..=8).contains(&value))
+        {
+            return Err(invalid("--concurrent-fragments must be between 1 and 8"));
+        }
         if self.playlist_limit == 0 {
             return Err(invalid("--playlist-limit must be at least 1"));
+        }
+        if self.no_solve
+            && !(self.dump_json
+                || self.dump_single_json
+                || self.list_formats
+                || self.simulate
+                || self.skip_download)
+        {
+            return Err(invalid(
+                "--no-solve requires -J, -j, -F, --simulate or --skip-download",
+            ));
         }
         ytrust::youtube::max_playlist_item(&self.playlist_items)?;
         if self.audio_quality.is_some() && !self.extract_audio && self.audio_format.is_none() {
@@ -389,6 +410,41 @@ fn validate_audio_quality(quality: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_no_solve_and_concurrent_fragments() {
+        let cli =
+            Cli::try_parse_from(["ytrust", "--no-solve", "https://www.youtube.com/watch?v=x"])
+                .unwrap();
+        assert!(cli.validate().is_err());
+
+        let cli = Cli::try_parse_from([
+            "ytrust",
+            "--no-solve",
+            "-J",
+            "https://www.youtube.com/watch?v=x",
+        ])
+        .unwrap();
+        assert!(cli.validate().is_ok());
+
+        let cli = Cli::try_parse_from([
+            "ytrust",
+            "--concurrent-fragments",
+            "0",
+            "https://www.youtube.com/watch?v=x",
+        ])
+        .unwrap();
+        assert!(cli.validate().is_err());
+
+        let cli = Cli::try_parse_from([
+            "ytrust",
+            "--concurrent-fragments",
+            "4",
+            "https://www.youtube.com/watch?v=x",
+        ])
+        .unwrap();
+        assert!(cli.validate().is_ok());
+    }
 
     #[test]
     fn detects_jsless_runtime_selection() {

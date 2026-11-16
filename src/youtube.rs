@@ -111,6 +111,7 @@ pub struct Format {
     pub audio_track_id: Option<String>,
     pub audio_is_default: bool,
     pub language: Option<String>,
+    pub needs_challenge: bool,
     pub user_agent: &'static str,
 }
 
@@ -550,21 +551,52 @@ fn player_js_url_from_cfg(ytcfg: &Value) -> Option<String> {
         })
         .or_else(|| ytcfg.get("JS_URL").and_then(Value::as_str))
         .map(|url| {
-            if url.starts_with("http") {
+            let url = if url.starts_with("http") {
                 url.to_string()
             } else if url.starts_with("//") {
                 format!("https:{url}")
             } else {
                 format!("https://www.youtube.com{url}")
-            }
+            };
+            normalize_player_js_url(url)
         })
+}
+
+/// The EJS solver does not understand the newer `*_tcl` player variants yet.
+/// Use the equivalent `*_vflset` variant for both signature timestamp
+/// extraction and challenge solving.
+fn normalize_player_js_url(url: String) -> String {
+    url.replace("player_es6_tcl.vflset", "player_es6.vflset")
+        .replace("player_ias_tcl.vflset", "player_ias.vflset")
 }
 
 const SIGNATURE_CACHE_CAPACITY: usize = 8;
 const SIGNATURE_CACHE_TTL: Duration = Duration::from_hours(6);
+const PLAYER_SOURCE_CACHE_CAPACITY: usize = 4;
 
 static SIGNATURE_TIMESTAMPS: LazyLock<Mutex<HashMap<String, (Instant, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static PLAYER_SOURCES: LazyLock<Mutex<HashMap<String, (Instant, String)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn cached_player_source(player_js_url: &str) -> Option<String> {
+    let cache = &*PLAYER_SOURCES;
+    let cache = cache.lock_unpoisoned();
+    let (cached_at, source) = cache.get(player_js_url)?;
+    (cached_at.elapsed() < SIGNATURE_CACHE_TTL).then(|| source.clone())
+}
+
+pub(crate) fn remember_player_source(player_js_url: &str, source: &str) {
+    let cache = &*PLAYER_SOURCES;
+    let mut cache = cache.lock_unpoisoned();
+    if cache.len() >= PLAYER_SOURCE_CACHE_CAPACITY && !cache.contains_key(player_js_url) {
+        cache.clear();
+    }
+    cache.insert(
+        player_js_url.to_string(),
+        (Instant::now(), source.to_string()),
+    );
+}
 
 async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Result<VideoInfo> {
     let client = build_client(config)?;
@@ -700,15 +732,21 @@ async fn signature_timestamp(
             return Ok(*value);
         }
     }
-    let source = fetch_text_limited(
-        client,
-        player_js_url,
-        config,
-        WEB_EMBEDDED_UA,
-        None,
-        MAX_PLAYER_JS_BYTES,
-    )
-    .await?;
+    let source = if let Some(source) = cached_player_source(player_js_url) {
+        source
+    } else {
+        let source = fetch_text_limited(
+            client,
+            player_js_url,
+            config,
+            WEB_EMBEDDED_UA,
+            None,
+            MAX_PLAYER_JS_BYTES,
+        )
+        .await?;
+        remember_player_source(player_js_url, &source);
+        source
+    };
     let value = find_signature_timestamp(&source).ok_or_else(|| {
         YtrustError::coded(
             ErrorCode::InvalidResponse,
@@ -1787,6 +1825,7 @@ fn parse_video_info(
             audio_track_id: None,
             audio_is_default: true,
             language: None,
+            needs_challenge: false,
             user_agent: client_kind.user_agent(),
         });
     }
@@ -1868,6 +1907,9 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
         return None;
     }
 
+    let needs_challenge = raw.signature_cipher.is_some()
+        || raw.cipher.is_some()
+        || (!url.is_empty() && url_has_n(&url));
     let (container, video_codec, audio_codec, has_video, has_audio) =
         parse_mime_and_codecs(&raw.mime_type);
     let language = raw
@@ -1912,6 +1954,7 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
             .and_then(|track| track.audio_is_default)
             .unwrap_or(false),
         language,
+        needs_challenge,
         user_agent: client_kind.user_agent(),
     })
 }
@@ -2432,6 +2475,24 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_tcl_player_variants() {
+        assert_eq!(
+            normalize_player_js_url(
+                "https://www.youtube.com/s/player/abc/player_es6_tcl.vflset/en_US/base.js"
+                    .to_string()
+            ),
+            "https://www.youtube.com/s/player/abc/player_es6.vflset/en_US/base.js"
+        );
+        assert_eq!(
+            normalize_player_js_url(
+                "https://www.youtube.com/s/player/abc/player_ias_tcl.vflset/en_US/base.js"
+                    .to_string()
+            ),
+            "https://www.youtube.com/s/player/abc/player_ias.vflset/en_US/base.js"
+        );
+    }
+
+    #[test]
     fn finds_signature_timestamp_variants() {
         assert_eq!(
             find_signature_timestamp("var a={signatureTimestamp:19369};"),
@@ -2579,6 +2640,13 @@ mod tests {
             client_order(&config),
             &[ClientKind::VisionOs, ClientKind::TvSamsung]
         );
+    }
+
+    #[test]
+    fn caches_player_source_by_url() {
+        let url = "https://www.youtube.com/s/player/test-source/base.js";
+        remember_player_source(url, "source");
+        assert_eq!(cached_player_source(url).as_deref(), Some("source"));
     }
 
     #[test]

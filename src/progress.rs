@@ -454,9 +454,7 @@ fn total_if_known(components: &[ComponentState]) -> Option<u64> {
     }
     components
         .iter()
-        .map(|component| component.total)
-        .collect::<Option<Vec<_>>>()
-        .map(|totals| totals.into_iter().sum())
+        .try_fold(0u64, |total, component| Some(total + component.total?))
 }
 
 fn estimated_total(components: &[ComponentState]) -> u64 {

@@ -127,6 +127,33 @@ test("resolve validates options before calling native code", async () => {
       return true;
     },
   );
+  await assert.rejects(
+    // @ts-expect-error testing solveChallenges validation
+    () => resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", { solveChallenges: "yes" }),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "INVALID_INPUT");
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => resolveAudio("https://www.youtube.com/watch?v=dQw4w9WgXcQ", { solveChallenges: false }),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "INVALID_INPUT");
+      return true;
+    },
+  );
+});
+
+test("resolve can skip challenge solving for metadata", { skip: !process.env.YTRUST_INTEGRATION }, async () => {
+  const result = await resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", {
+    ...integrationOptions,
+    solveChallenges: false,
+  });
+  assert.equal(result._type, "video");
+  assert.ok(result.formats.length > 0);
+  assert.ok(result.formats.every((format) => typeof format.needs_challenge === "boolean"));
 });
 
 test("resolve single video", { skip: !process.env.YTRUST_INTEGRATION }, async () => {

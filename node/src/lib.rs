@@ -69,6 +69,7 @@ pub struct ResolveOptions {
     pub playlist_limit: Option<u32>,
     pub playlist_items: Option<String>,
     pub no_playlist: Option<bool>,
+    pub solve_challenges: Option<bool>,
 }
 
 impl Default for ResolveOptions {
@@ -81,6 +82,7 @@ impl Default for ResolveOptions {
             playlist_limit: Some(DEFAULT_PLAYLIST_LIMIT as u32),
             playlist_items: Some(DEFAULT_PLAYLIST_ITEMS.to_string()),
             no_playlist: Some(false),
+            solve_challenges: Some(true),
         }
     }
 }
@@ -102,7 +104,7 @@ async fn request_config(
         sapisid1p: cookies.sapisid1p,
         sapisid3p: cookies.sapisid3p,
         timeout,
-        prefer_jsless: false,
+        prefer_jsless: options.solve_challenges == Some(false),
     };
     let core = CoreResolveOptions {
         no_playlist: options.no_playlist.unwrap_or(false),

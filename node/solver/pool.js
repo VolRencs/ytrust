@@ -1,7 +1,7 @@
 import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 
-const TASK_TIMEOUT_MS = 20_000;
+const TASK_TIMEOUT_MS = 30_000;
 const MAX_QUEUE = 64;
 const configured = Number.parseInt(process.env.YTRUST_SOLVER_THREADS ?? "", 10);
 const MAX_WORKERS = Math.max(

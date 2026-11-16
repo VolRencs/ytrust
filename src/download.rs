@@ -1,13 +1,14 @@
-use std::io::IsTerminal;
+use std::io::{IsTerminal, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{debug, warn};
 
 use crate::constants::WEB_UA;
@@ -23,6 +24,9 @@ const MAX_FFMPEG_STDERR_BYTES: usize = 64 * 1024;
 /// caller disabled user-level retries.
 const COLD_START_MIN_ATTEMPTS: u32 = 5;
 const COLD_START_BASE_DELAY_MS: u64 = 500;
+const PARALLEL_MIN_BYTES: u64 = 16 * 1024 * 1024;
+const PARALLEL_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CONCURRENT_FRAGMENTS: u32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
@@ -30,10 +34,11 @@ pub struct DownloadConfig {
     pub timeout: u64,
     pub proxy: Option<String>,
     pub cookies: Option<String>,
-    pub cookie_jar: Option<crate::cookies::CookieJar>,
+    pub cookie_jar: Option<std::sync::Arc<crate::cookies::CookieJar>>,
     pub ffmpeg: Option<PathBuf>,
     pub force_overwrites: bool,
     pub quiet: bool,
+    pub concurrent_fragments: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -142,7 +147,10 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    pub fn new(config: DownloadConfig) -> Result<Self> {
+    pub fn new(mut config: DownloadConfig) -> Result<Self> {
+        config.concurrent_fragments = config
+            .concurrent_fragments
+            .clamp(1, MAX_CONCURRENT_FRAGMENTS);
         let client = crate::http::client_for_config(config.proxy.as_deref(), config.timeout)?;
 
         let multi = if config.quiet || !std::io::stderr().is_terminal() {
@@ -201,6 +209,11 @@ impl Downloader {
         let mut attempt = 0u32;
         let mut cold_attempts = 0u32;
         let mut last_was_cold = false;
+        let existing_part = tokio::fs::metadata(&part)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let mut use_parallel = self.config.concurrent_fragments > 1 && existing_part == 0;
 
         loop {
             if attempt > 0 {
@@ -209,14 +222,24 @@ impl Downloader {
                 tokio::time::sleep(delay).await;
             }
 
-            match self
-                .download_http_once(format, &part, total, &bar, progress, component)
-                .await
-            {
+            let result = if use_parallel {
+                self.download_http_parallel(format, &part, &bar, progress, component)
+                    .await
+            } else {
+                self.download_http_once(format, &part, total, &bar, progress, component)
+                    .await
+            };
+
+            match result {
                 Ok(()) => {
                     replace_file(&part, destination).await?;
                     bar.finish_with_message(format!("{label} [done]"));
                     return Ok(());
+                }
+                Err(error) if use_parallel => {
+                    debug!("parallel download failed: {error}; falling back to one connection");
+                    let _ = tokio::fs::remove_file(&part).await;
+                    use_parallel = false;
                 }
                 Err(error) => {
                     let retryable = is_download_retryable(&error);
@@ -244,6 +267,181 @@ impl Downloader {
 
         bar.abandon_with_message(format!("{label} [failed]"));
         Err(last_error)
+    }
+
+    async fn download_http_parallel(
+        &self,
+        format: &Format,
+        part: &Path,
+        bar: &ProgressBar,
+        progress: Option<&Progress>,
+        component: &str,
+    ) -> Result<()> {
+        let total = format
+            .content_length
+            .filter(|total| *total >= PARALLEL_MIN_BYTES)
+            .ok_or_else(|| {
+                YtrustError::coded(
+                    ErrorCode::Network,
+                    "parallel download requires a known content length",
+                )
+            })?;
+        let existing = tokio::fs::metadata(part)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if existing > 0 {
+            return Err(YtrustError::coded(
+                ErrorCode::Network,
+                "parallel download cannot resume a partial file",
+            ));
+        }
+
+        if let Some(parent) = part.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let raw_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(part)
+            .await?;
+        let file = Arc::new(AsyncMutex::new(raw_file));
+
+        bar.set_length(total);
+        bar.set_position(0);
+        if let Some(progress) = progress {
+            progress.set_total(component, total);
+        }
+
+        let ranges = parallel_ranges(total, PARALLEL_CHUNK_BYTES);
+        debug!(
+            "parallel download: total={total} bytes, chunks={}, connections={}",
+            ranges.len(),
+            self.config.concurrent_fragments
+        );
+        {
+            let mut stream = futures_util::stream::iter(ranges)
+                .map(|(start, end)| {
+                    self.download_range(
+                        format,
+                        start,
+                        end,
+                        Arc::clone(&file),
+                        bar.clone(),
+                        progress.cloned(),
+                        component.to_string(),
+                    )
+                })
+                .buffer_unordered(self.config.concurrent_fragments as usize);
+            while let Some(result) = stream.next().await {
+                result?;
+            }
+        }
+        drop(file);
+
+        let actual = tokio::fs::metadata(part).await?.len();
+        if actual != total {
+            return Err(YtrustError::coded(
+                ErrorCode::Network,
+                format!("incomplete parallel download: {actual} of {total} bytes"),
+            ));
+        }
+        bar.set_position(total);
+        if let Some(progress) = progress {
+            progress.finish_component(component);
+        }
+        Ok(())
+    }
+
+    fn media_request(&self, format: &Format) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .get(&format.url)
+            .header(reqwest::header::ACCEPT, "*/*")
+            .header(reqwest::header::REFERER, "https://www.youtube.com/")
+            .header(reqwest::header::USER_AGENT, format.user_agent);
+        if let Some(cookies) = self.cookies_for(&format.url) {
+            request = request.header(reqwest::header::COOKIE, cookies);
+        }
+        request
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn download_range(
+        &self,
+        format: &Format,
+        start: u64,
+        end: u64,
+        file: Arc<AsyncMutex<tokio::fs::File>>,
+        bar: ProgressBar,
+        progress: Option<Progress>,
+        component: String,
+    ) -> Result<()> {
+        let expected = end.saturating_sub(start).saturating_add(1);
+        let mut last_error = None;
+        for attempt in 0..=2u32 {
+            if attempt > 0 {
+                tokio::time::sleep(download_retry_delay(attempt)).await;
+            }
+            let request = self
+                .media_request(format)
+                .header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                        let content_range = response
+                            .headers()
+                            .get(reqwest::header::CONTENT_RANGE)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(parse_content_range);
+                        if content_range.is_some_and(|(range_start, _)| range_start != start) {
+                            last_error = Some(YtrustError::coded(
+                                ErrorCode::Network,
+                                "server returned an unexpected range start",
+                            ));
+                            continue;
+                        }
+                        let body = match read_media_body(response, expected).await {
+                            Ok(body) => body,
+                            Err(error) => {
+                                last_error = Some(error);
+                                continue;
+                            }
+                        };
+                        let mut file = file.lock().await;
+                        file.seek(SeekFrom::Start(start)).await?;
+                        file.write_all(&body).await?;
+                        drop(file);
+                        bar.inc(expected);
+                        if let Some(progress) = &progress {
+                            progress.add(&component, expected);
+                        }
+                        return Ok(());
+                    }
+                    let error = YtrustError::HttpStatus {
+                        status: status.as_u16(),
+                        message: format!("range request returned HTTP {status}"),
+                    };
+                    if !matches!(status.as_u16(), 403 | 408 | 410 | 425 | 429 | 500..=599) {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    let error = YtrustError::from(error);
+                    let retryable = error.is_retryable();
+                    last_error = Some(error);
+                    if !retryable {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            YtrustError::coded(ErrorCode::Network, "parallel range download failed")
+        }))
     }
 
     async fn download_http_once(
@@ -276,16 +474,9 @@ impl Downloader {
             progress.set_done(component, existing);
         }
 
-        let mut request = self
-            .client
-            .get(&format.url)
-            .header(reqwest::header::ACCEPT, "*/*")
-            .header(reqwest::header::REFERER, "https://www.youtube.com/")
-            .header(reqwest::header::USER_AGENT, format.user_agent)
+        let request = self
+            .media_request(format)
             .header(reqwest::header::RANGE, format!("bytes={existing}-"));
-        if let Some(cookies) = self.cookies_for(&format.url) {
-            request = request.header(reqwest::header::COOKIE, cookies);
-        }
 
         let response = request.send().await?;
         let status = response.status();
@@ -949,16 +1140,9 @@ impl Downloader {
         bar: &ProgressBar,
         written: &mut u64,
     ) -> Result<()> {
-        let mut request = self
-            .client
-            .get(&format.url)
-            .header(reqwest::header::REFERER, "https://www.youtube.com/")
-            .header(reqwest::header::USER_AGENT, format.user_agent)
-            .header(reqwest::header::ACCEPT, "*/*")
+        let request = self
+            .media_request(format)
             .header(reqwest::header::RANGE, "bytes=0-");
-        if let Some(cookies) = self.cookies_for(&format.url) {
-            request = request.header(reqwest::header::COOKIE, cookies);
-        }
         let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
@@ -1355,6 +1539,45 @@ async fn remove_part(
     Ok(())
 }
 
+fn parallel_ranges(total: u64, chunk_size: u64) -> Vec<(u64, u64)> {
+    if total == 0 || chunk_size == 0 {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0u64;
+    while start < total {
+        let end = start
+            .saturating_add(chunk_size)
+            .saturating_sub(1)
+            .min(total - 1);
+        ranges.push((start, end));
+        start = end.saturating_add(1);
+    }
+    ranges
+}
+
+async fn read_media_body(response: reqwest::Response, expected: u64) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(usize::try_from(expected.min(16 * 1024 * 1024)).unwrap_or(0));
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if (body.len() as u64).saturating_add(chunk.len() as u64) > expected {
+            return Err(YtrustError::coded(
+                ErrorCode::Network,
+                "range response exceeded the requested size",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if body.len() as u64 != expected {
+        return Err(YtrustError::coded(
+            ErrorCode::Network,
+            format!("incomplete range: {} of {expected} bytes", body.len()),
+        ));
+    }
+    Ok(body)
+}
+
 fn bytes_style() -> ProgressStyle {
     ProgressStyle::with_template(
         "{spinner:.green} {msg} {wide_bar:.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} {eta}",
@@ -1660,6 +1883,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn splits_parallel_download_ranges() {
+        assert!(parallel_ranges(0, 8).is_empty());
+        assert_eq!(parallel_ranges(20, 8), vec![(0, 7), (8, 15), (16, 19)]);
+        assert_eq!(parallel_ranges(8, 8), vec![(0, 7)]);
+        assert_eq!(parallel_ranges(9, 8), vec![(0, 7), (8, 8)]);
+        assert_eq!(
+            parallel_ranges(100, 10),
+            vec![
+                (0, 9),
+                (10, 19),
+                (20, 29),
+                (30, 39),
+                (40, 49),
+                (50, 59),
+                (60, 69),
+                (70, 79),
+                (80, 89),
+                (90, 99)
+            ]
+        );
+    }
+
+    #[test]
     fn parses_download_ranges() {
         let range = parse_range("*120-inf").unwrap().unwrap();
         assert_eq!(range.start, 120.0);
@@ -1752,6 +1998,7 @@ mod tests {
             audio_track_id: None,
             audio_is_default: false,
             language: None,
+            needs_challenge: false,
             user_agent: "test",
         };
         let first = format_part_path(Path::new("video.mkv"), &format, "audio");
@@ -1793,6 +2040,7 @@ mod tests {
             audio_track_id: None,
             audio_is_default: false,
             language: None,
+            needs_challenge: false,
             user_agent: "test",
         };
         let forbidden = YtrustError::HttpStatus {

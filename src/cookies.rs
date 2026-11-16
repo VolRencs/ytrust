@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use aes::Aes128;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
@@ -11,10 +12,14 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::error::{ErrorCode, Result, YtrustError};
+use crate::sync::MutexExt;
 use crate::util::unix_time_i64;
 
 /// Keep the Cookie header comfortably below common HTTP server/proxy limits.
 const MAX_COOKIE_HEADER_BYTES: usize = 16 * 1024;
+const COOKIE_HEADER_CACHE_TTL: Duration = Duration::from_secs(60);
+const COOKIE_HEADER_CACHE_CAPACITY: usize = 64;
+type HeaderCache = Mutex<HashMap<(String, String), (Instant, Option<String>)>>;
 
 /// Authentication and consent cookies that must survive size trimming.
 const ESSENTIAL_COOKIE_NAMES: &[&str] = &[
@@ -52,9 +57,28 @@ struct Cookie {
     host_only: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
+    headers: Arc<HeaderCache>,
+}
+
+impl Clone for CookieJar {
+    fn clone(&self) -> Self {
+        Self {
+            cookies: self.cookies.clone(),
+            headers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl Default for CookieJar {
+    fn default() -> Self {
+        Self {
+            cookies: Vec::new(),
+            headers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 impl CookieJar {
@@ -68,6 +92,15 @@ impl CookieJar {
     }
 
     fn header_for_path(&self, host: &str, path: &str) -> Option<String> {
+        let key = (host.to_string(), path.to_string());
+        {
+            let cache = self.headers.lock_unpoisoned();
+            if let Some((cached_at, value)) = cache.get(&key)
+                && cached_at.elapsed() < COOKIE_HEADER_CACHE_TTL
+            {
+                return value.clone();
+            }
+        }
         let now = unix_time_i64();
         let mut matched: Vec<&Cookie> = self
             .cookies
@@ -119,11 +152,23 @@ impl CookieJar {
             values.push(entry);
         }
 
-        (!values.is_empty()).then(|| values.join("; "))
+        let value = (!values.is_empty()).then(|| values.join("; "));
+        {
+            let mut cache = self.headers.lock_unpoisoned();
+            if cache.len() >= COOKIE_HEADER_CACHE_CAPACITY && !cache.contains_key(&key) {
+                cache.clear();
+            }
+            cache.insert(key, (Instant::now(), value.clone()));
+        }
+        value
     }
 
     pub fn merge(&mut self, mut other: CookieJar) {
         self.cookies.append(&mut other.cookies);
+        let mut cache = self.headers.lock_unpoisoned();
+        if !cache.is_empty() {
+            cache.clear();
+        }
     }
 
     fn insert(
@@ -155,6 +200,10 @@ impl CookieJar {
             expiry,
             host_only,
         });
+        let mut cache = self.headers.lock_unpoisoned();
+        if !cache.is_empty() {
+            cache.clear();
+        }
     }
 
     fn value_for_host(&self, name: &str, host: &str) -> Option<String> {
@@ -174,7 +223,7 @@ impl CookieJar {
 #[derive(Debug, Clone, Default)]
 pub struct LoadedCookies {
     pub header: Option<String>,
-    pub cookie_jar: CookieJar,
+    pub cookie_jar: Arc<CookieJar>,
     pub sapisid: Option<String>,
     pub sapisid1p: Option<String>,
     pub sapisid3p: Option<String>,
@@ -205,7 +254,7 @@ pub fn load(cookie_file: Option<&Path>, from_browser: Option<&str>) -> Result<Lo
         sapisid: jar.value_for_host("SAPISID", "www.youtube.com"),
         sapisid1p: jar.value_for_host("__Secure-1PAPISID", "www.youtube.com"),
         sapisid3p: jar.value_for_host("__Secure-3PAPISID", "www.youtube.com"),
-        cookie_jar: jar,
+        cookie_jar: Arc::new(jar),
     })
 }
 

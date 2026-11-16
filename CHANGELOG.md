@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.0
+
+### Added
+
+- `--concurrent-fragments N` now performs parallel range requests for direct
+  HTTP downloads (1-8 connections, default 1).
+- `--no-solve` for metadata-only CLI runs; `resolve(..., { solveChallenges: false })`
+  in the Node module. Unresolved formats are marked `needs_challenge: true`.
+- Shared in-memory player JS source cache between signature-timestamp extraction
+  and challenge solving.
+- `needs_challenge` and `playable` fields in JSON output.
+
+### Changed
+
+- Cookie jars are shared via `Arc` and Cookie headers are cached per host/path.
+- Node challenge timeout now matches the CLI solver timeout (30 seconds).
+- Normalize `*_tcl` player JS variants to `*_vflset` so EJS can solve
+  challenges when YouTube serves the newer variant.
+
 ## 1.2.0
 
 ### Added

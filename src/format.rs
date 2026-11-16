@@ -819,6 +819,7 @@ mod tests {
             audio_track_id: None,
             audio_is_default: false,
             language: None,
+            needs_challenge: false,
             user_agent: "test",
         }
     }

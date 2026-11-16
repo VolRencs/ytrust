@@ -109,6 +109,7 @@ const OPTION_KEYS = new Set([
   "playlistItems",
   "noPlaylist",
   "ensurePlayable",
+  "solveChallenges",
 ]);
 
 /** Options handled in JavaScript and never forwarded to the native addon. */
@@ -154,6 +155,9 @@ function normalizeOptions(options) {
   }
   if (normalized.ensurePlayable != null && typeof normalized.ensurePlayable !== "boolean") {
     throw new YtrustError("INVALID_INPUT", "ensurePlayable must be a boolean");
+  }
+  if (normalized.solveChallenges != null && typeof normalized.solveChallenges !== "boolean") {
+    throw new YtrustError("INVALID_INPUT", "solveChallenges must be a boolean");
   }
   return normalized;
 }
@@ -368,6 +372,7 @@ async function applyChallenges(result, options, formats = collectFormats(result)
       if (!cipher.s) {
         format.url = cipher.url;
         cipherResolved = Boolean(format.url);
+        if (cipherResolved) format.needs_challenge = false;
       } else {
         const sig = sigData[cipher.s] ?? SOLVED_SIG_CACHE.get(cacheKey(playerUrl, cipher.s));
         if (sig) {
@@ -384,6 +389,7 @@ async function applyChallenges(result, options, formats = collectFormats(result)
       if (cipherResolved) {
         delete format.signature_cipher;
         delete format.cipher;
+        format.needs_challenge = false;
       } else {
         formatUnresolved = true;
       }
@@ -396,6 +402,7 @@ async function applyChallenges(result, options, formats = collectFormats(result)
           const parsed = new URL(format.url);
           parsed.searchParams.set("n", replacement);
           format.url = parsed.toString();
+          format.needs_challenge = false;
         } catch {
           formatUnresolved = true;
         }
@@ -404,6 +411,7 @@ async function applyChallenges(result, options, formats = collectFormats(result)
       }
     }
     if (formatUnresolved) {
+      format.needs_challenge = true;
       unresolved += 1;
       UNRESOLVED_FORMATS.add(format);
     }
@@ -414,8 +422,21 @@ async function applyChallenges(result, options, formats = collectFormats(result)
   return result;
 }
 
+function needsChallenge(format) {
+  if (!format) return true;
+  if (format.needs_challenge != null) return Boolean(format.needs_challenge);
+  if (format.signature_cipher || format.cipher) return true;
+  return false;
+}
+
 function isPlayable(format) {
-  return Boolean(format && typeof format.url === "string" && format.url && !UNRESOLVED_FORMATS.has(format));
+  return Boolean(
+    format &&
+      typeof format.url === "string" &&
+      format.url &&
+      !needsChallenge(format) &&
+      !UNRESOLVED_FORMATS.has(format),
+  );
 }
 
 function markPlayable(result) {
@@ -531,7 +552,9 @@ export async function resolve(input, options = {}) {
     const normalized = normalizeOptions(options);
     const forwarded = nativeOptions(normalized);
     result = await requireNative().resolve(source, forwarded);
-    result = await applyChallenges(result, forwarded);
+    if (normalized.solveChallenges !== false) {
+      result = await applyChallenges(result, forwarded);
+    }
     if (result?.best_audio && !isPlayable(result.best_audio)) {
       const fallback = pickPlayableAudio(result.formats);
       if (fallback) result.best_audio = fallback;
@@ -550,6 +573,9 @@ export async function resolveAudio(input, options = {}) {
   try {
     const source = normalizeInput(input);
     const normalized = normalizeOptions(options);
+    if (normalized.solveChallenges === false) {
+      throw new YtrustError("INVALID_INPUT", "solveChallenges=false is not supported by resolveAudio");
+    }
     const forwarded = nativeOptions(normalized);
     const result = await requireNative().resolve(source, {
       ...forwarded,

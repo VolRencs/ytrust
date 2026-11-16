@@ -7,6 +7,11 @@ export interface ResolveOptions {
   playlistItems?: string;
   noPlaylist?: boolean;
   /**
+   * `resolve` only: set false to return resolved formats without solving
+   * signature/n challenges. Such formats are marked `playable: false`.
+   */
+  solveChallenges?: boolean;
+  /**
    * `resolveAudio` only: wait until the selected media URL passes YouTube's
    * CDN cold-start window before returning it. Retries transient 403s for a
    * few seconds. Defaults to false.
@@ -25,6 +30,8 @@ export interface Format {
   url: string | null;
   /** False when the URL still has an unresolved signature/n challenge. */
   playable?: boolean;
+  /** True when the format needs signature/n solving before it can be played. */
+  needs_challenge?: boolean;
   signature_cipher?: string | null;
   cipher?: string | null;
   ext: string;
