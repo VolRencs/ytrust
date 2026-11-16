@@ -1,6 +1,6 @@
 [package]
 name = "ytrust"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.100"
 description = "Fast, modern YouTube downloader"
