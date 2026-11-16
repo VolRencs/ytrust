@@ -26,10 +26,6 @@ pub struct Cli {
     #[arg(short = 'f', long, env = "YTRUST_FORMAT")]
     pub format: Option<String>,
 
-    /// Do not retry with a muxed format when streams are still rejected after cold-start retries (HTTP 403/410)
-    #[arg(long)]
-    pub no_fallback: bool,
-
     /// Output filename template. Supports {title}, {id}, {ext}, {height}, {uploader}, {playlist}, {playlist_index}
     #[arg(short = 'o', long, default_value = DEFAULT_OUTPUT, env = "YTRUST_OUTPUT")]
     pub output: String,
@@ -198,7 +194,7 @@ pub struct Cli {
     pub write_all_thumbnails: bool,
 
     /// List available audio tracks and exit
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["dump_json", "dump_single_json"])]
     pub list_audio_tracks: bool,
 
     /// Do not download anything
@@ -348,6 +344,9 @@ impl Cli {
                     "--progress-json cannot be combined with streaming media to stdout",
                 ));
             }
+            if media_mode && self.skip_download {
+                return Err(invalid("stdout output requires a media download"));
+            }
             if media_mode
                 && (self.extract_audio
                     || self.audio_format.is_some()
@@ -365,6 +364,17 @@ impl Cli {
         }
         if self.embed_subs && (self.extract_audio || self.audio_format.is_some()) {
             return Err(invalid("--embed-subs is not supported in audio-only mode"));
+        }
+        if self.embed_subs
+            && self.remux_video.as_deref().is_some_and(|container| {
+                container
+                    .trim_start_matches('.')
+                    .eq_ignore_ascii_case("webm")
+            })
+        {
+            return Err(invalid(
+                "--embed-subs requires an mp4/mov or mkv output container",
+            ));
         }
         if self.remux_video.is_some() && (self.extract_audio || self.audio_format.is_some()) {
             return Err(invalid("--remux-video is not supported in audio-only mode"));
@@ -462,13 +472,47 @@ mod tests {
     }
 
     #[test]
-    fn parses_no_fallback_flag() {
+    fn rejects_conflicting_audio_track_listing_and_json() {
+        assert!(
+            Cli::try_parse_from([
+                "ytrust",
+                "--list-audio-tracks",
+                "-J",
+                "https://www.youtube.com/watch?v=x",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ytrust",
+                "--list-audio-tracks",
+                "-j",
+                "https://www.youtube.com/watch?v=x",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_skip_download_stdout_and_webm_embedding() {
         let cli = Cli::try_parse_from([
             "ytrust",
-            "--no-fallback",
+            "--skip-download",
+            "-o",
+            "-",
             "https://www.youtube.com/watch?v=x",
         ])
         .unwrap();
-        assert!(cli.no_fallback);
+        assert!(cli.validate().is_err());
+
+        let cli = Cli::try_parse_from([
+            "ytrust",
+            "--embed-subs",
+            "--remux-video",
+            "webm",
+            "https://www.youtube.com/watch?v=x",
+        ])
+        .unwrap();
+        assert!(cli.validate().is_err());
     }
 }

@@ -76,7 +76,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -96,6 +96,27 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked -p ytrust --target ${{ matrix.target }}
+
+      - name: Check Linux glibc baseline
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 - "target/${{ matrix.target }}/release/ytrust" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          path = sys.argv[1]
+          output = subprocess.check_output(["readelf", "--version-info", path], text=True)
+          versions = [
+              tuple(int(part) for part in match.split("."))
+              for match in re.findall(r"GLIBC_(\d+\.\d+)", output)
+          ]
+          maximum = max(versions, default=(0, 0))
+          print(f"maximum required GLIBC: {maximum[0]}.{maximum[1]}")
+          if maximum > (2, 35):
+              sys.exit("release binary requires glibc newer than 2.35")
+          PY
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

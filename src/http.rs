@@ -33,6 +33,11 @@ pub struct RequestConfig {
     pub timeout: u64,
     /// Prefer the JSLess VisionOS client when no challenge solver is available.
     pub prefer_jsless: bool,
+    /// Resolve the player JS URL when a format still needs a challenge.
+    ///
+    /// Metadata-only runs can disable this to avoid fetching the watch page
+    /// solely to discover the player JS URL.
+    pub resolve_player_js: bool,
 }
 
 impl RequestConfig {
@@ -64,6 +69,7 @@ impl Default for RequestConfig {
             sapisid3p: None,
             timeout: DEFAULT_TIMEOUT_SECS,
             prefer_jsless: false,
+            resolve_player_js: true,
         }
     }
 }
@@ -102,6 +108,9 @@ pub fn client(config: &RequestConfig) -> Result<Client> {
     let mut builder = Client::builder()
         .connect_timeout(timeout)
         .read_timeout(timeout)
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .http2_adaptive_window(true)
         .user_agent(WEB_UA);
     if let Some(proxy) = &config.proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| {
@@ -209,16 +218,6 @@ pub async fn post_innertube<T: DeserializeOwned>(
                             ErrorCode::BotCheck,
                             "YouTube returned an HTML page instead of JSON; cookies may be required",
                         ));
-                    }
-                    if request.endpoint == "player" {
-                        let _ = std::fs::write(
-                            format!(
-                                "/tmp/opencode/player-{}-{}.json",
-                                request.client_name,
-                                std::process::id()
-                            ),
-                            &text,
-                        );
                     }
                     return serde_json::from_str(&text).map_err(YtrustError::from);
                 }
@@ -541,6 +540,8 @@ pub fn redact_url(url: &str) -> String {
     let Ok(mut url) = Url::parse(url) else {
         return "<invalid URL>".to_string();
     };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     if url.query().is_some() {
         url.set_query(Some("<redacted>"));
     }
@@ -578,6 +579,14 @@ mod tests {
         let redacted = redact_url("https://rr1.googlevideo.com/videoplayback?sig=secret&expire=1");
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("expire=1"));
+    }
+
+    #[test]
+    fn redacts_url_credentials() {
+        let redacted = redact_url("https://user:password@example.com/path?token=secret");
+        assert!(!redacted.contains("user"));
+        assert!(!redacted.contains("password"));
+        assert!(!redacted.contains("secret"));
     }
 
     #[tokio::test]

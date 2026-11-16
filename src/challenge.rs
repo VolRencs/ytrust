@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::error::{ErrorCode, Result, YtrustError};
+use crate::format::FormatSelection;
 use crate::http::RequestConfig;
 use crate::sync::MutexExt;
 use crate::youtube::{self, Format, VideoInfo};
@@ -169,17 +170,52 @@ impl ChallengeSolver {
         runtime.as_deref()
     }
 
-    pub fn available(&self) -> bool {
-        self.runtime.get().is_some_and(Option::is_some)
-    }
-
     pub async fn solve_formats(
         &self,
         info: &mut VideoInfo,
         config: &RequestConfig,
     ) -> Result<SolveReport> {
+        self.solve_internal(info, None, config).await
+    }
+
+    /// Solve challenges only for the formats selected for download.
+    ///
+    /// Challenge values are still applied to every format, but the solver
+    /// requests and player-JS work are limited to the formats the caller is
+    /// going to download.
+    pub async fn solve_selection(
+        &self,
+        info: &mut VideoInfo,
+        selection: &FormatSelection,
+        config: &RequestConfig,
+    ) -> Result<SolveReport> {
+        self.solve_internal(info, Some(selection), config).await
+    }
+
+    async fn solve_internal(
+        &self,
+        info: &mut VideoInfo,
+        selection: Option<&FormatSelection>,
+        config: &RequestConfig,
+    ) -> Result<SolveReport> {
         let mut report = SolveReport::default();
-        if !needs_challenges(info) {
+        let selected_formats: Vec<&Format> = selection
+            .map(|selection| {
+                selection
+                    .video
+                    .iter()
+                    .chain(selection.audios.iter())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let needs = if selection.is_some() {
+            selected_formats
+                .iter()
+                .any(|format| format_needs_challenge(format))
+        } else {
+            needs_challenges(info)
+        };
+        if !needs {
             return Ok(report);
         }
         let Some(runtime) = self.runtime().await else {
@@ -203,13 +239,17 @@ impl ChallengeSolver {
             },
         };
 
-        let (requests, sig_challenges, n_challenges) =
-            collect_requests(info, &player_url, &self.cache);
+        let (requests, sig_challenges, n_challenges) = if selection.is_some() {
+            collect_requests(selected_formats.iter().copied(), &player_url, &self.cache)
+        } else {
+            collect_requests(info.formats.iter(), &player_url, &self.cache)
+        };
         debug!(
-            "challenge solve: player={}, sig={}, n={}",
+            "challenge solve: player={}, sig={}, n={}, selected_only={}",
             player_url,
             sig_challenges.len(),
-            n_challenges.len()
+            n_challenges.len(),
+            selection.is_some()
         );
         let mut sig_values = cached_values(&self.cache, &player_url, true);
         let mut n_values = cached_values(&self.cache, &player_url, false);
@@ -317,22 +357,24 @@ impl ChallengeSolver {
 }
 
 pub fn needs_challenges(info: &VideoInfo) -> bool {
-    info.formats.iter().any(|format| {
-        format.signature_cipher.is_some()
-            || format.cipher.is_some()
-            || (!format.url.is_empty() && challenge_value(&format.url, "n").is_some())
-    })
+    info.formats.iter().any(format_needs_challenge)
 }
 
-fn collect_requests(
-    info: &VideoInfo,
+fn format_needs_challenge(format: &Format) -> bool {
+    format.signature_cipher.is_some()
+        || format.cipher.is_some()
+        || (!format.url.is_empty() && challenge_value(&format.url, "n").is_some())
+}
+
+fn collect_requests<'a>(
+    formats: impl IntoIterator<Item = &'a Format>,
     player_url: &str,
     cache: &Mutex<SolverCache>,
 ) -> (Vec<SolverRequest>, BTreeSet<String>, BTreeSet<String>) {
     let cache = cache.lock_unpoisoned();
     let mut sig = BTreeSet::new();
     let mut n = BTreeSet::new();
-    for format in &info.formats {
+    for format in formats {
         if let Some(raw) = format
             .signature_cipher
             .as_deref()

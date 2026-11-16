@@ -289,7 +289,7 @@ fn valid_id(id: &str) -> Option<String> {
 pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<VideoInfo> {
     let client = build_client(config)?;
     let mut errors = Vec::new();
-    let mut fallback = None;
+    let mut partial = None;
 
     for &client_kind in client_order(config) {
         tracing::debug!("trying YouTube player client {client_kind:?}");
@@ -312,7 +312,7 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
                         {
                             merge_watch_metadata(&mut info, watch);
                         }
-                        if !needs_player_js(&info) {
+                        if !config.resolve_player_js || !needs_player_js(&info) {
                             return Ok(info);
                         }
                         match player_js_url(video_id, config).await {
@@ -322,7 +322,7 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
                             }
                             Err(error) => errors.push(error),
                         }
-                        fallback = Some(info);
+                        partial = Some(info);
                     }
                     Ok(_) => {
                         errors.push(YtrustError::coded(
@@ -348,7 +348,7 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
         Err(error) => errors.push(error),
     }
 
-    if let Some(info) = fallback
+    if let Some(info) = partial
         && info.formats.iter().any(|format| !format.url.is_empty())
     {
         return Ok(info);
@@ -531,8 +531,14 @@ pub async fn fetch_player_source(url: &str, config: &RequestConfig) -> Result<St
             "player JS URL must use https and a youtube.com host",
         ));
     }
+    if let Some(source) = cached_player_source(url) {
+        return Ok(source);
+    }
     let client = build_client(config)?;
-    fetch_text_limited(&client, url, config, WEB_UA, None, MAX_PLAYER_JS_BYTES).await
+    let source =
+        fetch_text_limited(&client, url, config, WEB_UA, None, MAX_PLAYER_JS_BYTES).await?;
+    remember_player_source(url, &source);
+    Ok(source)
 }
 
 fn extract_player_js_url(html: &str) -> Option<String> {
@@ -1858,7 +1864,7 @@ fn parse_video_info(
         .collect();
 
     let (subtitles, automatic_captions) = parse_captions(captions);
-    let fallback_language = default_audio_language
+    let default_language = default_audio_language
         .or_else(|| {
             subtitles
                 .first()
@@ -1871,7 +1877,7 @@ fn parse_video_info(
         });
     for format in &mut formats {
         if format.has_audio && format.language.is_none() {
-            format.language = fallback_language.clone();
+            format.language = default_language.clone();
         }
     }
     let id = if details.video_id.is_empty() {

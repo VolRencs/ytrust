@@ -91,7 +91,7 @@ echo "merge"
 
 echo "cold 403 retry (video)"
 mkdir -p "$TMP/cold"
-"$YTRUST" "${args[@]}" --retries 0 --no-fallback -f 'bestvideo[height<=144]' \
+"$YTRUST" "${args[@]}" --retries 0 -f 'bestvideo[height<=144]' \
   -P "$TMP/cold" -o '%(id)s.%(ext)s' "$VIDEO" >/dev/null
 ls "$TMP/cold"/* >/dev/null
 

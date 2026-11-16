@@ -240,7 +240,7 @@ async function singleFlight(key, work) {
   return pending;
 }
 
-async function solveInWorker(player, requests, playerUrl) {
+async function solveInWorker(player, requests, playerUrl, loadPlayer) {
   const preprocessed = playerUrl ? PREPROCESSED_PLAYER_CACHE.get(playerUrl) : undefined;
   const { solve } = await import("./solver/pool.js");
   let output;
@@ -254,7 +254,10 @@ async function solveInWorker(player, requests, playerUrl) {
       PREPROCESSED_PLAYER_CACHE.delete(playerUrl);
     }
   }
-  if (!output) output = await solve(player, requests);
+  if (!output) {
+    const source = player || (loadPlayer ? await loadPlayer() : player);
+    output = await solve(source, requests);
+  }
 
   if (!usedPreprocessed && playerUrl && typeof output?.preprocessed_player === "string") {
     remember(PREPROCESSED_PLAYER_CACHE, playerUrl, output.preprocessed_player, PLAYER_JS_CACHE_LIMIT);
@@ -340,12 +343,15 @@ async function applyChallenges(result, options, formats = collectFormats(result)
   let nData = {};
   if (sigChallenges.size || nChallenges.size) {
     try {
-      const player = await playerSource(playerUrl, options);
       const requests = [];
       if (sigChallenges.size) requests.push({ type: "sig", challenges: [...sigChallenges].sort() });
       if (nChallenges.size) requests.push({ type: "n", challenges: [...nChallenges].sort() });
+      const preprocessed = playerUrl ? PREPROCESSED_PLAYER_CACHE.get(playerUrl) : undefined;
+      const player = preprocessed ? "" : await playerSource(playerUrl, options);
       const key = `${playerUrl}\u0000${JSON.stringify(requests)}`;
-      const output = await singleFlight(key, () => solveInWorker(player, requests, playerUrl));
+      const output = await singleFlight(key, () =>
+        solveInWorker(player, requests, playerUrl, () => playerSource(playerUrl, options)),
+      );
       const responses = Array.isArray(output?.responses) ? output.responses : [];
       const solved = responseData(responses, requests);
       sigData = solved.sig ?? {};
@@ -550,14 +556,17 @@ export async function resolve(input, options = {}) {
   try {
     const source = normalizeInput(input);
     const normalized = normalizeOptions(options);
+    if (normalized.ensurePlayable != null) {
+      throw new YtrustError("INVALID_INPUT", "ensurePlayable is only supported by resolveAudio");
+    }
     const forwarded = nativeOptions(normalized);
     result = await requireNative().resolve(source, forwarded);
     if (normalized.solveChallenges !== false) {
       result = await applyChallenges(result, forwarded);
     }
     if (result?.best_audio && !isPlayable(result.best_audio)) {
-      const fallback = pickPlayableAudio(result.formats);
-      if (fallback) result.best_audio = fallback;
+      const alternative = pickPlayableAudio(result.formats);
+      if (alternative) result.best_audio = alternative;
     }
     return markPlayable(result);
   } catch (error) {
@@ -608,8 +617,24 @@ export async function resolveAudio(input, options = {}) {
       throw new YtrustError(code, `no playable audio format found for ${source}`);
     }
 
-    if (normalized.ensurePlayable && !(await ensureFormatPlayable(chosen, normalized))) {
-      throw new YtrustError("HTTP", `audio URL is still rejected by YouTube after retries for ${source}`);
+    if (normalized.ensurePlayable) {
+      const ensureCandidates = candidates.filter(
+        (candidate) => isPlayable(candidate) && candidate.protocol !== "m3u8_native",
+      );
+      if (chosen && chosen.protocol !== "m3u8_native" && !ensureCandidates.includes(chosen)) {
+        ensureCandidates.unshift(chosen);
+      }
+      let ensured = null;
+      for (const candidate of ensureCandidates) {
+        if (await ensureFormatPlayable(candidate, normalized)) {
+          ensured = candidate;
+          break;
+        }
+      }
+      if (!ensured) {
+        throw new YtrustError("HTTP", `audio URL is still rejected by YouTube after retries for ${source}`);
+      }
+      chosen = ensured;
     }
 
     return {

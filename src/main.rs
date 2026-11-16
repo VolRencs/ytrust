@@ -16,11 +16,12 @@ use ytrust::api::{self, ResolveOptions, Resolved};
 use ytrust::challenge::{ChallengeSolver, SolveReport};
 use ytrust::constants::{DEFAULT_AUDIO_FORMAT, DEFAULT_FORMAT};
 use ytrust::cookies;
-use ytrust::download::{DownloadConfig, DownloadRange, Downloader, audio_codec, parse_range};
-use ytrust::error::{ErrorCode, Result, YtrustError};
-use ytrust::format::{
-    FormatSelection, FormatSelector, is_muxed_selection, muxed_fallback, print_formats,
+use ytrust::download::{
+    DownloadConfig, DownloadRange, Downloader, PARALLEL_CHUNK_BYTES, audio_codec, can_copy_audio,
+    parse_range,
 };
+use ytrust::error::{ErrorCode, Result, YtrustError};
+use ytrust::format::{FormatSelection, FormatSelector, print_formats};
 use ytrust::http::RequestConfig;
 use ytrust::json;
 use ytrust::output::{
@@ -117,6 +118,18 @@ async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
             format!("unsupported output encoding: {encoding}; only UTF-8 is supported"),
         ));
     }
+    let json_mode = if cli.dump_single_json {
+        JsonMode::Single
+    } else if cli.dump_json {
+        JsonMode::PerVideo
+    } else {
+        JsonMode::None
+    };
+    let simulate = cli.simulate;
+    let skip_media = cli.skip_download;
+    let solve_needed = !cli.no_solve
+        && (json_mode != JsonMode::None || (!cli.list_formats && !simulate && !skip_media));
+    let metadata_only = cli.no_solve || (json_mode == JsonMode::None && (simulate || skip_media));
     let cookies = cookies::load(cli.cookies.as_deref(), cli.cookies_from_browser.as_deref())?;
     if cookies.header.is_some() {
         debug!("loaded cookies");
@@ -135,7 +148,8 @@ async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
         sapisid1p: cookies.sapisid1p.clone(),
         sapisid3p: cookies.sapisid3p.clone(),
         timeout,
-        prefer_jsless: cli.prefer_jsless() || cli.no_solve,
+        prefer_jsless: cli.prefer_jsless() || metadata_only,
+        resolve_player_js: !metadata_only,
     };
     let retries = cli.fragment_retries.unwrap_or(cli.retries);
     let downloader = Downloader::new(DownloadConfig {
@@ -148,18 +162,15 @@ async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
         force_overwrites: cli.force_overwrites,
         quiet: cli.quiet,
         concurrent_fragments: cli.concurrent_fragments.unwrap_or(1),
+        parallel_chunk_bytes: PARALLEL_CHUNK_BYTES,
     })?;
-    let solver = ChallengeSolver::new(cli.js_runtimes.as_deref()).await?;
-
-    let json_mode = if cli.dump_single_json {
-        JsonMode::Single
-    } else if cli.dump_json {
-        JsonMode::PerVideo
+    let solver = ChallengeSolver::new(if solve_needed {
+        cli.js_runtimes.as_deref()
     } else {
-        JsonMode::None
-    };
-    let simulate = cli.simulate;
-    let skip_media = cli.skip_download;
+        None
+    })
+    .await?;
+
     let section = parse_range(cli.download_sections.as_deref().unwrap_or_default())?;
     let options = ResolveOptions {
         no_playlist: cli.no_playlist,
@@ -180,6 +191,7 @@ async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
         solver: &solver,
         selector: &selector,
         json_mode,
+        solve_needed,
         simulate,
         skip_media,
         section,
@@ -225,6 +237,7 @@ struct RunContext<'a> {
     solver: &'a ChallengeSolver,
     selector: &'a FormatSelector,
     json_mode: JsonMode,
+    solve_needed: bool,
     simulate: bool,
     skip_media: bool,
     section: Option<DownloadRange>,
@@ -343,16 +356,30 @@ async fn process_info(
         apply_audio_tracks(&mut info, &cli.audio_tracks)?;
     }
 
-    let solve_needed = !cli.no_solve
-        && (context.json_mode != JsonMode::None
-            || (!cli.list_formats && !context.simulate && !context.skip_media));
-    let solve_report = if solve_needed {
-        Some(
-            context
-                .solver
-                .solve_formats(&mut info, context.request_config)
-                .await?,
-        )
+    let solve_report = if context.solve_needed {
+        if context.json_mode == JsonMode::None {
+            // Downloads only need the formats that were actually selected.
+            // Select them before solving so muxed-only requests skip the
+            // solver entirely and adaptive requests solve only their streams.
+            let selection = context.selector.select_pre_solve(&info.formats)?;
+            if selection.needs_solving() {
+                Some(
+                    context
+                        .solver
+                        .solve_selection(&mut info, &selection, context.request_config)
+                        .await?,
+                )
+            } else {
+                None
+            }
+        } else {
+            Some(
+                context
+                    .solver
+                    .solve_formats(&mut info, context.request_config)
+                    .await?,
+            )
+        }
     } else {
         None
     };
@@ -427,26 +454,7 @@ async fn process_info(
             make_progress(context.events, &info, original_url, playlist, Vec::new());
         write_extras(&info, playlist, cli, downloader, extras_progress.as_ref()).await?
     };
-    match download_selection(&info, &primary, original_url, playlist, context, &extras).await {
-        Ok(()) => Ok(()),
-        Err(error) if should_try_fallback(&error, &primary, cli) => {
-            let Some(fallback) = muxed_fallback(&info, &primary) else {
-                return Err(error);
-            };
-            emit_fallback(context.events, &info, &primary, &fallback);
-            match fallback.single().and_then(|format| format.height) {
-                Some(height) => {
-                    status!(
-                        cli,
-                        "streams still rejected; retrying with a {height}p muxed format"
-                    )
-                }
-                None => status!(cli, "streams still rejected; retrying with a muxed format"),
-            }
-            download_selection(&info, &fallback, original_url, playlist, context, &extras).await
-        }
-        Err(error) => Err(error),
-    }
+    download_selection(&info, &primary, original_url, playlist, context, &extras).await
 }
 
 async fn download_selection(
@@ -556,54 +564,12 @@ async fn download_selection(
     .await
 }
 
-fn should_try_fallback(error: &YtrustError, selection: &FormatSelection, cli: &Cli) -> bool {
-    !cli.no_fallback && error.is_forbidden() && !is_muxed_selection(selection)
-}
-
 fn extras_requested(cli: &Cli) -> bool {
     cli.write_thumbnail
         || cli.write_all_thumbnails
         || cli.write_subs
         || cli.write_auto_subs
         || cli.embed_subs
-}
-
-fn selection_json(selection: &FormatSelection) -> serde_json::Value {
-    let formats: Vec<serde_json::Value> = selection
-        .video
-        .iter()
-        .chain(selection.audios.iter())
-        .map(|format| {
-            serde_json::json!({
-                "format_id": format.itag.to_string(),
-                "ext": format_ext(format),
-                "height": format.height,
-                "vcodec": format.video_codec,
-                "acodec": format.audio_codec,
-                "language": format.language,
-            })
-        })
-        .collect();
-    serde_json::json!({ "formats": formats })
-}
-
-fn emit_fallback(
-    events: Option<&EventSink>,
-    info: &VideoInfo,
-    from: &FormatSelection,
-    to: &FormatSelection,
-) {
-    let Some(events) = events else {
-        return;
-    };
-    events.emit(&serde_json::json!({
-        "v": 1,
-        "event": "fallback",
-        "id": info.id,
-        "reason": "http_forbidden",
-        "from": selection_json(from),
-        "to": selection_json(to),
-    }));
 }
 
 impl RunContext<'_> {
@@ -668,6 +634,24 @@ async fn download_video(
             progress.done(Some(&destination), "video", true, false, None);
         }
         return Ok(());
+    }
+
+    if !cli.embed_subs
+        && !cli.force_overwrites
+        && let Some(container) = cli.remux_video.as_deref()
+    {
+        let container = container
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        let final_path = destination.with_extension(&container);
+        if final_path != destination && path_is_file(&final_path).await {
+            status!(cli, "already downloaded: {}", final_path.to_string_lossy());
+            if let Some(progress) = progress {
+                progress.done(Some(&final_path), "video", true, false, None);
+            }
+            return Ok(());
+        }
     }
 
     let label = destination
@@ -783,8 +767,15 @@ async fn download_video(
             &audio_components[index],
         ));
     }
-    for result in futures_util::future::join_all(downloads).await {
-        result?;
+    let results = futures_util::future::join_all(downloads).await;
+    if let Some(error) = results.into_iter().find_map(Result::err) {
+        // Do not leave hidden, never-resumable intermediates behind when one
+        // of the parallel stream downloads failed.
+        let _ = tokio::fs::remove_file(&video_path).await;
+        for path in &audio_paths {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        return Err(error);
     }
 
     let audio_tracks: Vec<(PathBuf, Option<String>)> = audio_paths
@@ -972,6 +963,14 @@ async fn download_audio_only(
             return Err(YtrustError::FfmpegMissing);
         }
 
+        let copy = can_copy_audio(audio, &target_ext);
+        if copy && cli.audio_quality.is_some() {
+            status!(
+                cli,
+                "note: --audio-quality is ignored because the audio is copied without re-encoding"
+            );
+        }
+
         let source_path =
             intermediate_path(&destination, "source", audio.itag, Some(index), source_ext);
         downloader
@@ -994,6 +993,7 @@ async fn download_audio_only(
                 &format!("{label} [{target_ext}]"),
                 duration_secs,
                 cli.audio_quality.as_deref(),
+                copy,
                 progress,
             )
             .await;

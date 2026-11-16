@@ -128,6 +128,15 @@ test("resolve validates options before calling native code", async () => {
     },
   );
   await assert.rejects(
+    () => resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", { ensurePlayable: true }),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "INVALID_INPUT");
+      assert.match(error.message, /resolveAudio/);
+      return true;
+    },
+  );
+  await assert.rejects(
     // @ts-expect-error testing solveChallenges validation
     () => resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", { solveChallenges: "yes" }),
     (error) => {

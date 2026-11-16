@@ -210,6 +210,9 @@ impl Progress {
             return;
         };
         state.components[index].done = done;
+        // A resumed/restarted component should not make the aggregate speed
+        // include bytes that were already present before this run.
+        state.started = Instant::now();
         state.last_emit = Instant::now();
         let value = progress_value(&state);
         drop(state);
@@ -234,7 +237,7 @@ impl Progress {
         let mut state = self.state.lock_unpoisoned();
         state.phase = Some(PhaseState {
             processor: processor.to_string(),
-            percent: None,
+            percent: Some(0.0),
         });
         state.last_emit = Instant::now();
         let value = postprocess_value(&state, processor, "started", None);
@@ -333,21 +336,6 @@ impl Progress {
             "language": language,
             "skipped": skipped,
             "simulated": simulated,
-            "playlist_index": state.meta.playlist_index,
-            "playlist_count": state.meta.playlist_count,
-        });
-        drop(state);
-        self.sink.emit(&value);
-    }
-
-    pub fn error(&self, code: &str, message: &str) {
-        let state = self.state.lock_unpoisoned();
-        let value = json!({
-            "v": 1,
-            "event": "error",
-            "id": state.meta.id,
-            "code": code,
-            "message": message,
             "playlist_index": state.meta.playlist_index,
             "playlist_count": state.meta.playlist_count,
         });

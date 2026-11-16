@@ -80,8 +80,11 @@ challenge solver as the Node module and runs it through a detected Node.js
 runtime; pass `--js-runtimes none` to disable it, or `node:PATH` to select a
 specific binary. `--no-solve` skips challenge solving for `-J`, `-F`,
 `--simulate` and `--skip-download`; unresolved formats are marked with
-`needs_challenge: true` and `playable: false`. `--concurrent-fragments N`
-enables parallel range requests for direct HTTP media (1-8, default 1).
+`needs_challenge: true` and `playable: false`. Metadata-only modes
+(`--simulate`, `--skip-download` without JSON, `--no-solve`) prefer the JSLess
+client and do not resolve a player JS URL, so `player_js_url` may be `null`.
+`--concurrent-fragments N` enables parallel range requests for direct HTTP
+media (1-8, default 1).
 `--download-sections` accepts one range such as `*120-inf` or `*1:00-2:30`. `-j` prints one JSON object per video, while `-J` prints one object
 per URL (a playlist object for playlists). `-j --flat-playlist` emits playlist
 entries without fetching every video. `--ignore-errors` continues after a
@@ -92,16 +95,28 @@ writes nothing.
 Fresh googlevideo URLs can return a transient `403` for a few seconds while
 YouTube's CDN edge fetches the stream. ytrust retries the same URL with a short
 backoff (even when `--retries 0` is used) before treating the stream as
-rejected. If a `403`/`410` persists after those cold-start retries, ytrust
-retries once with a muxed format and reports a `fallback` progress event. Pass
-`--no-fallback` to disable the muxed retry.
+rejected. If a `403`/`410` persists after those retries, the selected format is
+reported as failed and any partial range state is preserved for a later retry.
+
+### Resume and partial files
+
+Direct HTTP downloads keep a hidden `<file>.part` and, for parallel range
+downloads, a `<file>.part.state` JSON file with the completed chunk indexes.
+If a range, network request or process is interrupted, `ytrust` keeps both
+files and retries only the missing ranges on the next run with the same input.
+It does not delete a partial video on parallel-download errors.
+
+A stale or incompatible state file is preserved as `<file>.part.orphan-*` and
+the download starts fresh instead of deleting the old data. A `<file>.part.lock`
+prevents two processes from writing the same partial file concurrently. To
+force a full reset, remove both the `.part` and `.part.state` files for that
+output.
 
 ### Progress JSON
 
 `--progress-json` writes newline-delimited JSON to stdout. Human status and
 progress bars stay on stderr. Events are versioned with `"v": 1` and include
-`start`, `progress`, `postprocess`, `file`, `done`, `error`, `fallback` and
-`playlist`.
+`start`, `progress`, `postprocess`, `file`, `done`, `error` and `playlist`.
 Every `done` event contains an absolute `filepath` for the final media file
 when a file was written; simulate/skip events may report `null`. Bytes, speed
 and ETA are aggregated across separate video/audio downloads; the

@@ -27,6 +27,9 @@ const { resolveAudio } = require("ytrust");
 - `YtrustError` — error class with a stable `code`.
 - `errorCode(message)` — classify a raw error message.
 
+Setting `solveChallenges: false` on `resolve` skips player JS URL resolution as
+well, so `player_js_url` may be `null`.
+
 Every format includes `http_headers`, `expires_at`, `is_hls`, `language`,
 `filesize_approx` (when it can be estimated) and `playable` (false while a
 signature/`n` challenge is unresolved). `playable: true` means the URL is

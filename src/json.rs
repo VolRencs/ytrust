@@ -129,7 +129,7 @@ fn format_json(format: &Format, duration_secs: Option<u64>) -> Value {
         "height": format.height,
         "fps": format.fps,
         "tbr": format.bitrate as f64 / 1_000.0,
-        "filesize": format.content_length,
+        "filesize": format.content_length.filter(|length| *length > 0),
         "filesize_approx": filesize_approx,
         "language": format.language,
         "resolution": resolution,

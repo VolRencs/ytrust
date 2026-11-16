@@ -23,6 +23,13 @@ impl FormatSelection {
     pub fn needs_merge(&self) -> bool {
         self.video.is_some() && !self.audios.is_empty()
     }
+
+    pub fn needs_solving(&self) -> bool {
+        self.video
+            .iter()
+            .chain(self.audios.iter())
+            .any(|format| format.needs_challenge)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +45,16 @@ enum Kind {
     WorstAudio,
     BestExt,
     Exact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionMode {
+    /// Only formats that are ready to download: a direct URL and no pending
+    /// signature/n challenge.
+    Resolved,
+    /// Formats that can be selected before challenge solving: either they
+    /// already have a direct URL or they carry a cipher that can be solved.
+    PreSolve,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -63,8 +80,13 @@ struct Filter {
 }
 
 impl Filter {
-    fn matches(&self, value: &Format) -> bool {
-        if value.url.is_empty() {
+    fn matches(&self, value: &Format, mode: SelectionMode) -> bool {
+        let has_source =
+            !value.url.is_empty() || value.signature_cipher.is_some() || value.cipher.is_some();
+        if !has_source {
+            return false;
+        }
+        if mode == SelectionMode::Resolved && (value.url.is_empty() || value.needs_challenge) {
             return false;
         }
         if let Some(limit) = self.height_lte
@@ -269,7 +291,7 @@ impl Component {
 fn is_known_ext(value: &str) -> bool {
     matches!(
         value,
-        "mp4" | "webm" | "m4a" | "mp3" | "opus" | "flac" | "wav" | "3gp" | "mkv" | "ogg"
+        "mp4" | "webm" | "m4a" | "aac" | "mp3" | "opus" | "flac" | "wav" | "3gp" | "mkv" | "ogg"
     )
 }
 
@@ -395,9 +417,20 @@ impl FormatSelector {
     }
 
     pub fn select(&self, formats: &[Format]) -> Result<FormatSelection> {
+        self.select_with_mode(formats, SelectionMode::Resolved)
+    }
+
+    /// Select the formats that a download should attempt before challenge
+    /// solving. Ciphered formats are eligible so the solver only has to work
+    /// on the formats that will actually be downloaded.
+    pub fn select_pre_solve(&self, formats: &[Format]) -> Result<FormatSelection> {
+        self.select_with_mode(formats, SelectionMode::PreSolve)
+    }
+
+    fn select_with_mode(&self, formats: &[Format], mode: SelectionMode) -> Result<FormatSelection> {
         let mut last_error = None;
         for parts in &self.alternatives {
-            match select_alternative(formats, parts) {
+            match select_alternative(formats, parts, mode) {
                 Ok(selection) => return Ok(selection),
                 Err(error) => last_error = Some(error),
             }
@@ -412,25 +445,29 @@ pub fn select(info: &VideoInfo, expression: &str) -> Result<FormatSelection> {
     FormatSelector::parse(expression)?.select(&info.formats)
 }
 
-fn select_alternative(formats: &[Format], parts: &[Component]) -> Result<FormatSelection> {
+fn select_alternative(
+    formats: &[Format],
+    parts: &[Component],
+    mode: SelectionMode,
+) -> Result<FormatSelection> {
     let mut video = None;
     let mut audios = Vec::new();
     for component in parts {
         match component.kind {
             Kind::BestVideo | Kind::BestVideoAny | Kind::WorstVideo => {
-                let format = choose_video(formats, component)?;
+                let format = choose_video(formats, component, mode)?;
                 set_video(&mut video, format, &component.argument)?;
             }
             Kind::BestAudio | Kind::WorstAudio => {
-                let format = choose_audio(formats, component)?;
+                let format = choose_audio(formats, component, mode)?;
                 push_audio(&mut audios, format);
             }
             Kind::BestAudioAny => {
-                let format = choose_audio_any(formats, component)?;
+                let format = choose_audio_any(formats, component, mode)?;
                 push_audio(&mut audios, format);
             }
             Kind::Best | Kind::BestAny | Kind::Worst | Kind::BestExt | Kind::Exact => {
-                let format = choose_single(formats, component)?;
+                let format = choose_single(formats, component, mode)?;
                 if is_audio_only(&format) {
                     push_audio(&mut audios, format);
                 } else {
@@ -476,9 +513,9 @@ fn push_audio(audios: &mut Vec<Format>, format: Format) {
     }
 }
 
-fn choose_single(formats: &[Format], component: &Component) -> Result<Format> {
+fn choose_single(formats: &[Format], component: &Component, mode: SelectionMode) -> Result<Format> {
     let candidates = formats.iter().filter(|format| {
-        component.filter.matches(format)
+        component.filter.matches(format, mode)
             && format_matches_kind(format, component)
             && !(matches!(component.kind, Kind::Worst) && format.is_hls)
     });
@@ -492,11 +529,12 @@ fn choose_single(formats: &[Format], component: &Component) -> Result<Format> {
         .ok_or_else(|| YtrustError::FormatNotFound(component.argument.clone()))
 }
 
-fn choose_video(formats: &[Format], component: &Component) -> Result<Format> {
+fn choose_video(formats: &[Format], component: &Component, mode: SelectionMode) -> Result<Format> {
     let candidates = formats.iter().filter(|format| {
         format.has_video
-            && component.filter.matches(format)
+            && component.filter.matches(format, mode)
             && format_matches_video_kind(format, component)
+            && !(matches!(component.kind, Kind::WorstVideo) && format.is_hls)
     });
     let selected = if matches!(component.kind, Kind::WorstVideo) {
         candidates.min_by(|a, b| compare_video(a, b))
@@ -508,10 +546,10 @@ fn choose_video(formats: &[Format], component: &Component) -> Result<Format> {
         .ok_or_else(|| YtrustError::FormatNotFound(format!("{} (video)", component.argument)))
 }
 
-fn choose_audio(formats: &[Format], component: &Component) -> Result<Format> {
-    let candidates = formats
-        .iter()
-        .filter(|format| format.has_audio && !format.has_video && component.filter.matches(format));
+fn choose_audio(formats: &[Format], component: &Component, mode: SelectionMode) -> Result<Format> {
+    let candidates = formats.iter().filter(|format| {
+        format.has_audio && !format.has_video && component.filter.matches(format, mode)
+    });
     let selected = if matches!(component.kind, Kind::WorstAudio) {
         candidates.min_by(|a, b| compare_audio(a, b))
     } else {
@@ -522,10 +560,14 @@ fn choose_audio(formats: &[Format], component: &Component) -> Result<Format> {
         .ok_or_else(|| YtrustError::FormatNotFound(format!("{} (audio)", component.argument)))
 }
 
-fn choose_audio_any(formats: &[Format], component: &Component) -> Result<Format> {
+fn choose_audio_any(
+    formats: &[Format],
+    component: &Component,
+    mode: SelectionMode,
+) -> Result<Format> {
     formats
         .iter()
-        .filter(|format| format.has_audio && component.filter.matches(format))
+        .filter(|format| format.has_audio && component.filter.matches(format, mode))
         .max_by(|a, b| compare_audio(a, b))
         .cloned()
         .ok_or_else(|| YtrustError::FormatNotFound(format!("{} (audio)", component.argument)))
@@ -547,77 +589,10 @@ fn format_matches_kind(format: &Format, component: &Component) -> bool {
 }
 
 fn is_audio_ext(value: &str) -> bool {
-    matches!(value, "m4a" | "mp3" | "opus" | "flac" | "wav" | "ogg")
-}
-
-/// A selection that is already a single file with both video and audio.
-pub fn is_muxed_selection(selection: &FormatSelection) -> bool {
-    selection
-        .single()
-        .is_some_and(|format| format.has_video && format.has_audio)
-}
-
-/// Builds a muxed fallback selection for adaptive streams rejected by YouTube.
-///
-/// Prefers a muxed format no taller than the originally requested height and
-/// falls back to the best muxed format when the requested height has no muxed
-/// variant.
-pub fn muxed_fallback(info: &VideoInfo, selection: &FormatSelection) -> Option<FormatSelection> {
-    if is_muxed_selection(selection) {
-        return None;
-    }
-    let height = selection
-        .video
-        .as_ref()
-        .and_then(|format| format.height)
-        .or_else(|| {
-            selection
-                .audios
-                .iter()
-                .filter_map(|format| format.height)
-                .max()
-        });
-    let mut expressions = Vec::new();
-    if let Some(height) = height {
-        expressions.push(format!("best[height<={height}]"));
-    }
-    expressions.push("best".to_owned());
-    let selected_itags = selection_itags(selection);
-    for expression in expressions {
-        let Ok(selector) = FormatSelector::parse(&expression) else {
-            continue;
-        };
-        let Ok(candidate) = selector.select(&info.formats) else {
-            continue;
-        };
-        if selection_itags(&candidate) == selected_itags {
-            continue;
-        }
-        // Preserve an audio-only request: use the muxed stream as the audio
-        // source so `download_audio_only` extracts it instead of saving video.
-        if selection.video.is_none() {
-            let Some(audio) = candidate.single().cloned() else {
-                continue;
-            };
-            return Some(FormatSelection {
-                video: None,
-                audios: vec![audio],
-            });
-        }
-        return Some(candidate);
-    }
-    None
-}
-
-fn selection_itags(selection: &FormatSelection) -> Vec<u64> {
-    let mut itags: Vec<u64> = selection
-        .video
-        .iter()
-        .chain(selection.audios.iter())
-        .map(|format| format.itag)
-        .collect();
-    itags.sort_unstable();
-    itags
+    matches!(
+        value,
+        "m4a" | "aac" | "mp3" | "opus" | "flac" | "wav" | "ogg"
+    )
 }
 
 fn format_matches_video_kind(format: &Format, component: &Component) -> bool {
@@ -648,18 +623,22 @@ pub fn best_audio(info: &VideoInfo) -> Option<&Format> {
     };
     info.formats
         .iter()
-        .filter(|format| format.has_audio && !format.is_hls && !format.url.is_empty())
+        .filter(|format| {
+            format.has_audio && !format.is_hls && !format.url.is_empty() && !format.needs_challenge
+        })
         .max_by_key(|format| key(format))
         .or_else(|| {
             info.formats
                 .iter()
-                .filter(|format| format.has_audio && !format.url.is_empty())
+                .filter(|format| {
+                    format.has_audio && !format.url.is_empty() && !format.needs_challenge
+                })
                 .max_by_key(|format| key(format))
         })
         .or_else(|| {
             info.formats
                 .iter()
-                .filter(|format| format.has_audio && !format.is_hls)
+                .filter(|format| format.has_audio && !format.is_hls && !format.needs_challenge)
                 .max_by_key(|format| key(format))
         })
         .or_else(|| {
@@ -919,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn bestaudio_star_accepts_muxed_fallback() {
+    fn bestaudio_star_accepts_muxed() {
         let info = info(vec![format(18, true, true, Some(360), None)]);
         let selection = select(&info, "bestaudio*").unwrap();
         assert_eq!(selection.single().unwrap().itag, 18);
@@ -972,55 +951,6 @@ mod tests {
     }
 
     #[test]
-    fn muxed_fallback_replaces_adaptive_selection() {
-        let info = info(vec![
-            format(137, true, false, Some(1080), None),
-            format(251, false, true, None, Some(160_000)),
-            format(18, true, true, Some(360), Some(96_000)),
-        ]);
-        let primary = select(&info, "bestvideo+bestaudio").unwrap();
-        assert!(primary.needs_merge());
-        let fallback = muxed_fallback(&info, &primary).unwrap();
-        assert!(is_muxed_selection(&fallback));
-        assert_eq!(fallback.single().unwrap().itag, 18);
-    }
-
-    #[test]
-    fn muxed_fallback_ignores_height_when_no_muxed_variant_matches() {
-        let info = info(vec![
-            format(160, true, false, Some(144), None),
-            format(251, false, true, None, Some(160_000)),
-            format(18, true, true, Some(360), Some(96_000)),
-        ]);
-        let primary = select(&info, "bestvideo[height<=144]+bestaudio").unwrap();
-        let fallback = muxed_fallback(&info, &primary).unwrap();
-        assert_eq!(fallback.single().unwrap().itag, 18);
-    }
-
-    #[test]
-    fn muxed_fallback_is_not_used_for_muxed_single() {
-        let info = info(vec![format(18, true, true, Some(360), Some(96_000))]);
-        let primary = select(&info, "best").unwrap();
-        assert!(is_muxed_selection(&primary));
-        assert!(muxed_fallback(&info, &primary).is_none());
-    }
-
-    #[test]
-    fn muxed_fallback_handles_audio_only_selection() {
-        let info = info(vec![
-            format(251, false, true, None, Some(160_000)),
-            format(18, true, true, Some(360), Some(96_000)),
-        ]);
-        let primary = select(&info, "bestaudio").unwrap();
-        let fallback = muxed_fallback(&info, &primary).unwrap();
-        assert!(fallback.video.is_none());
-        assert_eq!(fallback.audios.len(), 1);
-        assert_eq!(fallback.audios[0].itag, 18);
-        assert!(fallback.audios[0].has_video);
-        assert!(fallback.audios[0].has_audio);
-    }
-
-    #[test]
     fn parses_selector_once_and_reuses_it() {
         let selector = FormatSelector::parse("bestvideo+bestaudio/best").unwrap();
         let info = info(vec![
@@ -1031,5 +961,31 @@ mod tests {
         assert!(selection.needs_merge());
         assert_eq!(selection.video.unwrap().itag, 137);
         assert_eq!(selection.audios[0].itag, 251);
+    }
+
+    #[test]
+    fn presolve_selects_ciphered_formats_but_resolved_selection_rejects_them() {
+        let mut ciphered = format(137, true, false, Some(1080), None);
+        ciphered.url.clear();
+        ciphered.signature_cipher = Some(
+            "s=abc&url=https%3A%2F%2Frr1.googlevideo.com%2Fvideoplayback%3Fitag%3D137".to_string(),
+        );
+        ciphered.needs_challenge = true;
+        let info = info(vec![ciphered]);
+        let selector = FormatSelector::parse("bestvideo").unwrap();
+
+        assert!(selector.select(&info.formats).is_err());
+        let selection = selector.select_pre_solve(&info.formats).unwrap();
+        assert_eq!(selection.single().unwrap().itag, 137);
+        assert!(selection.needs_solving());
+    }
+
+    #[test]
+    fn best_audio_prefers_a_resolved_format_over_an_unresolved_higher_bitrate() {
+        let mut unresolved = format(251, false, true, None, Some(160_000));
+        unresolved.needs_challenge = true;
+        let resolved = format(140, false, true, None, Some(64_000));
+        let info = info(vec![unresolved, resolved]);
+        assert_eq!(best_audio(&info).unwrap().itag, 140);
     }
 }

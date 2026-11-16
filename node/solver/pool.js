@@ -2,6 +2,7 @@ import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 
 const TASK_TIMEOUT_MS = 30_000;
+const IDLE_TIMEOUT_MS = 60_000;
 const MAX_QUEUE = 64;
 const configured = Number.parseInt(process.env.YTRUST_SOLVER_THREADS ?? "", 10);
 const MAX_WORKERS = Math.max(
@@ -24,7 +25,7 @@ function createSlot() {
       stackSizeMb: 4,
     },
   });
-  const slot = { worker, task: null, timer: null, dead: false };
+  const slot = { worker, task: null, timer: null, idleTimer: null, dead: false };
   worker.unref();
   worker.on("message", (message) => {
     if (slot.dead) return;
@@ -48,13 +49,40 @@ function finishTask(slot) {
   slot.timer = null;
   slot.task = null;
   slot.worker.unref();
+  scheduleIdle(slot);
+}
+
+function scheduleIdle(slot) {
+  if (slot.idleTimer) clearTimeout(slot.idleTimer);
+  slot.idleTimer = setTimeout(() => {
+    slot.idleTimer = null;
+    if (!slot.dead && !slot.task) retireSlot(slot);
+  }, IDLE_TIMEOUT_MS);
+  slot.idleTimer.unref();
+}
+
+function retireSlot(slot) {
+  if (slot.dead) return;
+  slot.dead = true;
+  if (slot.timer) clearTimeout(slot.timer);
+  if (slot.idleTimer) clearTimeout(slot.idleTimer);
+  slot.timer = null;
+  slot.idleTimer = null;
+  const index = slots.indexOf(slot);
+  if (index >= 0) slots.splice(index, 1);
+  slot.worker.terminate().catch(() => {});
+  dispatch();
 }
 
 function failSlot(slot, error) {
   if (slot.dead) return;
   slot.dead = true;
   const task = slot.task;
-  finishTask(slot);
+  if (slot.timer) clearTimeout(slot.timer);
+  if (slot.idleTimer) clearTimeout(slot.idleTimer);
+  slot.timer = null;
+  slot.idleTimer = null;
+  slot.task = null;
   const index = slots.indexOf(slot);
   if (index >= 0) slots.splice(index, 1);
   slot.worker.terminate().catch(() => {});
@@ -79,6 +107,8 @@ function dispatch() {
     }
     if (!slot) return;
     const task = queue.shift();
+    if (slot.idleTimer) clearTimeout(slot.idleTimer);
+    slot.idleTimer = null;
     slot.task = task;
     slot.worker.ref();
     slot.timer = setTimeout(() => {

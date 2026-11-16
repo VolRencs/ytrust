@@ -105,6 +105,7 @@ async fn request_config(
         sapisid3p: cookies.sapisid3p,
         timeout,
         prefer_jsless: options.solve_challenges == Some(false),
+        resolve_player_js: options.solve_challenges != Some(false),
     };
     let core = CoreResolveOptions {
         no_playlist: options.no_playlist.unwrap_or(false),

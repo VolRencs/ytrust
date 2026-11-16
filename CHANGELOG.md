@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.4.0
+
+### Added
+
+- Resumable parallel range downloads. A `.part.state` sidecar records completed
+  chunks; interrupted downloads retry only missing ranges and never delete the
+  partial media file on range errors. Incompatible state is quarantined as
+  `.orphan-*`, and a `.part.lock` prevents concurrent writers.
+- Selective challenge solving for downloads: the CLI now pre-selects formats
+  and solves only the selected video/audio streams. Muxed-only requests skip
+  the solver entirely.
+- Fast metadata mode for `--simulate`, `--skip-download` and `--no-solve`:
+  these paths prefer the JSLess client and do not resolve a player JS URL.
+- `-c:a copy` extraction/remux for compatible audio codecs, avoiding
+  AAC→AAC and Opus→Opus re-encoding.
+- Node idle solver workers are retired after 60 seconds, and preprocessed
+  player data is reused without transferring the raw player source again.
+
+### Fixed
+
+- Removed a leftover debug dump of player responses.
+- Parallel downloads no longer start without a known content length or fall
+  back to a single connection on the same sparse `.part`.
+- Fixed container extension mapping for 3GP, Matroska, FLAC, Opus, M4A, MP3,
+  WAV and MOV formats.
+- Formats with unresolved challenges are no longer selected for download.
+- Merge failures clean up intermediate streams, and an existing remux target
+  no longer leaves the redundant merged file behind.
+- FFmpeg error redaction handles `Authorization` before `Cookie`, proxy
+  authorization and URL credentials.
+- Release CLI builds use an Ubuntu 22.04 glibc baseline and are checked in CI.
+- `--list-audio-tracks` conflicts with `-J`/`-j`; `--skip-download -o -` and
+  `--embed-subs --remux-video webm` fail before network access.
+- `resolve()` rejects `ensurePlayable` instead of silently ignoring it.
+- System HTTP proxies and zstd responses are supported by the HTTP client.
+
+### Removed
+
+- The automatic muxed fallback and the `--no-fallback` flag. A persistent
+  `403`/`410` now fails the selected format instead of silently switching to a
+  lower-quality muxed stream; partial range state remains for an explicit retry.
+
 ## 1.3.0
 
 ### Added

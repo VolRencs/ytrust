@@ -269,19 +269,23 @@ pub fn format_ext(format: &Format) -> &'static str {
     match format.container.as_str() {
         "mp4" if !format.has_video => "m4a",
         "mp4" => "mp4",
+        "m4a" | "mp4a" | "x-m4a" => "m4a",
+        "aac" => "aac",
         "webm" => "webm",
-        "3gpp" => "3gp",
-        "x-matroska" | "matroska" => "mkv",
+        "3gp" | "3gpp" | "3gpp2" => "3gp",
+        "mkv" | "x-matroska" | "matroska" => "mkv",
         "mpeg" if format.has_video => "mpg",
-        "mpeg" => "mp3",
-        "ogg" => "ogg",
-        "quicktime" => "mov",
+        "mpeg" | "mp3" | "mpga" => "mp3",
+        "ogg" | "oga" => "ogg",
+        "opus" => "opus",
+        "flac" | "x-flac" => "flac",
+        "wav" | "x-wav" => "wav",
+        "quicktime" | "mov" => "mov",
+        "m4v" => "m4v",
+        "flv" => "flv",
+        "avi" => "avi",
         _ => "bin",
     }
-}
-
-pub fn merged_ext(video_ext: &str, audio_ext: &str, override_ext: Option<&str>) -> String {
-    merged_ext_multi(video_ext, &[audio_ext], override_ext)
 }
 
 pub fn merged_ext_multi(
@@ -393,5 +397,51 @@ mod tests {
         };
         let path = render_path("%(title)s [%(id)s].%(ext)s", &ctx, None, false).unwrap();
         assert_eq!(path, PathBuf::from("A_B_ Test_ [abc123].mp4"));
+    }
+
+    #[test]
+    fn maps_container_extensions() {
+        let format = |container: &str, has_video: bool| Format {
+            itag: 1,
+            url: "https://example.com/media".to_string(),
+            signature_cipher: None,
+            cipher: None,
+            container: container.to_string(),
+            video_codec: has_video.then(|| "avc1".to_string()),
+            audio_codec: Some("opus".to_string()),
+            has_video,
+            has_audio: true,
+            width: None,
+            height: None,
+            fps: None,
+            bitrate: 1,
+            audio_bitrate: None,
+            content_length: Some(1),
+            quality_label: None,
+            is_hls: false,
+            is_live: false,
+            audio_track_name: None,
+            audio_track_id: None,
+            audio_is_default: false,
+            language: None,
+            needs_challenge: false,
+            user_agent: "test",
+        };
+
+        assert_eq!(format_ext(&format("mp4", true)), "mp4");
+        assert_eq!(format_ext(&format("mp4", false)), "m4a");
+        assert_eq!(format_ext(&format("m4a", false)), "m4a");
+        assert_eq!(format_ext(&format("webm", true)), "webm");
+        assert_eq!(format_ext(&format("3gp", true)), "3gp");
+        assert_eq!(format_ext(&format("3gpp", true)), "3gp");
+        assert_eq!(format_ext(&format("mkv", true)), "mkv");
+        assert_eq!(format_ext(&format("x-matroska", true)), "mkv");
+        assert_eq!(format_ext(&format("mpeg", true)), "mpg");
+        assert_eq!(format_ext(&format("mpeg", false)), "mp3");
+        assert_eq!(format_ext(&format("opus", false)), "opus");
+        assert_eq!(format_ext(&format("flac", false)), "flac");
+        assert_eq!(format_ext(&format("wav", false)), "wav");
+        assert_eq!(format_ext(&format("quicktime", true)), "mov");
+        assert_eq!(format_ext(&format("unknown", true)), "bin");
     }
 }

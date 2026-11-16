@@ -1,11 +1,16 @@
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{IsTerminal, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::FutureExt;
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
@@ -25,8 +30,10 @@ const MAX_FFMPEG_STDERR_BYTES: usize = 64 * 1024;
 const COLD_START_MIN_ATTEMPTS: u32 = 5;
 const COLD_START_BASE_DELAY_MS: u64 = 500;
 const PARALLEL_MIN_BYTES: u64 = 16 * 1024 * 1024;
-const PARALLEL_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+pub const PARALLEL_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CONCURRENT_FRAGMENTS: u32 = 8;
+const PARALLEL_STATE_VERSION: u32 = 1;
+const MAX_PARALLEL_CHUNKS: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
@@ -39,6 +46,155 @@ pub struct DownloadConfig {
     pub force_overwrites: bool,
     pub quiet: bool,
     pub concurrent_fragments: u32,
+    pub parallel_chunk_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ParallelState {
+    version: u32,
+    itag: u64,
+    component: String,
+    total: u64,
+    chunk_size: u64,
+    completed: Vec<usize>,
+}
+
+impl ParallelState {
+    fn new(format: &Format, component: &str, total: u64, chunk_size: u64) -> Self {
+        Self {
+            version: PARALLEL_STATE_VERSION,
+            itag: format.itag,
+            component: component.to_string(),
+            total,
+            chunk_size,
+            completed: Vec::new(),
+        }
+    }
+
+    fn chunk_count(&self) -> Option<usize> {
+        if self.chunk_size == 0 || self.total == 0 {
+            return None;
+        }
+        usize::try_from(self.total.div_ceil(self.chunk_size)).ok()
+    }
+
+    fn valid_for(&self, format: &Format, component: &str, total: u64) -> bool {
+        self.version == PARALLEL_STATE_VERSION
+            && self.itag == format.itag
+            && self.component == component
+            && self.total == total
+            && self.chunk_size > 0
+            && self.chunk_count().is_some_and(|count| {
+                count > 0
+                    && count <= MAX_PARALLEL_CHUNKS
+                    && self.completed.iter().all(|index| *index < count)
+            })
+    }
+}
+
+struct PartLock {
+    file: std::fs::File,
+}
+
+impl PartLock {
+    fn acquire(part: &Path) -> Result<Self> {
+        let path = parallel_lock_path(part);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(YtrustError::coded(
+                ErrorCode::Io,
+                format!(
+                    "output is already being downloaded by another process: {}",
+                    part.display()
+                ),
+            )),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for PartLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn parallel_state_path(part: &Path) -> PathBuf {
+    append_suffix(part, ".state")
+}
+
+fn parallel_temp_state_path(part: &Path) -> PathBuf {
+    append_suffix(part, &format!(".state.tmp.{}", std::process::id()))
+}
+
+fn parallel_lock_path(part: &Path) -> PathBuf {
+    append_suffix(part, ".lock")
+}
+
+fn orphan_suffix() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!(".orphan-{millis}-{}", std::process::id())
+}
+
+async fn persist_parallel_state(part: &Path, state: &ParallelState) -> Result<()> {
+    let path = parallel_state_path(part);
+    let temp = parallel_temp_state_path(part);
+    let bytes = serde_json::to_vec(state)?;
+    if let Err(error) = tokio::fs::write(&temp, &bytes).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error.into());
+    }
+    if let Err(error) = replace_file(&temp, &path).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn quarantine_file(path: &Path) -> Result<()> {
+    if !is_file(path).await {
+        return Ok(());
+    }
+    let orphan = append_suffix(path, &orphan_suffix());
+    tokio::fs::rename(path, &orphan).await?;
+    warn!(
+        "preserved incompatible partial file as {}",
+        orphan.display()
+    );
+    Ok(())
+}
+
+async fn quarantine_parallel_pair(part: &Path) -> Result<()> {
+    let state = parallel_state_path(part);
+    let state_existed = is_file(&state).await;
+    let orphan_state = append_suffix(&state, &orphan_suffix());
+    if state_existed {
+        tokio::fs::rename(&state, &orphan_state).await?;
+    }
+    match quarantine_file(part).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if state_existed {
+                let _ = tokio::fs::rename(&orphan_state, &state).await;
+            }
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -144,6 +300,7 @@ pub struct Downloader {
     config: DownloadConfig,
     multi: MultiProgress,
     ffmpeg: OnceCell<PathBuf>,
+    ffmpeg_missing: AtomicBool,
 }
 
 impl Downloader {
@@ -151,6 +308,7 @@ impl Downloader {
         config.concurrent_fragments = config
             .concurrent_fragments
             .clamp(1, MAX_CONCURRENT_FRAGMENTS);
+        config.parallel_chunk_bytes = config.parallel_chunk_bytes.max(1);
         let client = crate::http::client_for_config(config.proxy.as_deref(), config.timeout)?;
 
         let multi = if config.quiet || !std::io::stderr().is_terminal() {
@@ -164,6 +322,7 @@ impl Downloader {
             config,
             multi,
             ffmpeg: OnceCell::new(),
+            ffmpeg_missing: AtomicBool::new(false),
         })
     }
 
@@ -203,43 +362,95 @@ impl Downloader {
         }
 
         let part = format_part_path(destination, format, component);
+        let _lock = PartLock::acquire(&part)?;
         let total = format.content_length.filter(|total| *total > 0);
+        let state_path = parallel_state_path(&part);
+        let state_exists = is_file(&state_path).await;
+        let parallel = state_exists
+            || (self.config.concurrent_fragments > 1
+                && total.is_some_and(|total| total >= PARALLEL_MIN_BYTES));
+
         let bar = self.progress_bar(total, label);
+        if parallel {
+            let Some(total) = total else {
+                bar.abandon_with_message(format!("{label} [failed]"));
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidInput,
+                    "parallel resume requires a known content length",
+                ));
+            };
+            match self
+                .download_http_parallel(format, &part, total, &bar, progress, component, label)
+                .await
+            {
+                Ok(()) => {
+                    if let Err(error) = replace_file(&part, destination).await {
+                        bar.abandon_with_message(format!("{label} [failed]"));
+                        return Err(error);
+                    }
+                    let _ = tokio::fs::remove_file(&state_path).await;
+                    bar.finish_with_message(format!("{label} [done]"));
+                    Ok(())
+                }
+                Err(error) => {
+                    bar.abandon_with_message(format!("{label} [failed]"));
+                    Err(error)
+                }
+            }
+        } else {
+            self.download_http_single(
+                format,
+                &part,
+                destination,
+                total,
+                label,
+                progress,
+                component,
+                &bar,
+            )
+            .await
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn download_http_single(
+        &self,
+        format: &Format,
+        part: &Path,
+        destination: &Path,
+        total: Option<u64>,
+        label: &str,
+        progress: Option<&Progress>,
+        component: &str,
+        bar: &ProgressBar,
+    ) -> Result<()> {
         let last_error;
         let mut attempt = 0u32;
         let mut cold_attempts = 0u32;
         let mut last_was_cold = false;
-        let existing_part = tokio::fs::metadata(&part)
-            .await
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        let mut use_parallel = self.config.concurrent_fragments > 1 && existing_part == 0;
 
         loop {
             if attempt > 0 {
                 let delay = retry_delay(attempt, cold_attempts, last_was_cold);
-                warn!("retrying {label} in {delay:?} (attempt {})", attempt + 1);
+                if last_was_cold {
+                    debug!(
+                        "retrying cold-start {label} in {delay:?} (attempt {})",
+                        attempt + 1
+                    );
+                } else {
+                    warn!("retrying {label} in {delay:?} (attempt {})", attempt + 1);
+                }
                 tokio::time::sleep(delay).await;
             }
 
-            let result = if use_parallel {
-                self.download_http_parallel(format, &part, &bar, progress, component)
-                    .await
-            } else {
-                self.download_http_once(format, &part, total, &bar, progress, component)
-                    .await
-            };
-
-            match result {
+            match self
+                .download_http_once(format, part, total, bar, progress, component)
+                .await
+            {
                 Ok(()) => {
-                    replace_file(&part, destination).await?;
+                    replace_file(part, destination).await?;
                     bar.finish_with_message(format!("{label} [done]"));
                     return Ok(());
-                }
-                Err(error) if use_parallel => {
-                    debug!("parallel download failed: {error}; falling back to one connection");
-                    let _ = tokio::fs::remove_file(&part).await;
-                    use_parallel = false;
                 }
                 Err(error) => {
                     let retryable = is_download_retryable(&error);
@@ -269,77 +480,300 @@ impl Downloader {
         Err(last_error)
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn download_http_parallel(
         &self,
         format: &Format,
         part: &Path,
+        total: u64,
         bar: &ProgressBar,
         progress: Option<&Progress>,
         component: &str,
+        label: &str,
     ) -> Result<()> {
-        let total = format
-            .content_length
-            .filter(|total| *total >= PARALLEL_MIN_BYTES)
-            .ok_or_else(|| {
-                YtrustError::coded(
-                    ErrorCode::Network,
-                    "parallel download requires a known content length",
-                )
-            })?;
-        let existing = tokio::fs::metadata(part)
-            .await
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if existing > 0 {
-            return Err(YtrustError::coded(
-                ErrorCode::Network,
-                "parallel download cannot resume a partial file",
-            ));
-        }
-
         if let Some(parent) = part.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let raw_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(part)
-            .await?;
-        let file = Arc::new(AsyncMutex::new(raw_file));
 
-        bar.set_length(total);
-        bar.set_position(0);
-        if let Some(progress) = progress {
-            progress.set_total(component, total);
-        }
+        let state_path = parallel_state_path(part);
+        let part_len = tokio::fs::metadata(part)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let mut part_exists = part_len > 0;
+        let mut part_len = part_len;
 
-        let ranges = parallel_ranges(total, PARALLEL_CHUNK_BYTES);
-        debug!(
-            "parallel download: total={total} bytes, chunks={}, connections={}",
-            ranges.len(),
-            self.config.concurrent_fragments
-        );
-        {
-            let mut stream = futures_util::stream::iter(ranges)
-                .map(|(start, end)| {
-                    self.download_range(
-                        format,
-                        start,
-                        end,
-                        Arc::clone(&file),
-                        bar.clone(),
-                        progress.cloned(),
-                        component.to_string(),
-                    )
-                })
-                .buffer_unordered(self.config.concurrent_fragments as usize);
-            while let Some(result) = stream.next().await {
-                result?;
+        let mut state = if is_file(&state_path).await {
+            match tokio::fs::read(&state_path).await {
+                Ok(bytes) => serde_json::from_slice::<ParallelState>(&bytes).ok(),
+                Err(error) => {
+                    debug!("could not read parallel state: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(candidate) = state.take() {
+            if candidate.valid_for(format, component, total) {
+                state = Some(candidate);
+            } else {
+                warn!(
+                    "parallel resume state does not match {}; preserving it",
+                    part.display()
+                );
+                quarantine_parallel_pair(part).await?;
+                part_exists = false;
+                part_len = 0;
             }
         }
-        drop(file);
 
+        if state.is_some() && !part_exists {
+            // There is no media file to resume; a stale state is harmless to
+            // remove, but the partial video itself is never deleted here.
+            let _ = tokio::fs::remove_file(&state_path).await;
+            state = None;
+        }
+
+        if state.is_some() && part_len > total {
+            warn!(
+                "parallel resume file is larger than expected for {}; preserving it",
+                part.display()
+            );
+            quarantine_parallel_pair(part).await?;
+            state = None;
+            part_exists = false;
+            part_len = 0;
+        }
+
+        if state.is_none() && part_exists {
+            warn!(
+                "preserving partial file without compatible state as {}",
+                part.display()
+            );
+            quarantine_parallel_pair(part).await?;
+            part_exists = false;
+            part_len = 0;
+        }
+
+        let mut state = match state {
+            Some(state) => state,
+            None => ParallelState::new(format, component, total, self.config.parallel_chunk_bytes),
+        };
+        if part_exists && part_len < total && !state.completed.is_empty() {
+            warn!(
+                "partial file {} is shorter than expected; re-downloading unverified ranges",
+                part.display()
+            );
+            state.completed.clear();
+        }
+        state.completed.sort_unstable();
+        state.completed.dedup();
+        persist_parallel_state(part, &state).await?;
+
+        let raw_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(part)
+            .await?;
+        if raw_file.metadata().await?.len() != total {
+            raw_file.set_len(total).await?;
+        }
+        let file = Arc::new(AsyncMutex::new(raw_file));
+
+        let ranges = parallel_ranges(total, state.chunk_size);
+        if ranges.is_empty() {
+            return Err(YtrustError::coded(
+                ErrorCode::Network,
+                "parallel download has no ranges",
+            ));
+        }
+        let chunk_count = ranges.len();
+        if state.completed.iter().any(|index| *index >= chunk_count) {
+            return Err(YtrustError::coded(
+                ErrorCode::InvalidResponse,
+                "parallel state contains an out-of-range chunk",
+            ));
+        }
+
+        let mut completed: BTreeSet<usize> = state.completed.iter().copied().collect();
+        let completed_bytes: u64 = ranges
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| completed.contains(index))
+            .map(|(_, (start, end))| end.saturating_sub(*start).saturating_add(1))
+            .sum();
+        bar.set_length(total);
+        bar.set_position(completed_bytes);
+        if let Some(progress) = progress {
+            progress.set_total(component, total);
+            progress.set_done(component, completed_bytes);
+        }
+
+        let mut pending: VecDeque<usize> = (0..chunk_count)
+            .filter(|index| !completed.contains(index))
+            .collect();
+        let mut concurrency = self.config.concurrent_fragments.max(1) as usize;
+        let max_passes = self.config.retries.saturating_add(1).max(1);
+        let mut no_progress_passes = 0u32;
+        let mut error_passes = 0u32;
+        let mut last_error: Option<YtrustError> = None;
+
+        debug!(
+            "parallel download: total={total} bytes, chunks={chunk_count}, completed={}, missing={}, chunk_size={}, connections={}",
+            completed.len(),
+            pending.len(),
+            state.chunk_size,
+            concurrency
+        );
+
+        while !pending.is_empty() {
+            let before = completed.len();
+            let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+            let mut stop_new = false;
+            let mut fatal: Option<YtrustError> = None;
+            let mut failures = 0u32;
+            let mut cold_failures = 0u32;
+
+            while !stop_new && in_flight.len() < concurrency {
+                let Some(index) = pending.pop_front() else {
+                    break;
+                };
+                let (start, end) = ranges[index];
+                let file = Arc::clone(&file);
+                in_flight.push(
+                    async move {
+                        (
+                            index,
+                            self.download_range_once(format, start, end, file).await,
+                        )
+                    }
+                    .boxed(),
+                );
+            }
+
+            while let Some((index, result)) = in_flight.next().await {
+                match result {
+                    Ok(bytes) => {
+                        if fatal.is_some() {
+                            continue;
+                        }
+                        completed.insert(index);
+                        state.completed = completed.iter().copied().collect();
+                        if let Err(error) = persist_parallel_state(part, &state).await {
+                            fatal = Some(error);
+                            stop_new = true;
+                            continue;
+                        }
+                        bar.inc(bytes);
+                        if let Some(progress) = progress {
+                            progress.add(component, bytes);
+                        }
+                        if !stop_new {
+                            while in_flight.len() < concurrency {
+                                let Some(next_index) = pending.pop_front() else {
+                                    break;
+                                };
+                                let (start, end) = ranges[next_index];
+                                let file = Arc::clone(&file);
+                                in_flight.push(
+                                    async move {
+                                        (
+                                            next_index,
+                                            self.download_range_once(format, start, end, file)
+                                                .await,
+                                        )
+                                    }
+                                    .boxed(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if fatal.is_some() {
+                            continue;
+                        }
+                        let retryable = is_download_retryable(&error);
+                        if !retryable {
+                            fatal = Some(error);
+                            stop_new = true;
+                            continue;
+                        }
+                        failures = failures.saturating_add(1);
+                        if is_cold_start_forbidden(&error, format) {
+                            cold_failures = cold_failures.saturating_add(1);
+                        }
+                        last_error = Some(error);
+                        stop_new = true;
+                    }
+                }
+            }
+
+            if let Some(error) = fatal {
+                return Err(error);
+            }
+
+            let progressed = completed.len() > before;
+            if failures == 0 || cold_failures == failures {
+                error_passes = 0;
+            } else {
+                error_passes = error_passes.saturating_add(1);
+                if error_passes >= 2 && concurrency > 1 {
+                    debug!(
+                        "parallel ranges keep failing for {label}; retrying remaining ranges one at a time"
+                    );
+                    concurrency = 1;
+                }
+            }
+
+            if !progressed {
+                no_progress_passes = no_progress_passes.saturating_add(1);
+                let cold_only = failures > 0 && cold_failures == failures;
+                let allowed = if cold_only {
+                    max_passes.max(COLD_START_MIN_ATTEMPTS)
+                } else {
+                    max_passes
+                };
+                if no_progress_passes >= allowed {
+                    return Err(last_error.unwrap_or_else(|| {
+                        YtrustError::coded(ErrorCode::Network, "parallel download failed")
+                    }));
+                }
+                let delay = if cold_only {
+                    cold_start_retry_delay(no_progress_passes)
+                } else {
+                    download_retry_delay(no_progress_passes)
+                };
+                if cold_only {
+                    debug!(
+                        "retrying cold-start parallel ranges for {label} in {delay:?} (pass {})",
+                        no_progress_passes + 1
+                    );
+                } else {
+                    warn!(
+                        "retrying parallel ranges for {label} in {delay:?} (pass {})",
+                        no_progress_passes + 1
+                    );
+                }
+                tokio::time::sleep(delay).await;
+            } else {
+                no_progress_passes = 0;
+                if failures > 0 {
+                    let delay = download_retry_delay(error_passes.min(3));
+                    debug!("retrying failed parallel ranges for {label} in {delay:?}");
+                    tokio::time::sleep(delay).await;
+                }
+            }
+
+            pending = (0..chunk_count)
+                .filter(|index| !completed.contains(index))
+                .collect();
+        }
+
+        drop(file);
         let actual = tokio::fs::metadata(part).await?.len();
         if actual != total {
             return Err(YtrustError::coded(
@@ -367,81 +801,44 @@ impl Downloader {
         request
     }
 
-    #[expect(clippy::too_many_arguments)]
-    async fn download_range(
+    async fn download_range_once(
         &self,
         format: &Format,
         start: u64,
         end: u64,
         file: Arc<AsyncMutex<tokio::fs::File>>,
-        bar: ProgressBar,
-        progress: Option<Progress>,
-        component: String,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let expected = end.saturating_sub(start).saturating_add(1);
-        let mut last_error = None;
-        for attempt in 0..=2u32 {
-            if attempt > 0 {
-                tokio::time::sleep(download_retry_delay(attempt)).await;
-            }
-            let request = self
-                .media_request(format)
-                .header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
-            match request.send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    if status == reqwest::StatusCode::PARTIAL_CONTENT {
-                        let content_range = response
-                            .headers()
-                            .get(reqwest::header::CONTENT_RANGE)
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(parse_content_range);
-                        if content_range.is_some_and(|(range_start, _)| range_start != start) {
-                            last_error = Some(YtrustError::coded(
-                                ErrorCode::Network,
-                                "server returned an unexpected range start",
-                            ));
-                            continue;
-                        }
-                        let body = match read_media_body(response, expected).await {
-                            Ok(body) => body,
-                            Err(error) => {
-                                last_error = Some(error);
-                                continue;
-                            }
-                        };
-                        let mut file = file.lock().await;
-                        file.seek(SeekFrom::Start(start)).await?;
-                        file.write_all(&body).await?;
-                        drop(file);
-                        bar.inc(expected);
-                        if let Some(progress) = &progress {
-                            progress.add(&component, expected);
-                        }
-                        return Ok(());
-                    }
-                    let error = YtrustError::HttpStatus {
-                        status: status.as_u16(),
-                        message: format!("range request returned HTTP {status}"),
-                    };
-                    if !matches!(status.as_u16(), 403 | 408 | 410 | 425 | 429 | 500..=599) {
-                        return Err(error);
-                    }
-                    last_error = Some(error);
-                }
-                Err(error) => {
-                    let error = YtrustError::from(error);
-                    let retryable = error.is_retryable();
-                    last_error = Some(error);
-                    if !retryable {
-                        break;
-                    }
-                }
+        let request = self
+            .media_request(format)
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+        let response = request.send().await?;
+        let status = response.status();
+        if status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(YtrustError::HttpStatus {
+                status: status.as_u16(),
+                message: format!("range request returned HTTP {status}"),
+            });
+        }
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range);
+        match content_range {
+            Some((range_start, _)) if range_start == start => {}
+            _ => {
+                return Err(YtrustError::coded(
+                    ErrorCode::InvalidResponse,
+                    "server returned an unexpected range start",
+                ));
             }
         }
-        Err(last_error.unwrap_or_else(|| {
-            YtrustError::coded(ErrorCode::Network, "parallel range download failed")
-        }))
+        let body = read_media_body(response, expected).await?;
+        let mut file = file.lock().await;
+        file.seek(SeekFrom::Start(start)).await?;
+        file.write_all(&body).await?;
+        Ok(expected)
     }
 
     async fn download_http_once(
@@ -764,6 +1161,7 @@ impl Downloader {
         label: &str,
         duration_secs: Option<u64>,
         audio_quality: Option<&str>,
+        copy: bool,
         progress: Option<&Progress>,
     ) -> Result<()> {
         if is_file(destination).await && !self.config.force_overwrites {
@@ -794,8 +1192,8 @@ impl Downloader {
             .arg(input)
             .arg("-vn")
             .arg("-c:a")
-            .arg(codec);
-        if let Some(quality) = audio_quality.filter(|quality| !quality.trim().is_empty()) {
+            .arg(if copy { "copy" } else { codec });
+        if !copy && let Some(quality) = audio_quality.filter(|quality| !quality.trim().is_empty()) {
             apply_audio_quality(&mut command, codec, quality.trim())?;
         }
         command
@@ -929,6 +1327,9 @@ impl Downloader {
         }
         let destination = media.with_extension(&container);
         if is_file(&destination).await && !self.config.force_overwrites {
+            if media != destination {
+                let _ = tokio::fs::remove_file(media).await;
+            }
             return Ok(destination);
         }
         let temp = temp_output_path(&destination, "remux", &container);
@@ -1099,7 +1500,14 @@ impl Downloader {
         loop {
             if attempt > 0 {
                 let delay = retry_delay(attempt, cold_attempts, last_was_cold);
-                warn!("retrying {label} in {delay:?} (attempt {})", attempt + 1);
+                if last_was_cold {
+                    debug!(
+                        "retrying cold-start {label} in {delay:?} (attempt {})",
+                        attempt + 1
+                    );
+                } else {
+                    warn!("retrying {label} in {delay:?} (attempt {})", attempt + 1);
+                }
                 tokio::time::sleep(delay).await;
             }
             let mut written = 0u64;
@@ -1280,6 +1688,9 @@ impl Downloader {
         if let Some(path) = self.ffmpeg.get() {
             return Ok(path.clone());
         }
+        if self.ffmpeg_missing.load(Ordering::Relaxed) {
+            return Err(YtrustError::FfmpegMissing);
+        }
         let path = match &self.config.ffmpeg {
             Some(location) if location.is_dir() => location.join(if cfg!(windows) {
                 "ffmpeg.exe"
@@ -1303,7 +1714,10 @@ impl Downloader {
                 let _ = self.ffmpeg.set(path.clone());
                 Ok(path)
             }
-            _ => Err(YtrustError::FfmpegMissing),
+            _ => {
+                self.ffmpeg_missing.store(true, Ordering::Relaxed);
+                Err(YtrustError::FfmpegMissing)
+            }
         }
     }
 
@@ -1352,6 +1766,30 @@ pub fn audio_codec(audio_format: &str) -> Result<&'static str> {
             ErrorCode::InvalidInput,
             format!("unsupported audio format: {other}"),
         )),
+    }
+}
+
+/// True when the source audio codec can be remuxed into the target container
+/// without re-encoding. This avoids generation loss for the common cases
+/// (AAC in MP4, Opus/Vorbis in WebM/Ogg, FLAC, MP3).
+pub fn can_copy_audio(format: &Format, target_ext: &str) -> bool {
+    let codec = format
+        .audio_codec
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match target_ext
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "m4a" => codec.starts_with("mp4a") || codec.starts_with("aac") || codec.starts_with("alac"),
+        "opus" => codec.starts_with("opus"),
+        "ogg" => codec.starts_with("vorbis") || codec.starts_with("opus"),
+        "flac" => codec.starts_with("flac"),
+        "mp3" => codec.starts_with("mp3"),
+        "wav" => codec.starts_with("pcm"),
+        _ => false,
     }
 }
 
@@ -1729,11 +2167,11 @@ fn redact_ffmpeg_stderr(stderr: &str) -> String {
     let mut redacted = String::new();
     for line in stderr.lines() {
         let lower = line.to_ascii_lowercase();
-        let line = if lower.contains("cookie:") || lower.contains("authorization:") {
-            let prefix_len = lower
-                .find("cookie:")
-                .or_else(|| lower.find("authorization:"))
-                .unwrap_or(0);
+        let sensitive_at = ["proxy-authorization:", "authorization:", "cookie:"]
+            .iter()
+            .filter_map(|key| lower.find(key))
+            .min();
+        let line = if let Some(prefix_len) = sensitive_at {
             let (prefix, rest) = line.split_at(prefix_len);
             let key_end = rest.find(':').map(|index| index + 1).unwrap_or(rest.len());
             format!("{} {} <redacted>", prefix.trim_end(), &rest[..key_end])
@@ -1882,6 +2320,141 @@ fn apply_audio_quality(command: &mut Command, codec: &str, quality: &str) -> Res
 mod tests {
     use super::*;
 
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn media_format(url: &str, total: u64) -> Format {
+        Format {
+            itag: 137,
+            url: url.to_string(),
+            signature_cipher: None,
+            cipher: None,
+            container: "mp4".to_string(),
+            video_codec: Some("avc1".to_string()),
+            audio_codec: None,
+            has_video: true,
+            has_audio: false,
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30),
+            bitrate: 1_000,
+            audio_bitrate: None,
+            content_length: Some(total),
+            quality_label: None,
+            is_hls: false,
+            is_live: false,
+            audio_track_name: None,
+            audio_track_id: None,
+            audio_is_default: false,
+            language: None,
+            needs_challenge: false,
+            user_agent: "test",
+        }
+    }
+
+    async fn spawn_range_server(
+        body: Vec<u8>,
+        status: u16,
+    ) -> (String, Arc<StdMutex<Vec<(u64, u64)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let records = Arc::new(StdMutex::new(Vec::new()));
+        let records_for_task = Arc::clone(&records);
+        let body = Arc::new(body);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = Arc::clone(&body);
+                let records = Arc::clone(&records_for_task);
+                tokio::spawn(async move {
+                    serve_range_request(stream, body, records, status).await;
+                });
+            }
+        });
+        (format!("http://{address}/video"), records)
+    }
+
+    async fn serve_range_request(
+        mut stream: TcpStream,
+        body: Arc<Vec<u8>>,
+        records: Arc<StdMutex<Vec<(u64, u64)>>>,
+        status: u16,
+    ) {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let Ok(read) = stream.read(&mut chunk).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&request);
+        let range = text
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+            .and_then(|line| line.split_once('=').map(|(_, value)| value.trim()))
+            .and_then(|value| value.split_once('-'))
+            .and_then(|(start, end)| {
+                Some((
+                    start.trim().parse::<u64>().ok()?,
+                    end.trim().parse::<u64>().ok()?,
+                ))
+            })
+            .unwrap_or((0, body.len().saturating_sub(1) as u64));
+        records.lock().unwrap().push(range);
+        if status != 206 {
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            return;
+        }
+        let start = range.0.min(body.len().saturating_sub(1) as u64) as usize;
+        let end = range.1.min(body.len().saturating_sub(1) as u64) as usize;
+        let chunk = &body[start..=end];
+        let header = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+            chunk.len()
+        );
+        if stream.write_all(header.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = stream.write_all(chunk).await;
+    }
+
+    async fn seed_parallel_file(
+        part: &Path,
+        format: &Format,
+        total: u64,
+        completed: Vec<usize>,
+        initial: &[u8],
+    ) {
+        let mut state = ParallelState::new(format, "video", total, 8);
+        state.completed = completed;
+        persist_parallel_state(part, &state).await.unwrap();
+        tokio::fs::write(part, initial).await.unwrap();
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(part)
+            .await
+            .unwrap();
+        file.set_len(total).await.unwrap();
+    }
+
     #[test]
     fn splits_parallel_download_ranges() {
         assert!(parallel_ranges(0, 8).is_empty());
@@ -1944,6 +2517,233 @@ mod tests {
         assert_eq!(audio_codec("mp3").unwrap(), "libmp3lame");
         assert_eq!(audio_codec("M4A").unwrap(), "aac");
         assert!(audio_codec("aiff").is_err());
+    }
+
+    #[test]
+    fn copies_compatible_audio_codecs() {
+        let format = |codec: &str| Format {
+            itag: 251,
+            url: "https://example.com".to_string(),
+            signature_cipher: None,
+            cipher: None,
+            container: "webm".to_string(),
+            video_codec: None,
+            audio_codec: Some(codec.to_string()),
+            has_video: false,
+            has_audio: true,
+            width: None,
+            height: None,
+            fps: None,
+            bitrate: 128_000,
+            audio_bitrate: Some(128_000),
+            content_length: Some(1_000),
+            quality_label: None,
+            is_hls: false,
+            is_live: false,
+            audio_track_name: None,
+            audio_track_id: None,
+            audio_is_default: false,
+            language: None,
+            needs_challenge: false,
+            user_agent: "test",
+        };
+
+        assert!(can_copy_audio(&format("opus"), "opus"));
+        assert!(can_copy_audio(&format("vorbis"), "ogg"));
+        assert!(can_copy_audio(&format("mp4a.40.2"), "m4a"));
+        assert!(can_copy_audio(&format("flac"), "flac"));
+        assert!(can_copy_audio(&format("mp3"), "mp3"));
+        assert!(!can_copy_audio(&format("opus"), "m4a"));
+        assert!(!can_copy_audio(&format("mp4a.40.2"), "opus"));
+        assert!(!can_copy_audio(&format(""), "m4a"));
+    }
+
+    #[test]
+    fn parallel_state_roundtrips_and_validates_ranges() {
+        let format = Format {
+            itag: 137,
+            url: "https://example.com".to_string(),
+            signature_cipher: None,
+            cipher: None,
+            container: "mp4".to_string(),
+            video_codec: Some("avc1".to_string()),
+            audio_codec: None,
+            has_video: true,
+            has_audio: false,
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30),
+            bitrate: 1_000,
+            audio_bitrate: None,
+            content_length: Some(20),
+            quality_label: None,
+            is_hls: false,
+            is_live: false,
+            audio_track_name: None,
+            audio_track_id: None,
+            audio_is_default: false,
+            language: None,
+            needs_challenge: false,
+            user_agent: "test",
+        };
+        let mut state = ParallelState::new(&format, "video", 20, 8);
+        state.completed = vec![0, 2];
+        assert!(state.valid_for(&format, "video", 20));
+        assert!(!state.valid_for(&format, "audio", 20));
+        assert!(!state.valid_for(&format, "video", 21));
+
+        state.completed.push(3);
+        assert!(!state.valid_for(&format, "video", 20));
+
+        state.completed = vec![0, 1, 2];
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: ParallelState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.completed, vec![0, 1, 2]);
+        assert_eq!(
+            parallel_state_path(Path::new("video.part")),
+            PathBuf::from("video.part.state")
+        );
+    }
+
+    #[test]
+    fn part_lock_rejects_concurrent_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("video.part");
+        let first = PartLock::acquire(&part).unwrap();
+        assert!(PartLock::acquire(&part).is_err());
+        drop(first);
+        assert!(PartLock::acquire(&part).is_ok());
+    }
+
+    fn test_downloader(fragments: u32, retries: u32) -> Downloader {
+        Downloader::new(DownloadConfig {
+            retries,
+            timeout: 5,
+            proxy: None,
+            cookies: None,
+            cookie_jar: None,
+            ffmpeg: None,
+            force_overwrites: false,
+            quiet: true,
+            concurrent_fragments: fragments,
+            parallel_chunk_bytes: 8,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn parallel_resume_only_requests_missing_ranges() {
+        let body: Vec<u8> = (0..20u8).collect();
+        let (url, records) = spawn_range_server(body.clone(), 206).await;
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("video.mp4");
+        let format = media_format(&url, body.len() as u64);
+        let part = format_part_path(&destination, &format, "video");
+        seed_parallel_file(&part, &format, body.len() as u64, vec![0], &body[..8]).await;
+
+        test_downloader(4, 2)
+            .download_http(&format, &destination, "test", None, "video")
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), body);
+        assert!(!part.exists());
+        assert!(!parallel_state_path(&part).exists());
+        let mut ranges = records.lock().unwrap().clone();
+        ranges.sort_unstable();
+        assert_eq!(ranges, vec![(8, 15), (16, 19)]);
+    }
+
+    #[tokio::test]
+    async fn parallel_error_preserves_part_and_state() {
+        let body: Vec<u8> = (0..20u8).collect();
+        let (url, records) = spawn_range_server(body.clone(), 500).await;
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("video.mp4");
+        let format = media_format(&url, body.len() as u64);
+        let part = format_part_path(&destination, &format, "video");
+        seed_parallel_file(&part, &format, body.len() as u64, vec![0], &body[..8]).await;
+
+        let result = test_downloader(4, 0)
+            .download_http(&format, &destination, "test", None, "video")
+            .await;
+
+        assert!(result.is_err());
+        assert!(part.exists());
+        assert!(parallel_state_path(&part).exists());
+        assert!(!destination.exists());
+        let mut ranges = records.lock().unwrap().clone();
+        ranges.sort_unstable();
+        assert_eq!(ranges, vec![(8, 15), (16, 19)]);
+    }
+
+    #[tokio::test]
+    async fn completed_parallel_state_skips_network() {
+        let body: Vec<u8> = (0..20u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("video.mp4");
+        let format = media_format("http://127.0.0.1:9/video", body.len() as u64);
+        let part = format_part_path(&destination, &format, "video");
+        seed_parallel_file(&part, &format, body.len() as u64, vec![0, 1, 2], &body).await;
+
+        test_downloader(4, 0)
+            .download_http(&format, &destination, "test", None, "video")
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), body);
+        assert!(!part.exists());
+        assert!(!parallel_state_path(&part).exists());
+    }
+
+    #[tokio::test]
+    async fn incompatible_parallel_state_is_quarantined_not_deleted() {
+        let body: Vec<u8> = (0..20u8).collect();
+        let (url, records) = spawn_range_server(body.clone(), 206).await;
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("video.mp4");
+        let format = media_format(&url, body.len() as u64);
+        let part = format_part_path(&destination, &format, "video");
+        seed_parallel_file(&part, &format, 21, vec![0], &body[..8]).await;
+
+        test_downloader(4, 0)
+            .download_http(&format, &destination, "test", None, "video")
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), body);
+        let orphans = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".orphan-"))
+            .count();
+        assert!(orphans >= 2);
+        let mut ranges = records.lock().unwrap().clone();
+        ranges.sort_unstable();
+        assert_eq!(ranges, vec![(0, 7), (8, 15), (16, 19)]);
+    }
+
+    #[tokio::test]
+    async fn range_unsupported_preserves_partial_data() {
+        let body: Vec<u8> = (0..20u8).collect();
+        let (url, records) = spawn_range_server(body.clone(), 200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("video.mp4");
+        let format = media_format(&url, body.len() as u64);
+        let part = format_part_path(&destination, &format, "video");
+        seed_parallel_file(&part, &format, body.len() as u64, vec![0], &body[..8]).await;
+
+        let result = test_downloader(4, 0)
+            .download_http(&format, &destination, "test", None, "video")
+            .await;
+
+        assert!(result.is_err());
+        assert!(part.exists());
+        assert!(parallel_state_path(&part).exists());
+        assert!(!destination.exists());
+        let mut ranges = records.lock().unwrap().clone();
+        ranges.sort_unstable();
+        assert_eq!(ranges, vec![(8, 15), (16, 19)]);
     }
 
     #[test]
@@ -2013,6 +2813,16 @@ mod tests {
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("hidden"));
         assert!(redacted.contains("Cookie:"));
+    }
+
+    #[test]
+    fn redacts_authorization_before_cookie_in_ffmpeg_errors() {
+        let redacted = redact_ffmpeg_stderr(
+            "Authorization: Bearer secret Cookie: SID=also-secret Proxy-Authorization: Basic hidden",
+        );
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("also-secret"));
+        assert!(!redacted.contains("hidden"));
     }
 
     #[test]
