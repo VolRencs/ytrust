@@ -1,6 +1,5 @@
 use serde_json::Value;
 
-use crate::constants::{DEFAULT_PLAYLIST_ITEMS, DEFAULT_PLAYLIST_LIMIT};
 use crate::error::Result;
 use crate::http::RequestConfig;
 use crate::json;
@@ -14,16 +13,6 @@ pub struct ResolveOptions {
     pub no_playlist: bool,
     pub playlist_limit: u64,
     pub playlist_items: String,
-}
-
-impl Default for ResolveOptions {
-    fn default() -> Self {
-        Self {
-            no_playlist: false,
-            playlist_limit: DEFAULT_PLAYLIST_LIMIT,
-            playlist_items: DEFAULT_PLAYLIST_ITEMS.to_string(),
-        }
-    }
 }
 
 #[derive(Debug)]

@@ -1,7 +1,15 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.6.8/schema.json",
   "files": {
-    "includes": ["index.js", "bench/**/*.ts", "test/**/*.ts", "solver/index.js", "solver/pool.js", "solver/worker.js"]
+    "includes": [
+      "index.js",
+      "bench/**/*.ts",
+      "test/**/*.ts",
+      "solver/index.js",
+      "solver/pool.js",
+      "solver/server.js",
+      "solver/worker.js"
+    ]
   },
   "formatter": {
     "enabled": true,

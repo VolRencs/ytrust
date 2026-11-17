@@ -52,7 +52,7 @@ struct SolverCache {
     n: HashMap<(String, String), String>,
 }
 
-const SOLVER_CACHE_ENTRIES: usize = 4096;
+const SOLVER_CACHE_ENTRIES: usize = 1024;
 const PREPROCESSED_CACHE_ENTRIES: usize = 4;
 
 struct CipherParams {

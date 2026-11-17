@@ -83,7 +83,7 @@ Run `ytrust --help` for the full list of options. The CLI bundles the same EJS
 challenge solver as the Node module and runs it through a detected Node.js
 runtime; pass `--js-runtimes none` to disable it, or `node:PATH` to select a
 specific binary. `--no-solve` skips challenge solving for `-J`, `-F`,
-`--simulate` and `--skip-download`; unresolved formats are marked with
+`--list-audio-tracks`, `--simulate` and `--skip-download`; unresolved formats are marked with
 `needs_challenge: true` and `playable: false`. Metadata-only modes
 (`--simulate`, `--skip-download` without JSON, `--no-solve`) prefer the JSLess
 client and do not resolve a player JS URL, so `player_js_url` may be `null`.
@@ -138,6 +138,7 @@ Every format in `-J` output includes `language`, and `audio_track` includes
 ```bash
 -f 'bestaudio[language=en]'
 -f 'bestaudio[language^=en]'
+-f 'bestaudio[language~=en]'
 -f 'bestaudio[language!=de]'
 -f 'bestvideo+bestaudio[language=en]+bestaudio[language=de]'
 ```

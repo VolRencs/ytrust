@@ -19,14 +19,13 @@ pub(crate) const MAX_HTML_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PLAYER_JS_BYTES: usize = 32 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
-const CLIENT_CACHE_CAPACITY: usize = 8;
+const CLIENT_CACHE_CAPACITY: usize = 4;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct RequestConfig {
     pub proxy: Option<String>,
-    pub cookies: Option<String>,
-    pub cookie_jar: Option<std::sync::Arc<crate::cookies::CookieJar>>,
+    pub cookie_jar: std::sync::Arc<crate::cookies::CookieJar>,
     pub sapisid: Option<String>,
     pub sapisid1p: Option<String>,
     pub sapisid3p: Option<String>,
@@ -53,14 +52,7 @@ impl RequestConfig {
     }
 
     pub fn cookies_for(&self, url: &str) -> Option<String> {
-        if let Some(jar) = &self.cookie_jar {
-            return jar.header_for_url(url);
-        }
-        if is_youtube_host(url) {
-            self.cookies.clone()
-        } else {
-            None
-        }
+        self.cookie_jar.header_for_url(url)
     }
 }
 
@@ -68,8 +60,7 @@ impl Default for RequestConfig {
     fn default() -> Self {
         Self {
             proxy: None,
-            cookies: None,
-            cookie_jar: None,
+            cookie_jar: std::sync::Arc::new(crate::cookies::CookieJar::default()),
             sapisid: None,
             sapisid1p: None,
             sapisid3p: None,
@@ -87,7 +78,7 @@ static CLIENTS: LazyLock<ClientCache> = LazyLock::new(|| Mutex::new(HashMap::new
 
 // Reuse the same client for resolve and download paths instead of building a
 // second connection pool.
-pub fn client_for_config(proxy: Option<&str>, timeout: u64) -> Result<Client> {
+pub(crate) fn client_for_config(proxy: Option<&str>, timeout: u64) -> Result<Client> {
     client(&RequestConfig {
         proxy: proxy.map(ToString::to_string),
         timeout,
@@ -500,10 +491,7 @@ fn redact_proxy(proxy: &str) -> String {
     url.to_string()
 }
 
-pub fn authorization_header(
-    config: &RequestConfig,
-    user_session_id: Option<&str>,
-) -> Option<String> {
+fn authorization_header(config: &RequestConfig, user_session_id: Option<&str>) -> Option<String> {
     let timestamp = unix_time();
     let origin = "https://www.youtube.com";
     let extra = user_session_id
@@ -532,19 +520,6 @@ pub fn authorization_header(
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-pub fn is_youtube_host(url: &str) -> bool {
-    let Ok(url) = Url::parse(url) else {
-        return false;
-    };
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    host == "youtube.com"
-        || host == "www.youtube.com"
-        || host == "m.youtube.com"
-        || host == "music.youtube.com"
-        || host == "youtube-nocookie.com"
-        || host == "www.youtube-nocookie.com"
-}
-
 pub fn redact_url(url: &str) -> String {
     let Ok(mut url) = Url::parse(url) else {
         return "<invalid URL>".to_string();
@@ -561,15 +536,6 @@ pub fn redact_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_youtube_hosts() {
-        assert!(is_youtube_host("https://www.youtube.com/watch?v=x"));
-        assert!(is_youtube_host("https://music.youtube.com/watch?v=x"));
-        assert!(!is_youtube_host(
-            "https://rr1---sn.googlevideo.com/videoplayback"
-        ));
-    }
 
     #[test]
     fn builds_sapisid_authorization_without_session_id() {

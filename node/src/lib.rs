@@ -98,8 +98,7 @@ async fn request_config(
     let timeout = u64::from(options.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS as u32));
     let config = RequestConfig {
         proxy: options.proxy.clone(),
-        cookies: cookies.header,
-        cookie_jar: Some(cookies.cookie_jar),
+        cookie_jar: cookies.cookie_jar,
         sapisid: cookies.sapisid,
         sapisid1p: cookies.sapisid1p,
         sapisid3p: cookies.sapisid3p,

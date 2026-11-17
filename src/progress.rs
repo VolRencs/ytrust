@@ -475,7 +475,7 @@ fn aggregate_percent(components: &[ComponentState], phase: Option<&PhaseState>) 
     0.0
 }
 
-pub fn absolute_path(path: &Path) -> PathBuf {
+fn absolute_path(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 

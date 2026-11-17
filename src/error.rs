@@ -6,7 +6,7 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, YtrustError>;
 
 /// Higher values are more useful to callers when several client attempts fail.
-pub const fn error_priority(code: ErrorCode) -> u8 {
+const fn error_priority(code: ErrorCode) -> u8 {
     match code {
         ErrorCode::BotCheck => 10,
         ErrorCode::AgeRestricted => 9,
@@ -104,9 +104,6 @@ pub enum YtrustError {
     #[error("invalid URL: {0}")]
     Url(#[from] url::ParseError),
 
-    #[error("{0}")]
-    Message(String),
-
     #[error("{message}")]
     Coded { code: ErrorCode, message: String },
 
@@ -139,10 +136,6 @@ impl From<reqwest::Error> for YtrustError {
 }
 
 impl YtrustError {
-    pub fn msg(message: impl Into<String>) -> Self {
-        Self::Message(message.into())
-    }
-
     pub fn coded(code: ErrorCode, message: impl Into<String>) -> Self {
         Self::Coded {
             code,
@@ -210,7 +203,6 @@ impl YtrustError {
             Self::FormatNotFound(_) => ErrorCode::FormatNotFound,
             Self::FfmpegMissing | Self::Ffmpeg { .. } => ErrorCode::Ffmpeg,
             Self::InvalidOutput(_) => ErrorCode::InvalidInput,
-            Self::Message(_) => ErrorCode::Unknown,
         }
     }
 }
@@ -229,7 +221,6 @@ mod tests {
             YtrustError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "x")).code(),
             ErrorCode::Io
         );
-        assert_eq!(YtrustError::msg("x").code(), ErrorCode::Unknown);
         assert_eq!(
             YtrustError::FormatNotFound("x".into()).code(),
             ErrorCode::FormatNotFound

@@ -20,7 +20,6 @@ use tracing::{debug, warn};
 
 use crate::constants::WEB_UA;
 use crate::error::{ErrorCode, Result, YtrustError};
-use crate::http::is_youtube_host;
 use crate::progress::{ExtraFile, Progress};
 use crate::youtube::Format;
 
@@ -36,14 +35,14 @@ pub const PARALLEL_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CONCURRENT_FRAGMENTS: u32 = 8;
 const PARALLEL_STATE_VERSION: u32 = 1;
 const MAX_PARALLEL_CHUNKS: usize = 1_000_000;
+const STATE_PERSIST_EVERY_CHUNKS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
     pub retries: u32,
     pub timeout: u64,
     pub proxy: Option<String>,
-    pub cookies: Option<String>,
-    pub cookie_jar: Option<std::sync::Arc<crate::cookies::CookieJar>>,
+    pub cookie_jar: std::sync::Arc<crate::cookies::CookieJar>,
     pub ffmpeg: Option<PathBuf>,
     pub force_overwrites: bool,
     pub quiet: bool,
@@ -420,6 +419,21 @@ impl Downloader {
                     bar.finish_with_message(format!("{label} [done]"));
                     Ok(())
                 }
+                Err(error) if is_range_unsupported(&error) => {
+                    let _ = tokio::fs::remove_file(&part).await;
+                    let _ = tokio::fs::remove_file(&state_path).await;
+                    self.download_http_single(
+                        format,
+                        &part,
+                        destination,
+                        Some(total),
+                        label,
+                        progress,
+                        component,
+                        &bar,
+                    )
+                    .await
+                }
                 Err(error) => {
                     bar.abandon_with_message(format!("{label} [failed]"));
                     Err(error)
@@ -599,6 +613,7 @@ impl Downloader {
         state.completed.sort_unstable();
         state.completed.dedup();
         persist_parallel_state(part, &state).await?;
+        let mut persisted_completions = state.completed.len();
 
         let raw_file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -690,11 +705,17 @@ impl Downloader {
                             continue;
                         }
                         completed.insert(index);
-                        state.completed = completed.iter().copied().collect();
-                        if let Err(error) = persist_parallel_state(part, &state).await {
-                            fatal = Some(error);
-                            stop_new = true;
-                            continue;
+                        if completed.len().saturating_sub(persisted_completions)
+                            >= STATE_PERSIST_EVERY_CHUNKS
+                            || pending.is_empty()
+                        {
+                            state.completed = completed.iter().copied().collect();
+                            if let Err(error) = persist_parallel_state(part, &state).await {
+                                fatal = Some(error);
+                                stop_new = true;
+                                continue;
+                            }
+                            persisted_completions = completed.len();
                         }
                         bar.inc(bytes);
                         if let Some(progress) = progress {
@@ -801,6 +822,10 @@ impl Downloader {
                 .collect();
         }
 
+        if persisted_completions != completed.len() {
+            state.completed = completed.iter().copied().collect();
+            persist_parallel_state(part, &state).await?;
+        }
         drop(file);
         let actual = tokio::fs::metadata(part).await?.len();
         if actual != total {
@@ -1692,7 +1717,6 @@ impl Downloader {
     pub async fn fetch_text(&self, url: &str) -> Result<String> {
         let config = crate::http::RequestConfig {
             proxy: self.config.proxy.clone(),
-            cookies: self.config.cookies.clone(),
             cookie_jar: self.config.cookie_jar.clone(),
             timeout: self.config.timeout,
             ..crate::http::RequestConfig::default()
@@ -1760,14 +1784,7 @@ impl Downloader {
     }
 
     fn cookies_for(&self, url: &str) -> Option<String> {
-        if let Some(jar) = &self.config.cookie_jar {
-            return jar.header_for_url(url);
-        }
-        self.config
-            .cookies
-            .as_deref()
-            .filter(|_| is_youtube_host(url))
-            .map(str::to_string)
+        self.config.cookie_jar.header_for_url(url)
     }
 
     fn progress_bar(&self, total: Option<u64>, label: &str) -> ProgressBar {
@@ -1875,6 +1892,10 @@ fn is_googlevideo_url(raw: &str) -> bool {
     };
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     host == "googlevideo.com" || host.ends_with(".googlevideo.com")
+}
+
+fn is_range_unsupported(error: &YtrustError) -> bool {
+    matches!(error, YtrustError::HttpStatus { status: 200, .. })
 }
 
 fn is_download_retryable(error: &YtrustError) -> bool {
@@ -2440,14 +2461,15 @@ mod tests {
             .unwrap_or((0, body.len().saturating_sub(1) as u64));
         records.lock().unwrap().push(range);
         if status != 206 {
-            let _ = stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    )
-                    .as_bytes(),
-                )
-                .await;
+            let payload = if status == 200 { body.as_slice() } else { &[] };
+            let header = format!(
+                "HTTP/1.1 {status} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            if stream.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = stream.write_all(payload).await;
             return;
         }
         let start = range.0.min(body.len().saturating_sub(1) as u64) as usize;
@@ -2657,8 +2679,7 @@ mod tests {
             retries,
             timeout: 5,
             proxy: None,
-            cookies: None,
-            cookie_jar: None,
+            cookie_jar: Arc::new(crate::cookies::CookieJar::default()),
             ffmpeg: None,
             force_overwrites: false,
             quiet: true,
@@ -2761,7 +2782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_unsupported_preserves_partial_data() {
+    async fn range_unsupported_falls_back_to_single_request() {
         let body: Vec<u8> = (0..20u8).collect();
         let (url, records) = spawn_range_server(body.clone(), 200).await;
         let dir = tempfile::tempdir().unwrap();
@@ -2770,17 +2791,17 @@ mod tests {
         let part = format_part_path(&destination, &format, "video");
         seed_parallel_file(&part, &format, body.len() as u64, vec![0], &body[..8]).await;
 
-        let result = test_downloader(4, 0)
+        test_downloader(4, 0)
             .download_http(&format, &destination, "test", None, "video")
-            .await;
+            .await
+            .unwrap();
 
-        assert!(result.is_err());
-        assert!(part.exists());
-        assert!(parallel_state_path(&part).exists());
-        assert!(!destination.exists());
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), body);
+        assert!(!part.exists());
+        assert!(!parallel_state_path(&part).exists());
         let mut ranges = records.lock().unwrap().clone();
         ranges.sort_unstable();
-        assert_eq!(ranges, vec![(8, 15), (16, 19)]);
+        assert_eq!(ranges, vec![(0, 19), (8, 15), (16, 19)]);
     }
 
     #[test]

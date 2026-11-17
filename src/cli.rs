@@ -121,37 +121,13 @@ pub struct Cli {
     #[arg(long, value_name = "ENCODING")]
     pub encoding: Option<String>,
 
-    /// yt-dlp compatibility: sanitize names for Windows (already the default)
-    #[arg(long)]
-    pub windows_filenames: bool,
-
-    /// yt-dlp compatibility: use .part files and resume (already the default)
-    #[arg(long = "continue", hide = true)]
-    pub continue_: bool,
-
-    /// yt-dlp compatibility: use .part files (already the default)
-    #[arg(long, hide = true)]
-    pub part: bool,
-
     /// yt-dlp compatibility: convert downloaded subtitles to this format
     #[arg(long, value_name = "FORMAT")]
     pub convert_subs: Option<String>,
 
-    /// yt-dlp compatibility: accepted for compatibility; ytrust uses its own retry schedule
-    #[arg(long, value_name = "EXPR", hide = true)]
-    pub retry_sleep: Option<String>,
-
     /// Number of parallel range requests for direct HTTP downloads (1-8)
     #[arg(long, value_name = "N")]
     pub concurrent_fragments: Option<u32>,
-
-    /// yt-dlp compatibility: accepted for compatibility
-    #[arg(long, hide = true)]
-    pub abort_on_unavailable_fragments: bool,
-
-    /// yt-dlp compatibility: accepted for compatibility
-    #[arg(long, hide = true)]
-    pub force_keyframes_at_cuts: bool,
 
     /// yt-dlp compatibility: suppress warnings
     #[arg(long)]
@@ -290,11 +266,12 @@ impl Cli {
             && !(self.dump_json
                 || self.dump_single_json
                 || self.list_formats
+                || self.list_audio_tracks
                 || self.simulate
                 || self.skip_download)
         {
             return Err(invalid(
-                "--no-solve requires -J, -j, -F, --simulate or --skip-download",
+                "--no-solve requires -J, -j, -F, --list-audio-tracks, --simulate or --skip-download",
             ));
         }
         ytrust::youtube::max_playlist_item(&self.playlist_items)?;
@@ -432,6 +409,15 @@ mod tests {
             "ytrust",
             "--no-solve",
             "-J",
+            "https://www.youtube.com/watch?v=x",
+        ])
+        .unwrap();
+        assert!(cli.validate().is_ok());
+
+        let cli = Cli::try_parse_from([
+            "ytrust",
+            "--no-solve",
+            "--list-audio-tracks",
             "https://www.youtube.com/watch?v=x",
         ])
         .unwrap();

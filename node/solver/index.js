@@ -7,7 +7,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const lib = readFileSync(join(here, "lib.min.js"), "utf8");
 const core = readFileSync(join(here, "core.min.js"), "utf8");
 
-const SOLVE_TIMEOUT_MS = 15_000;
+const SOLVE_TIMEOUT_MS = 30_000;
 
 let context;
 

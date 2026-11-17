@@ -2561,7 +2561,7 @@ dependencies = [
 
 [[package]]
 name = "ytrust"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "aes",
  "cbc",
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "ytrust-node"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "napi",
  "napi-build",

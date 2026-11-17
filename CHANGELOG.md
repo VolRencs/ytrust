@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.1
+
+### Changed
+
+- Removed dead code and no-op compatibility flags, and narrowed several
+  internal APIs and caches to reduce memory use.
+- Cookie handling now uses one shared `Arc<CookieJar>` instead of duplicating
+  Cookie headers in request and download configuration.
+- Parallel download state is persisted in batches instead of after every chunk.
+- Node challenge URL rewriting now preserves the original query bytes, matching
+  the Rust solver.
+
+### Fixed
+
+- `language~=`, `vcodec~=` and `acodec~=` format filters now work.
+- `--no-solve` accepts `--list-audio-tracks`.
+- `--merge-output-format webm` with `--embed-subs` fails before downloading.
+- `resolveAudio(..., { ensurePlayable: true })` no longer fails for HLS-only
+  audio, and `resolve(..., { ensurePlayable: false })` is accepted.
+- Parallel downloads fall back to a single request when the server ignores
+  range requests and returns HTTP 200.
+
 ## 1.5.0
 
 ### Changed

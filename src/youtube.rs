@@ -255,7 +255,7 @@ pub fn classify(url: &str, no_playlist: bool) -> Result<Target> {
     ))
 }
 
-pub fn video_id_from_url(url: &Url) -> Option<String> {
+fn video_id_from_url(url: &Url) -> Option<String> {
     let host = url.host_str()?.trim_start_matches("www.");
     let path = url.path();
 
@@ -616,7 +616,7 @@ fn normalize_player_js_url(url: String) -> String {
 
 const SIGNATURE_CACHE_CAPACITY: usize = 8;
 const SIGNATURE_CACHE_TTL: Duration = Duration::from_hours(6);
-const PLAYER_SOURCE_CACHE_CAPACITY: usize = 8;
+const PLAYER_SOURCE_CACHE_CAPACITY: usize = 4;
 const PLAYER_SOURCE_TTL: Duration = Duration::from_hours(6);
 
 struct SignatureEntry {
@@ -1496,16 +1496,6 @@ pub fn filter_playlist_entries(playlist: &mut PlaylistInfo, selection: &str) -> 
         .entries
         .retain(|entry| mask.get(entry.index).copied().unwrap_or(false));
     Ok(())
-}
-
-pub fn parse_item_ranges(expression: &str, total: usize) -> Result<Vec<usize>> {
-    let mask = playlist_item_mask(expression, total)?;
-    Ok(mask
-        .into_iter()
-        .enumerate()
-        .skip(1)
-        .filter_map(|(index, selected)| selected.then_some(index))
-        .collect())
 }
 
 fn playlist_item_mask(expression: &str, total: usize) -> Result<Vec<bool>> {
@@ -2571,6 +2561,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn parse_item_ranges(expression: &str, total: usize) -> Result<Vec<usize>> {
+        let mask = playlist_item_mask(expression, total)?;
+        Ok(mask
+            .into_iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(index, selected)| selected.then_some(index))
+            .collect())
+    }
+
     #[test]
     fn classifies_watch_url() {
         let target = classify("https://www.youtube.com/watch?v=dQw4w9WgXcQ", false).unwrap();
@@ -2859,7 +2859,10 @@ mod tests {
         );
         assert_eq!(cache.len(), PLAYER_SOURCE_CACHE_CAPACITY - 1);
         assert!(!cache.contains_key("https://www.youtube.com/s/player/lru-0/base.js"));
-        assert!(cache.contains_key("https://www.youtube.com/s/player/lru-7/base.js"));
+        assert!(cache.contains_key(&format!(
+            "https://www.youtube.com/s/player/lru-{}/base.js",
+            PLAYER_SOURCE_CACHE_CAPACITY - 1
+        )));
     }
 
     #[tokio::test]

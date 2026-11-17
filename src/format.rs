@@ -238,7 +238,7 @@ fn ext_matches(actual: &str, expected: &str) -> bool {
             actual.to_ascii_lowercase().as_str(),
             expected.to_ascii_lowercase().as_str()
         ),
-        ("m4a", "mp4") | ("mp4", "m4a") | ("webm", "opus") | ("mka", "m4a")
+        ("m4a", "mp4") | ("mp4", "m4a") | ("webm", "opus")
     )
 }
 
@@ -291,7 +291,22 @@ impl Component {
 fn is_known_ext(value: &str) -> bool {
     matches!(
         value,
-        "mp4" | "webm" | "m4a" | "aac" | "mp3" | "opus" | "flac" | "wav" | "3gp" | "mkv" | "ogg"
+        "mp4"
+            | "webm"
+            | "m4a"
+            | "aac"
+            | "mp3"
+            | "opus"
+            | "flac"
+            | "wav"
+            | "3gp"
+            | "mkv"
+            | "ogg"
+            | "mpg"
+            | "mov"
+            | "m4v"
+            | "flv"
+            | "avi"
     )
 }
 
@@ -324,6 +339,8 @@ fn apply_filter(filter: &mut Filter, expression: &str) -> Result<()> {
         (name.trim(), "!=", value.trim())
     } else if let Some((name, value)) = expression.split_once("^=") {
         (name.trim(), "^=", value.trim())
+    } else if let Some((name, value)) = expression.split_once("~=") {
+        (name.trim(), "~", value.trim())
     } else if let Some((name, value)) = expression.split_once('=') {
         (name.trim(), "=", value.trim())
     } else if let Some((name, value)) = expression.split_once('~') {
@@ -439,10 +456,6 @@ impl FormatSelector {
             YtrustError::FormatNotFound(format!("no format matched {:?}", self.expression))
         }))
     }
-}
-
-pub fn select(info: &VideoInfo, expression: &str) -> Result<FormatSelection> {
-    FormatSelector::parse(expression)?.select(&info.formats)
 }
 
 fn select_alternative(
@@ -696,7 +709,7 @@ pub fn print_formats(info: &VideoInfo) -> Result<()> {
     Ok(())
 }
 
-pub fn write_formats(out: &mut impl std::io::Write, info: &VideoInfo) -> std::io::Result<()> {
+fn write_formats(out: &mut impl std::io::Write, info: &VideoInfo) -> std::io::Result<()> {
     writeln!(
         out,
         "{:<6} {:<6} {:<12} {:<6} {:<14} {:<14} {:<8} {:>10}  NOTE",
@@ -760,6 +773,10 @@ pub fn write_formats(out: &mut impl std::io::Write, info: &VideoInfo) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn select(info: &VideoInfo, expression: &str) -> Result<FormatSelection> {
+        FormatSelector::parse(expression)?.select(&info.formats)
+    }
 
     #[test]
     fn parses_height_filter() {
@@ -869,6 +886,8 @@ mod tests {
         assert_eq!(filter.language_prefix.as_deref(), Some("en"));
         let (_, filter) = parse_filter("bestaudio[language!=de]").unwrap();
         assert_eq!(filter.language_not.as_deref(), Some("de"));
+        let (_, filter) = parse_filter("bestaudio[language~=en]").unwrap();
+        assert_eq!(filter.language_contains.as_deref(), Some("en"));
     }
 
     #[test]

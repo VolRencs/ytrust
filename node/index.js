@@ -34,7 +34,7 @@ const ERROR_CODES = [
   ],
   [
     "INVALID_INPUT",
-    /invalid (url|playlist|search|download section|video id|numeric filter)|search query is empty|playlist items start at 1|playlist URL has no list parameter|multiple download sections|unsupported format (selector|filter)|unclosed format filter|too many components|empty format selector/i,
+    /invalid (url|playlist|search|download section|video id|numeric filter)|search query is empty|playlist items start at 1|playlist URL has no list parameter|multiple download sections|unsupported format (selector|filter)|unclosed format filter|empty format selector/i,
   ],
   ["NO_AUDIO", /no audio/i],
   ["FORMAT_NOT_FOUND", /format not available|no format matched/i],
@@ -45,26 +45,7 @@ const ERROR_CODES = [
   ["INVALID_RESPONSE", /JSON:|invalid JSON|no video details|no streaming data|invalid response/i],
 ];
 
-const KNOWN_CODES = new Set([
-  "AGE_RESTRICTED",
-  "BOTCHECK",
-  "PRIVATE",
-  "UNAVAILABLE",
-  "COOKIES",
-  "UNSUPPORTED_URL",
-  "INVALID_INPUT",
-  "TIMEOUT",
-  "NETWORK",
-  "HTTP",
-  "NO_AUDIO",
-  "INVALID_RESPONSE",
-  "NATIVE_LOAD",
-  "FORMAT_NOT_FOUND",
-  "FFMPEG",
-  "IO",
-  "CHALLENGE_FAILED",
-  "UNKNOWN",
-]);
+const KNOWN_CODES = new Set([...ERROR_CODES.map(([code]) => code), "UNKNOWN"]);
 
 export class YtrustError extends Error {
   constructor(code, message, options) {
@@ -176,7 +157,7 @@ const SOLVED_SIG_CACHE = new Map();
 const INFLIGHT_SOLVES = new Map();
 const UNRESOLVED_FORMATS = new WeakSet();
 const PLAYER_JS_CACHE_LIMIT = 4;
-const CHALLENGE_CACHE_LIMIT = 2000;
+const CHALLENGE_CACHE_LIMIT = 1024;
 
 function warn(message, error) {
   process.emitWarning(error ? `${message}: ${error.message}` : message, { code: "YTRUST_CHALLENGE" });
@@ -197,6 +178,24 @@ function challengeValue(url) {
   } catch {
     return null;
   }
+}
+
+function encodeQueryValue(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) => {
+    return `%${character.charCodeAt(0).toString(16).toUpperCase()}`;
+  });
+}
+
+function setQueryParam(rawUrl, key, value) {
+  const question = rawUrl.indexOf("?");
+  const base = question >= 0 ? rawUrl.slice(0, question) : rawUrl;
+  const query = question >= 0 ? rawUrl.slice(question + 1) : "";
+  const pairs = query
+    .split("&")
+    .filter(Boolean)
+    .filter((pair) => pair.split("=")[0] !== key);
+  pairs.push(`${key}=${encodeQueryValue(value)}`);
+  return `${base}?${pairs.join("&")}`;
 }
 
 function cipherParams(format) {
@@ -312,6 +311,7 @@ async function applyChallenges(result, options, formats = collectFormats(result)
       if (!SOLVED_SIG_CACHE.has(cacheKey(knownPlayerUrl, cipher.s))) sigChallenges.add(cipher.s);
     } else if (cipher && !format.url) {
       format.url = cipher.url;
+      format.needs_challenge = Boolean(challengeValue(format.url));
       delete format.signature_cipher;
       delete format.cipher;
     }
@@ -324,10 +324,9 @@ async function applyChallenges(result, options, formats = collectFormats(result)
   }
   if (!needsWork) return result;
 
-  const playerUrl = await ensurePlayerUrl(result, options);
+  const playerUrl = (await ensurePlayerUrl(result, options)) || knownPlayerUrl;
   if (!playerUrl) {
     warn("resolved formats need challenge solving, but the player JS URL is unknown");
-    return result;
   }
 
   if (knownPlayerUrl !== playerUrl) {
@@ -341,7 +340,7 @@ async function applyChallenges(result, options, formats = collectFormats(result)
 
   let sigData = {};
   let nData = {};
-  if (sigChallenges.size || nChallenges.size) {
+  if (playerUrl && (sigChallenges.size || nChallenges.size)) {
     try {
       const requests = [];
       if (sigChallenges.size) requests.push({ type: "sig", challenges: [...sigChallenges].sort() });
@@ -382,14 +381,8 @@ async function applyChallenges(result, options, formats = collectFormats(result)
       } else {
         const sig = sigData[cipher.s] ?? SOLVED_SIG_CACHE.get(cacheKey(playerUrl, cipher.s));
         if (sig) {
-          try {
-            const parsed = new URL(cipher.url);
-            parsed.searchParams.set(cipher.sp, sig);
-            format.url = parsed.toString();
-            cipherResolved = true;
-          } catch {
-            cipherResolved = false;
-          }
+          format.url = setQueryParam(cipher.url, cipher.sp, sig);
+          cipherResolved = true;
         }
       }
       if (cipherResolved) {
@@ -404,14 +397,8 @@ async function applyChallenges(result, options, formats = collectFormats(result)
       const value = challengeValue(format.url);
       const replacement = value ? (nData[value] ?? SOLVED_N_CACHE.get(cacheKey(playerUrl, value))) : null;
       if (replacement) {
-        try {
-          const parsed = new URL(format.url);
-          parsed.searchParams.set("n", replacement);
-          format.url = parsed.toString();
-          format.needs_challenge = false;
-        } catch {
-          formatUnresolved = true;
-        }
+        format.url = setQueryParam(format.url, "n", replacement);
+        format.needs_challenge = false;
       } else if (value) {
         formatUnresolved = true;
       }
@@ -551,7 +538,7 @@ export async function resolve(input, options = {}) {
   try {
     const source = normalizeInput(input);
     const normalized = normalizeOptions(options);
-    if (normalized.ensurePlayable != null) {
+    if (normalized.ensurePlayable === true) {
       throw new YtrustError("INVALID_INPUT", "ensurePlayable is only supported by resolveAudio");
     }
     const forwarded = nativeOptions(normalized);
@@ -612,11 +599,11 @@ export async function resolveAudio(input, options = {}) {
       throw new YtrustError(code, `no playable audio format found for ${source}`);
     }
 
-    if (normalized.ensurePlayable) {
+    if (normalized.ensurePlayable && chosen.protocol !== "m3u8_native") {
       const ensureCandidates = candidates.filter(
         (candidate) => isPlayable(candidate) && candidate.protocol !== "m3u8_native",
       );
-      if (chosen && chosen.protocol !== "m3u8_native" && !ensureCandidates.includes(chosen)) {
+      if (!ensureCandidates.includes(chosen)) {
         ensureCandidates.unshift(chosen);
       }
       let ensured = null;

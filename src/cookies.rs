@@ -18,7 +18,7 @@ use crate::util::unix_time_i64;
 /// Keep the Cookie header comfortably below common HTTP server/proxy limits.
 const MAX_COOKIE_HEADER_BYTES: usize = 16 * 1024;
 const COOKIE_HEADER_CACHE_TTL: Duration = Duration::from_secs(60);
-const COOKIE_HEADER_CACHE_CAPACITY: usize = 64;
+const COOKIE_HEADER_CACHE_CAPACITY: usize = 16;
 type HeaderCache = Mutex<HashMap<(String, String), (Instant, Option<String>)>>;
 
 /// Authentication and consent cookies that must survive size trimming.
@@ -47,7 +47,7 @@ const ESSENTIAL_COOKIE_NAMES: &[&str] = &[
     "WID",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Cookie {
     domain: String,
     path: String,
@@ -63,15 +63,6 @@ pub struct CookieJar {
     headers: Arc<HeaderCache>,
 }
 
-impl Clone for CookieJar {
-    fn clone(&self) -> Self {
-        Self {
-            cookies: self.cookies.clone(),
-            headers: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-}
-
 impl Default for CookieJar {
     fn default() -> Self {
         Self {
@@ -82,10 +73,6 @@ impl Default for CookieJar {
 }
 
 impl CookieJar {
-    pub fn header_for(&self, host: &str) -> Option<String> {
-        self.header_for_path(host, "/")
-    }
-
     pub fn header_for_url(&self, url: &str) -> Option<String> {
         let url = url::Url::parse(url).ok()?;
         self.header_for_path(url.host_str()?, url.path())
@@ -163,7 +150,7 @@ impl CookieJar {
         value
     }
 
-    pub fn merge(&mut self, mut other: CookieJar) {
+    fn merge(&mut self, mut other: CookieJar) {
         self.cookies.append(&mut other.cookies);
         let mut cache = self.headers.lock_unpoisoned();
         if !cache.is_empty() {
@@ -220,9 +207,8 @@ impl CookieJar {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LoadedCookies {
-    pub header: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
     pub sapisid: Option<String>,
     pub sapisid1p: Option<String>,
@@ -250,7 +236,6 @@ pub fn load(cookie_file: Option<&Path>, from_browser: Option<&str>) -> Result<Lo
     }
 
     Ok(LoadedCookies {
-        header: jar.header_for("www.youtube.com"),
         sapisid: jar.value_for_host("SAPISID", "www.youtube.com"),
         sapisid1p: jar.value_for_host("__Secure-1PAPISID", "www.youtube.com"),
         sapisid3p: jar.value_for_host("__Secure-3PAPISID", "www.youtube.com"),
@@ -945,7 +930,7 @@ mod tests {
 
         let jar = load_from_path(&profile).unwrap();
         assert_eq!(
-            jar.header_for("www.youtube.com"),
+            jar.header_for_url("https://www.youtube.com/"),
             Some("SID=secret".to_string())
         );
     }
@@ -955,7 +940,10 @@ mod tests {
         let mut jar = CookieJar::default();
         jar.insert(".youtube.com", "/", "SID", "secret", 0, false);
         jar.insert(".google.com", "/", "SID", "wrong", 0, false);
-        assert_eq!(jar.header_for("www.youtube.com"), Some("SID=secret".into()));
+        assert_eq!(
+            jar.header_for_url("https://www.youtube.com/"),
+            Some("SID=secret".into())
+        );
     }
 
     #[test]
@@ -963,7 +951,7 @@ mod tests {
         let mut jar = CookieJar::default();
         jar.insert(".youtube.com", "/", "ST-1", &"x".repeat(400_000), 0, false);
         jar.insert(".youtube.com", "/", "SID", "auth", 0, false);
-        let header = jar.header_for("www.youtube.com").unwrap();
+        let header = jar.header_for_url("https://www.youtube.com/").unwrap();
         assert_eq!(header, "SID=auth");
         assert!(header.len() < MAX_COOKIE_HEADER_BYTES);
     }
@@ -982,7 +970,7 @@ mod tests {
                 false,
             );
         }
-        let header = jar.header_for("www.youtube.com").unwrap();
+        let header = jar.header_for_url("https://www.youtube.com/").unwrap();
         assert!(header.starts_with("SID=auth"));
         assert!(header.len() <= MAX_COOKIE_HEADER_BYTES);
     }
@@ -993,7 +981,7 @@ mod tests {
         jar.insert(".youtube.com", "/", "OTHER", "first", 0, false);
         jar.insert(".youtube.com", "/", "SID", "auth", 0, false);
         jar.insert(".youtube.com", "/", "HSID", "auth2", 0, false);
-        let header = jar.header_for("www.youtube.com").unwrap();
+        let header = jar.header_for_url("https://www.youtube.com/").unwrap();
         assert!(header.starts_with("SID=auth; HSID=auth2"));
     }
 
@@ -1002,10 +990,10 @@ mod tests {
         let mut jar = CookieJar::default();
         jar.insert("www.youtube.com", "/", "SID", "www-only", 0, true);
         jar.insert(".youtube.com", "/", "PREF", "shared", 0, false);
-        let header = jar.header_for("m.youtube.com").unwrap();
+        let header = jar.header_for_url("https://m.youtube.com/").unwrap();
         assert!(!header.contains("SID="));
         assert!(header.contains("PREF=shared"));
-        let header = jar.header_for("www.youtube.com").unwrap();
+        let header = jar.header_for_url("https://www.youtube.com/").unwrap();
         assert!(header.contains("SID=www-only"));
     }
 
@@ -1028,7 +1016,7 @@ mod tests {
         let mut jar = CookieJar::default();
         jar.insert(".youtube.com", "/", "SID", &"s".repeat(20_000), 0, false);
         jar.insert(".youtube.com", "/", "PREF", "ok", 0, false);
-        let header = jar.header_for("www.youtube.com");
+        let header = jar.header_for_url("https://www.youtube.com/");
         assert!(header.is_none() || header.unwrap().len() <= MAX_COOKIE_HEADER_BYTES);
     }
 }

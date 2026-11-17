@@ -137,6 +137,14 @@ test("resolve validates options before calling native code", async () => {
     },
   );
   await assert.rejects(
+    () => resolve("https://example.com/x", { ensurePlayable: false }),
+    (error) => {
+      assert.ok(error instanceof YtrustError);
+      assert.equal(error.code, "UNSUPPORTED_URL");
+      return true;
+    },
+  );
+  await assert.rejects(
     // @ts-expect-error testing solveChallenges validation
     () => resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", { solveChallenges: "yes" }),
     (error) => {

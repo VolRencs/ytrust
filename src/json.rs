@@ -20,13 +20,7 @@ pub fn video_json_with_playlist(
         .iter()
         .map(|format| format_json(format, info.duration_secs))
         .collect();
-    let best_audio = best_audio(info)
-        .and_then(|best| {
-            info.formats
-                .iter()
-                .position(|format| std::ptr::eq(format, best))
-        })
-        .and_then(|index| formats.get(index).cloned());
+    let best_audio = best_audio(info).map(|format| format_json(format, info.duration_secs));
     json!({
         "_type": "video",
         "id": info.id,
