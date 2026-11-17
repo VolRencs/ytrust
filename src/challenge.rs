@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -47,12 +47,13 @@ struct SolverServer {
 
 #[derive(Default)]
 struct SolverCache {
-    preprocessed: HashMap<String, String>,
+    preprocessed: HashMap<String, (Instant, String)>,
     sig: HashMap<(String, String), String>,
     n: HashMap<(String, String), String>,
 }
 
 const SOLVER_CACHE_ENTRIES: usize = 4096;
+const PREPROCESSED_CACHE_ENTRIES: usize = 4;
 
 struct CipherParams {
     url: String,
@@ -211,7 +212,7 @@ impl ChallengeSolver {
         let needs = if selection.is_some() {
             selected_formats
                 .iter()
-                .any(|format| format_needs_challenge(format))
+                .any(|format| format.needs_challenge())
         } else {
             needs_challenges(info)
         };
@@ -256,33 +257,38 @@ impl ChallengeSolver {
 
         if !requests.is_empty() {
             let preprocessed = {
-                let cache = self.cache.lock_unpoisoned();
-                cache.preprocessed.get(&player_url).cloned()
+                let mut cache = self.cache.lock_unpoisoned();
+                cache
+                    .preprocessed
+                    .get_mut(&player_url)
+                    .map(|(used_at, value)| {
+                        *used_at = Instant::now();
+                        value.clone()
+                    })
             };
             // The preprocessed player is all the solver needs. Fetching the
             // multi-megabyte raw source as well is pure overhead.
             let source = if preprocessed.is_some() {
-                String::new()
+                None
             } else {
-                match youtube::cached_player_source(&player_url) {
-                    Some(source) => source,
-                    None => match youtube::fetch_player_source(&player_url, config).await {
-                        Ok(source) => {
-                            youtube::remember_player_source(&player_url, &source);
-                            source
-                        }
-                        Err(error) => {
-                            report.error = Some(format!("could not fetch player JS: {error}"));
-                            warn!("{}", report.error.as_deref().unwrap_or_default());
-                            report.unresolved = apply_values(info, &sig_values, &n_values);
-                            return Ok(report);
-                        }
-                    },
+                match youtube::player_source(&player_url, config).await {
+                    Ok(source) => Some(source),
+                    Err(error) => {
+                        report.error = Some(format!("could not fetch player JS: {error}"));
+                        warn!("{}", report.error.as_deref().unwrap_or_default());
+                        report.unresolved = apply_values(info, &sig_values, &n_values);
+                        return Ok(report);
+                    }
                 }
             };
             report.attempted = true;
             match self
-                .run_solver(runtime, &source, preprocessed.as_deref(), &requests)
+                .run_solver(
+                    runtime,
+                    source.as_deref().unwrap_or_default(),
+                    preprocessed.as_deref(),
+                    &requests,
+                )
                 .await
             {
                 Ok(output) => {
@@ -296,12 +302,19 @@ impl ChallengeSolver {
                     } else {
                         if let Some(preprocessed) = output.preprocessed_player {
                             let mut cache = self.cache.lock_unpoisoned();
-                            if cache.preprocessed.len() >= 4
+                            if cache.preprocessed.len() >= PREPROCESSED_CACHE_ENTRIES
                                 && !cache.preprocessed.contains_key(&player_url)
+                                && let Some(oldest) = cache
+                                    .preprocessed
+                                    .iter()
+                                    .min_by_key(|(_, (used_at, _))| *used_at)
+                                    .map(|(key, _)| key.clone())
                             {
-                                cache.preprocessed.clear();
+                                cache.preprocessed.remove(&oldest);
                             }
-                            cache.preprocessed.insert(player_url.clone(), preprocessed);
+                            cache
+                                .preprocessed
+                                .insert(player_url.clone(), (Instant::now(), preprocessed));
                         }
                         if let Some(responses) = output.responses {
                             for response in responses {
@@ -357,13 +370,7 @@ impl ChallengeSolver {
 }
 
 pub fn needs_challenges(info: &VideoInfo) -> bool {
-    info.formats.iter().any(format_needs_challenge)
-}
-
-fn format_needs_challenge(format: &Format) -> bool {
-    format.signature_cipher.is_some()
-        || format.cipher.is_some()
-        || (!format.url.is_empty() && challenge_value(&format.url, "n").is_some())
+    info.formats.iter().any(Format::needs_challenge)
 }
 
 fn collect_requests<'a>(

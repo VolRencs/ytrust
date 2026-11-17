@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.5.0
+
+### Changed
+
+- Download locks are stored under the platform cache directory
+  (`ytrust/locks`), keyed by a hash of the absolute `.part` path, instead of
+  leaving `<file>.part.lock` files next to downloaded media. Existing 1.4.0
+  `.part.lock` files are safe to delete.
+- Signature timestamps for TVHTML5 now come from the watch page's `ytcfg.STS`,
+  so cold resolves no longer download the multi-megabyte player JS before the
+  player API request. On that path player JS is fetched only for challenge
+  solving or the narrow reload fallback below, and its signature timestamp is
+  cached for later requests.
+- The player JS source cache is now LRU-bounded and deduplicates concurrent
+  fetches. When challenge solving is enabled, the source download can be
+  prefetched in parallel with the player API request. Cached sources are shared
+  through `Arc<str>` instead of being cloned per access.
+- `resolve_player_js` is only enabled when challenge solving is actually
+  needed, avoiding player URL discovery for format listings.
+
+### Fixed
+
+- A TVHTML5 player response with `The page needs to be reloaded.` now retries
+  once with a fresh signature timestamp extracted from the player JS instead of
+  failing the resolve. The fallback is limited to that specific error and does
+  not change the existing client order.
+
 ## 1.4.0
 
 ### Added

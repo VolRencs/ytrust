@@ -106,6 +106,7 @@ async fn request_config(
         timeout,
         prefer_jsless: options.solve_challenges == Some(false),
         resolve_player_js: options.solve_challenges != Some(false),
+        prefetch_player_source: options.solve_challenges != Some(false),
     };
     let core = CoreResolveOptions {
         no_playlist: options.no_playlist.unwrap_or(false),

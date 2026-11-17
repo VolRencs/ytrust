@@ -38,6 +38,12 @@ pub struct RequestConfig {
     /// Metadata-only runs can disable this to avoid fetching the watch page
     /// solely to discover the player JS URL.
     pub resolve_player_js: bool,
+    /// Start downloading the player JS source as soon as its URL is known so
+    /// the fetch overlaps the player API request.
+    ///
+    /// Only meaningful together with `resolve_player_js`; callers should
+    /// enable it when challenge solving is expected. It defaults to `false`.
+    pub prefetch_player_source: bool,
 }
 
 impl RequestConfig {
@@ -70,6 +76,7 @@ impl Default for RequestConfig {
             timeout: DEFAULT_TIMEOUT_SECS,
             prefer_jsless: false,
             resolve_player_js: true,
+            prefetch_player_source: false,
         }
     }
 }
@@ -154,6 +161,7 @@ pub async fn post_innertube<T: DeserializeOwned>(
 ) -> Result<T> {
     let timeout = Duration::from_secs(config.timeout.max(5));
     let mut last_error = None;
+    let started = Instant::now();
 
     for attempt in 0..=2u32 {
         let mut builder = client
@@ -207,9 +215,10 @@ pub async fn post_innertube<T: DeserializeOwned>(
             Ok((status, after, text)) => {
                 retry_after = after;
                 tracing::debug!(
-                    "innertube {} HTTP {status} ({} bytes)",
+                    "innertube {} HTTP {status} ({} bytes, {} ms)",
                     request.endpoint,
-                    text.len()
+                    text.len(),
+                    started.elapsed().as_millis()
                 );
 
                 if status.is_success() {

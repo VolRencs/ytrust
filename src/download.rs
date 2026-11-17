@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::io::{IsTerminal, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -11,6 +12,7 @@ use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
@@ -98,7 +100,10 @@ struct PartLock {
 
 impl PartLock {
     fn acquire(part: &Path) -> Result<Self> {
-        let path = parallel_lock_path(part);
+        let path = lock_path(part);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -125,6 +130,33 @@ impl Drop for PartLock {
     }
 }
 
+fn lock_path(part: &Path) -> PathBuf {
+    let cache = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ytrust")
+        .join("locks");
+    cache.join(format!("{}.lock", lock_key(part)))
+}
+
+fn lock_key(part: &Path) -> String {
+    let absolute = std::path::absolute(part).unwrap_or_else(|_| part.to_path_buf());
+    let normalized = match (
+        absolute
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok()),
+        absolute.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => absolute,
+    };
+    let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
@@ -137,10 +169,6 @@ fn parallel_state_path(part: &Path) -> PathBuf {
 
 fn parallel_temp_state_path(part: &Path) -> PathBuf {
     append_suffix(part, &format!(".state.tmp.{}", std::process::id()))
-}
-
-fn parallel_lock_path(part: &Path) -> PathBuf {
-    append_suffix(part, ".lock")
 }
 
 fn orphan_suffix() -> String {
@@ -2609,7 +2637,16 @@ mod tests {
     fn part_lock_rejects_concurrent_owners() {
         let dir = tempfile::tempdir().unwrap();
         let part = dir.path().join("video.part");
+        assert!(!append_suffix(&part, ".lock").exists());
+        let lock = lock_path(&part);
+        let cache = dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("ytrust")
+            .join("locks");
+        assert!(lock.starts_with(cache));
+
         let first = PartLock::acquire(&part).unwrap();
+        assert!(!append_suffix(&part, ".lock").exists());
         assert!(PartLock::acquire(&part).is_err());
         drop(first);
         assert!(PartLock::acquire(&part).is_ok());

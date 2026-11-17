@@ -471,12 +471,7 @@ function pickPlayableAudio(formats) {
     if (!isPlayable(format)) continue;
     const hasAudio = typeof format.acodec === "string" && format.acodec !== "none";
     if (!hasAudio && format.protocol !== "m3u8_native") continue;
-    const key = [
-      format.audio_track?.audio_is_default ? 1 : 0,
-      format.vcodec === "none" ? 1 : 0,
-      isOpus(format) ? 1 : 0,
-      audioRate(format),
-    ];
+    const key = audioKey(format);
     if (!best || compareKeys(key, bestKey) > 0) {
       best = format;
       bestKey = key;

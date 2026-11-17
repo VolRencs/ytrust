@@ -39,9 +39,12 @@ should retry `403` for a few seconds (for ffmpeg use
 will do it for you. Ciphered formats are solved with
 yt-dlp's EJS bundle in a bounded worker pool, and player JS is fetched through
 the same proxy/timeout/cookies configuration as the API requests. This keeps
-challenge solving off the Node event loop. Player JS URLs are cached for 30
-minutes, and the preprocessed EJS player is reused across videos, so subsequent
-resolves skip most of the solver warm-up cost.
+challenge solving off the Node event loop. The player JS source is prefetched
+while the player API request is in flight, its cache deduplicates concurrent
+fetches, and the preprocessed EJS player is reused across videos, so subsequent
+resolves skip most of the solver warm-up cost. Signature timestamps come from
+the watch page's `ytcfg`; the multi-megabyte player JS is downloaded only for
+challenge solving or a narrow page-reload retry.
 
 ## Browser cookies
 

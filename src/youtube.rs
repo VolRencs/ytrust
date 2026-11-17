@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::OnceCell as AsyncOnceCell;
+use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::constants::{
@@ -133,6 +135,13 @@ impl Format {
         duration_secs
             .filter(|duration| *duration > 0 && bitrate > 0)
             .map(|duration| bitrate.saturating_mul(duration) / 8)
+    }
+
+    /// True when the stream still needs signature or `n` challenge solving.
+    pub fn needs_challenge(&self) -> bool {
+        self.signature_cipher.is_some()
+            || self.cipher.is_some()
+            || (!self.url.is_empty() && url_has_n(&self.url))
     }
 }
 
@@ -298,31 +307,38 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
                 let PlayerFetch {
                     response,
                     watch_metadata,
+                    player_js_url: known_player_url,
+                    source_prefetch,
                 } = fetched;
                 match parse_video_info(video_id, response, client_kind, None) {
                     Ok(mut info) if !info.formats.is_empty() => {
                         if let Some(watch) = watch_metadata {
                             merge_watch_metadata(&mut info, watch);
                         }
-                        if info.title.is_empty()
-                            && let Some(html) = fetch_watch_html(video_id, config).await
-                            && let Ok(value) =
-                                extract_json_assignment(&html, "ytInitialPlayerResponse")
-                            && let Ok(watch) = serde_json::from_value::<PlayerResponse>(value)
-                        {
-                            merge_watch_metadata(&mut info, watch);
-                        }
                         if !config.resolve_player_js || !needs_player_js(&info) {
                             return Ok(info);
                         }
-                        match player_js_url(video_id, config).await {
-                            Ok(url) => {
-                                info.player_js_url = Some(url);
-                                return Ok(info);
-                            }
-                            Err(error) => errors.push(error),
+                        let player_url = match known_player_url {
+                            Some(url) => Some(url),
+                            None => match player_js_url(video_id, config).await {
+                                Ok(url) => Some(url),
+                                Err(error) => {
+                                    errors.push(error);
+                                    None
+                                }
+                            },
+                        };
+                        let Some(player_url) = player_url else {
+                            partial = Some(info);
+                            continue;
+                        };
+                        info.player_js_url = Some(player_url);
+                        if let Some(prefetch) = source_prefetch
+                            && let Some(Err(error)) = prefetch.wait().await
+                        {
+                            tracing::debug!("player JS prefetch failed: {error}");
                         }
-                        partial = Some(info);
+                        return Ok(info);
                     }
                     Ok(_) => {
                         errors.push(YtrustError::coded(
@@ -337,7 +353,7 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
         }
     }
 
-    match fetch_web_embedded_video(video_id, config).await {
+    match fetch_web_embedded_video(&client, video_id, config).await {
         Ok(info) if !info.formats.is_empty() => return Ok(info),
         Ok(_) => {
             errors.push(YtrustError::coded(
@@ -362,12 +378,22 @@ pub async fn fetch_video(video_id: &str, config: &RequestConfig) -> Result<Video
     }))
 }
 
-async fn fetch_watch_html(video_id: &str, config: &RequestConfig) -> Option<String> {
-    let client = build_client(config).ok()?;
+async fn fetch_watch_html(
+    client: &reqwest::Client,
+    video_id: &str,
+    config: &RequestConfig,
+) -> Option<String> {
     let watch_url = format!("https://www.youtube.com/watch?v={video_id}&hl=en&gl=US");
-    fetch_text(&client, &watch_url, config, WEB_UA, None)
+    let started = Instant::now();
+    let html = fetch_text(client, &watch_url, config, WEB_UA, None)
         .await
-        .ok()
+        .ok();
+    tracing::debug!(
+        "watch page fetched: bytes={} elapsed_ms={}",
+        html.as_ref().map_or(0, String::len),
+        started.elapsed().as_millis()
+    );
+    html
 }
 
 fn merge_watch_metadata(info: &mut VideoInfo, response: PlayerResponse) {
@@ -433,17 +459,14 @@ fn merge_watch_metadata(info: &mut VideoInfo, response: PlayerResponse) {
 }
 
 fn needs_player_js(info: &VideoInfo) -> bool {
-    info.formats.iter().any(|format| {
-        format.signature_cipher.is_some()
-            || format.cipher.is_some()
-            || (!format.url.is_empty() && url_has_n(&format.url))
-    })
+    info.formats.iter().any(Format::needs_challenge)
 }
 
 fn url_has_n(url: &str) -> bool {
-    Url::parse(url)
-        .ok()
-        .is_some_and(|url| url.query_pairs().any(|(key, _)| key == "n"))
+    Url::parse(url).ok().is_some_and(|url| {
+        url.query_pairs()
+            .any(|(key, value)| key == "n" && !value.is_empty())
+    })
 }
 
 const PLAYER_JS_URL_TTL: Duration = Duration::from_mins(30);
@@ -517,6 +540,10 @@ async fn fetch_player_js_url(video_id: &str, config: &RequestConfig) -> Result<S
 
 /// Fetch the player JavaScript source through the configured proxy/timeout.
 pub async fn fetch_player_source(url: &str, config: &RequestConfig) -> Result<String> {
+    Ok(player_source(url, config).await?.to_string())
+}
+
+fn validate_player_source_url(url: &str) -> Result<()> {
     let parsed = Url::parse(url)
         .map_err(|_| YtrustError::coded(ErrorCode::InvalidInput, "invalid player JS URL"))?;
     if parsed.scheme() != "https"
@@ -531,14 +558,23 @@ pub async fn fetch_player_source(url: &str, config: &RequestConfig) -> Result<St
             "player JS URL must use https and a youtube.com host",
         ));
     }
-    if let Some(source) = cached_player_source(url) {
-        return Ok(source);
-    }
+    Ok(())
+}
+
+async fn fetch_player_source_uncached(url: &str, config: &RequestConfig) -> Result<Arc<str>> {
+    validate_player_source_url(url)?;
     let client = build_client(config)?;
+    let started = Instant::now();
+    tracing::debug!("player JS fetch started: url={url}");
     let source =
         fetch_text_limited(&client, url, config, WEB_UA, None, MAX_PLAYER_JS_BYTES).await?;
-    remember_player_source(url, &source);
-    Ok(source)
+    tracing::debug!(
+        "player JS fetched: url={} bytes={} elapsed_ms={}",
+        url,
+        source.len(),
+        started.elapsed().as_millis()
+    );
+    Ok(Arc::from(source))
 }
 
 fn extract_player_js_url(html: &str) -> Option<String> {
@@ -573,42 +609,221 @@ fn player_js_url_from_cfg(ytcfg: &Value) -> Option<String> {
 /// extraction and challenge solving.
 fn normalize_player_js_url(url: String) -> String {
     url.replace("player_es6_tcl.vflset", "player_es6.vflset")
+        .replace("player_es6_tcc.vflset", "player_es6.vflset")
         .replace("player_ias_tcl.vflset", "player_ias.vflset")
+        .replace("player_ias_tcc.vflset", "player_ias.vflset")
 }
 
 const SIGNATURE_CACHE_CAPACITY: usize = 8;
 const SIGNATURE_CACHE_TTL: Duration = Duration::from_hours(6);
-const PLAYER_SOURCE_CACHE_CAPACITY: usize = 4;
+const PLAYER_SOURCE_CACHE_CAPACITY: usize = 8;
+const PLAYER_SOURCE_TTL: Duration = Duration::from_hours(6);
 
-static SIGNATURE_TIMESTAMPS: LazyLock<Mutex<HashMap<String, (Instant, u64)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static PLAYER_SOURCES: LazyLock<Mutex<HashMap<String, (Instant, String)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub(crate) fn cached_player_source(player_js_url: &str) -> Option<String> {
-    let cache = &*PLAYER_SOURCES;
-    let cache = cache.lock_unpoisoned();
-    let (cached_at, source) = cache.get(player_js_url)?;
-    (cached_at.elapsed() < SIGNATURE_CACHE_TTL).then(|| source.clone())
+struct SignatureEntry {
+    inserted_at: Instant,
+    last_used: Instant,
+    value: u64,
 }
 
-pub(crate) fn remember_player_source(player_js_url: &str, source: &str) {
-    let cache = &*PLAYER_SOURCES;
+struct PlayerSourceEntry {
+    cell: Arc<AsyncOnceCell<Arc<str>>>,
+    inserted_at: Instant,
+    last_used: Instant,
+}
+
+static SIGNATURE_TIMESTAMPS: LazyLock<Mutex<HashMap<String, SignatureEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PLAYER_SOURCES: LazyLock<Mutex<HashMap<String, PlayerSourceEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn sts_from_ytcfg(ytcfg: &Value) -> Option<u64> {
+    let value = match ytcfg.get("STS")? {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }?;
+    (value > 0).then_some(value)
+}
+
+fn cached_sts(player_js_url: &str) -> Option<u64> {
+    let cache = &*SIGNATURE_TIMESTAMPS;
     let mut cache = cache.lock_unpoisoned();
-    if cache.len() >= PLAYER_SOURCE_CACHE_CAPACITY && !cache.contains_key(player_js_url) {
-        cache.clear();
+    let entry = cache.get_mut(player_js_url)?;
+    if entry.inserted_at.elapsed() >= SIGNATURE_CACHE_TTL {
+        cache.remove(player_js_url);
+        return None;
+    }
+    entry.last_used = Instant::now();
+    Some(entry.value)
+}
+
+fn remember_sts(player_js_url: &str, value: u64) {
+    if value == 0 {
+        return;
+    }
+    let now = Instant::now();
+    let mut cache = SIGNATURE_TIMESTAMPS.lock_unpoisoned();
+    if cache.len() >= SIGNATURE_CACHE_CAPACITY
+        && !cache.contains_key(player_js_url)
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
     }
     cache.insert(
         player_js_url.to_string(),
-        (Instant::now(), source.to_string()),
+        SignatureEntry {
+            inserted_at: now,
+            last_used: now,
+            value,
+        },
     );
 }
 
-async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Result<VideoInfo> {
-    let client = build_client(config)?;
+fn source_entry_is_fresh(entry: &PlayerSourceEntry) -> bool {
+    entry.inserted_at.elapsed() < PLAYER_SOURCE_TTL
+}
+
+fn evict_player_source(cache: &mut HashMap<String, PlayerSourceEntry>, incoming: &str) {
+    if cache.len() < PLAYER_SOURCE_CACHE_CAPACITY || cache.contains_key(incoming) {
+        return;
+    }
+    let oldest = cache
+        .iter()
+        .filter(|(_, entry)| entry.cell.get().is_some())
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(key, _)| key.clone());
+    if let Some(oldest) = oldest {
+        cache.remove(&oldest);
+    }
+}
+
+fn store_player_source(player_js_url: &str, source: Arc<str>) {
+    let now = Instant::now();
+    let cell = AsyncOnceCell::new();
+    let _ = cell.set(Arc::clone(&source));
+    {
+        let mut cache = PLAYER_SOURCES.lock_unpoisoned();
+        evict_player_source(&mut cache, player_js_url);
+        cache.insert(
+            player_js_url.to_string(),
+            PlayerSourceEntry {
+                cell: Arc::new(cell),
+                inserted_at: now,
+                last_used: now,
+            },
+        );
+    }
+    if let Some(value) = find_signature_timestamp(&source) {
+        remember_sts(player_js_url, value);
+    }
+}
+
+pub(crate) fn cached_player_source(player_js_url: &str) -> Option<Arc<str>> {
+    let cache = &*PLAYER_SOURCES;
+    let mut cache = cache.lock_unpoisoned();
+    let entry = cache.get_mut(player_js_url)?;
+    if !source_entry_is_fresh(entry) {
+        cache.remove(player_js_url);
+        return None;
+    }
+    entry.last_used = Instant::now();
+    entry.cell.get().cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn remember_player_source(player_js_url: &str, source: &str) {
+    store_player_source(player_js_url, Arc::from(source));
+}
+
+/// Load the player JavaScript once per URL, sharing an in-flight fetch between
+/// prefetch and challenge solving.
+pub(crate) async fn player_source(player_js_url: &str, config: &RequestConfig) -> Result<Arc<str>> {
+    player_source_with(player_js_url, || {
+        fetch_player_source_uncached(player_js_url, config)
+    })
+    .await
+}
+
+async fn player_source_with<F, Fut>(player_js_url: &str, fetch: F) -> Result<Arc<str>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Arc<str>>>,
+{
+    if let Some(source) = cached_player_source(player_js_url) {
+        tracing::debug!("player JS cache hit: url={player_js_url}");
+        return Ok(source);
+    }
+    let cell = {
+        let mut cache = PLAYER_SOURCES.lock_unpoisoned();
+        let now = Instant::now();
+        if let Some(entry) = cache.get_mut(player_js_url)
+            && source_entry_is_fresh(entry)
+        {
+            entry.last_used = now;
+            Arc::clone(&entry.cell)
+        } else {
+            let cell = Arc::new(AsyncOnceCell::new());
+            evict_player_source(&mut cache, player_js_url);
+            cache.insert(
+                player_js_url.to_string(),
+                PlayerSourceEntry {
+                    cell: Arc::clone(&cell),
+                    inserted_at: now,
+                    last_used: now,
+                },
+            );
+            cell
+        }
+    };
+    let source = Arc::clone(cell.get_or_try_init(fetch).await?);
+    // Replace the in-flight cell with an initialized entry so the signature
+    // timestamp is extracted and later callers can read it synchronously.
+    store_player_source(player_js_url, Arc::clone(&source));
+    Ok(source)
+}
+
+/// Background player-JS fetch that is cancelled when it is not awaited.
+pub(crate) struct SourcePrefetch(Option<JoinHandle<Result<Arc<str>>>>);
+
+impl SourcePrefetch {
+    fn spawn(url: String, config: RequestConfig) -> Self {
+        tracing::debug!("player JS prefetch spawned: url={url}");
+        Self(Some(tokio::spawn(async move {
+            player_source(&url, &config).await
+        })))
+    }
+
+    async fn wait(mut self) -> Option<Result<Arc<str>>> {
+        let handle = self.0.take()?;
+        match handle.await {
+            Ok(result) => Some(result),
+            Err(error) => Some(Err(YtrustError::coded(
+                ErrorCode::Unknown,
+                format!("player JS prefetch task failed: {error}"),
+            ))),
+        }
+    }
+}
+
+impl Drop for SourcePrefetch {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+async fn fetch_web_embedded_video(
+    client: &reqwest::Client,
+    video_id: &str,
+    config: &RequestConfig,
+) -> Result<VideoInfo> {
     let embed_url = format!("https://www.youtube.com/embed/{video_id}?html5=1");
     let html = fetch_text(
-        &client,
+        client,
         &embed_url,
         config,
         WEB_EMBEDDED_UA,
@@ -660,44 +875,43 @@ async fn fetch_web_embedded_video(video_id: &str, config: &RequestConfig) -> Res
         )
     })?;
     remember_player_js_url(&player_js_url);
-    let signature_timestamp = signature_timestamp(&client, &player_js_url, config).await?;
+    let signature_timestamp = match sts_from_ytcfg(&ytcfg).or_else(|| cached_sts(&player_js_url)) {
+        Some(value) => value,
+        None => signature_timestamp(&player_js_url, config).await?,
+    };
     let encrypted_flags = ytcfg
         .pointer("/WEB_PLAYER_CONTEXT_CONFIGS/WEB_PLAYER_CONTEXT_CONFIG_ID_EMBEDDED_PLAYER/encryptedHostFlags")
         .and_then(Value::as_str);
-    let mut playback = json!({
-        "html5Preference": "HTML5_PREF_WANTS",
-        "signatureTimestamp": signature_timestamp,
-    });
-    if let Some(flags) = encrypted_flags {
-        playback["encryptedHostFlags"] = json!(flags);
-    }
     let client_version = ytcfg
         .pointer("/INNERTUBE_CONTEXT/client/clientVersion")
         .and_then(Value::as_str)
         .unwrap_or(WEB_EMBEDDED_CLIENT_VERSION);
-    let body = json!({
+    let mut body = json!({
         "context": context,
         "videoId": video_id,
-        "playbackContext": {"contentPlaybackContext": playback},
+        "playbackContext": playback_context(Some(signature_timestamp), encrypted_flags),
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
-    let response: PlayerResponse = post_innertube(
-        &client,
-        InnertubeRequest {
-            endpoint: "player",
-            body: &body,
-            client_name: WEB_EMBEDDED_CLIENT_ID,
-            client_version,
-            user_agent: WEB_EMBEDDED_UA,
-            visitor_data,
-            user_session_id: ytcfg.get("USER_SESSION_ID").and_then(Value::as_str),
-            browser: true,
-            send_cookies: true,
-        },
+    let user_session_id = ytcfg.get("USER_SESSION_ID").and_then(Value::as_str);
+    let mut response: PlayerResponse = post_innertube(
+        client,
+        web_embedded_player_request(&body, client_version, visitor_data, user_session_id),
         config,
     )
     .await?;
+    if needs_page_reload(&response)
+        && let Ok(fresh) = signature_timestamp_fresh(&player_js_url, config).await
+    {
+        tracing::debug!("retrying embed player request with a fresh signature timestamp");
+        body["playbackContext"] = playback_context(Some(fresh), encrypted_flags);
+        response = post_innertube(
+            client,
+            web_embedded_player_request(&body, client_version, visitor_data, user_session_id),
+            config,
+        )
+        .await?;
+    }
     let mut info = parse_video_info(
         video_id,
         response,
@@ -724,52 +938,47 @@ fn upload_date_from_html(html: &str) -> Option<String> {
     None
 }
 
-async fn signature_timestamp(
-    client: &reqwest::Client,
-    player_js_url: &str,
-    config: &RequestConfig,
-) -> Result<u64> {
-    {
-        let cache = &*SIGNATURE_TIMESTAMPS;
-        let cache = cache.lock_unpoisoned();
-        if let Some((cached_at, value)) = cache.get(player_js_url)
-            && cached_at.elapsed() < SIGNATURE_CACHE_TTL
-        {
-            return Ok(*value);
-        }
+fn playback_context(sts: Option<u64>, encrypted_flags: Option<&str>) -> Value {
+    let mut playback = json!({"html5Preference": "HTML5_PREF_WANTS"});
+    if let Some(sts) = sts {
+        playback["signatureTimestamp"] = json!(sts);
     }
-    let source = if let Some(source) = cached_player_source(player_js_url) {
-        source
-    } else {
-        let source = fetch_text_limited(
-            client,
-            player_js_url,
-            config,
-            WEB_EMBEDDED_UA,
-            None,
-            MAX_PLAYER_JS_BYTES,
-        )
-        .await?;
-        remember_player_source(player_js_url, &source);
-        source
+    if let Some(flags) = encrypted_flags {
+        playback["encryptedHostFlags"] = json!(flags);
+    }
+    json!({"contentPlaybackContext": playback})
+}
+
+fn needs_page_reload(response: &PlayerResponse) -> bool {
+    let Some(status) = &response.playability_status else {
+        return false;
     };
+    if status.status == "OK" {
+        return false;
+    }
+    status.reason.as_deref().is_some_and(|reason| {
+        reason
+            .to_ascii_lowercase()
+            .contains("page needs to be reloaded")
+    })
+}
+
+async fn signature_timestamp(player_js_url: &str, config: &RequestConfig) -> Result<u64> {
+    if let Some(value) = cached_sts(player_js_url) {
+        return Ok(value);
+    }
+    signature_timestamp_fresh(player_js_url, config).await
+}
+
+async fn signature_timestamp_fresh(player_js_url: &str, config: &RequestConfig) -> Result<u64> {
+    let source = player_source(player_js_url, config).await?;
     let value = find_signature_timestamp(&source).ok_or_else(|| {
         YtrustError::coded(
             ErrorCode::InvalidResponse,
             "player JS has no valid signatureTimestamp",
         )
     })?;
-    let cache = &*SIGNATURE_TIMESTAMPS;
-    let mut cache = cache.lock_unpoisoned();
-    if cache.len() >= SIGNATURE_CACHE_CAPACITY
-        && let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, (cached_at, _))| *cached_at)
-            .map(|(key, _)| key.clone())
-    {
-        cache.remove(&oldest);
-    }
-    cache.insert(player_js_url.to_string(), (Instant::now(), value));
+    remember_sts(player_js_url, value);
     Ok(value)
 }
 
@@ -1456,6 +1665,42 @@ fn web_context() -> Value {
 struct PlayerFetch {
     response: PlayerResponse,
     watch_metadata: Option<PlayerResponse>,
+    player_js_url: Option<String>,
+    source_prefetch: Option<SourcePrefetch>,
+}
+
+fn player_api_request<'a>(body: &'a Value, client_kind: ClientKind) -> InnertubeRequest<'a> {
+    let (_, client_name, client_version) = client_kind.context();
+    InnertubeRequest {
+        endpoint: "player",
+        body,
+        client_name,
+        client_version,
+        user_agent: client_kind.user_agent(),
+        visitor_data: None,
+        user_session_id: None,
+        browser: false,
+        send_cookies: client_kind.supports_cookies(),
+    }
+}
+
+fn web_embedded_player_request<'a>(
+    body: &'a Value,
+    client_version: &'a str,
+    visitor_data: Option<&'a str>,
+    user_session_id: Option<&'a str>,
+) -> InnertubeRequest<'a> {
+    InnertubeRequest {
+        endpoint: "player",
+        body,
+        client_name: WEB_EMBEDDED_CLIENT_ID,
+        client_version,
+        user_agent: WEB_EMBEDDED_UA,
+        visitor_data,
+        user_session_id,
+        browser: true,
+        send_cookies: true,
+    }
 }
 
 async fn fetch_player_response(
@@ -1464,7 +1709,7 @@ async fn fetch_player_response(
     client_kind: ClientKind,
     config: &RequestConfig,
 ) -> Result<PlayerFetch> {
-    let (context, client_name, client_version) = client_kind.context();
+    let (context, _, _) = client_kind.context();
     let mut body = json!({
         "context": {"client": context},
         "videoId": video_id,
@@ -1472,58 +1717,71 @@ async fn fetch_player_response(
         "racyCheckOk": true,
     });
     let mut watch_metadata = None;
+    let mut player_js_url = None;
+    let mut source_prefetch = None;
     if client_kind == ClientKind::TvSamsung {
         // TVHTML5 clients reject requests without a playback context and a
         // current signature timestamp. yt-dlp sends the same fields. The watch
         // page also supplies the metadata TVHTML5 omits from its response.
-        let watch_html = fetch_watch_html(video_id, config).await;
+        let watch_html = fetch_watch_html(client, video_id, config).await;
+        let ytcfg = watch_html.as_deref().and_then(extract_ytcfg);
         if let Some(html) = &watch_html
             && let Ok(value) = extract_json_assignment(html, "ytInitialPlayerResponse")
         {
             watch_metadata = serde_json::from_value(value).ok();
         }
-        let player_url = watch_html
+        player_js_url = ytcfg
             .as_ref()
-            .and_then(|html| extract_ytcfg(html))
-            .and_then(|config| player_js_url_from_cfg(&config))
+            .and_then(player_js_url_from_cfg)
             .or_else(cached_player_js_url);
-        if let Some(player_url) = player_url {
-            remember_player_js_url(&player_url);
-            match signature_timestamp(client, &player_url, config).await {
-                Ok(timestamp) => {
-                    body["playbackContext"] = json!({
-                        "contentPlaybackContext": {
-                            "html5Preference": "HTML5_PREF_WANTS",
-                            "signatureTimestamp": timestamp,
-                        }
-                    });
-                }
-                Err(error) => tracing::debug!("TvSamsung signature timestamp unavailable: {error}"),
+        if let Some(player_url) = player_js_url.as_deref() {
+            remember_player_js_url(player_url);
+            if let Some(sts) = ytcfg
+                .as_ref()
+                .and_then(sts_from_ytcfg)
+                .or_else(|| cached_sts(player_url))
+            {
+                body["playbackContext"] = playback_context(Some(sts), None);
+            } else {
+                tracing::debug!("TvSamsung signature timestamp unavailable before player request");
+            }
+            if config.prefetch_player_source
+                && config.resolve_player_js
+                && cached_player_source(player_url).is_none()
+            {
+                source_prefetch = Some(SourcePrefetch::spawn(
+                    player_url.to_string(),
+                    config.clone(),
+                ));
             }
         } else {
             tracing::debug!("TvSamsung player JS URL unavailable");
         }
     }
 
-    let response = post_innertube(
-        client,
-        InnertubeRequest {
-            endpoint: "player",
-            body: &body,
-            client_name,
-            client_version,
-            user_agent: client_kind.user_agent(),
-            visitor_data: None,
-            user_session_id: None,
-            browser: false,
-            send_cookies: client_kind.supports_cookies(),
-        },
-        config,
-    )
-    .await?;
+    let mut response =
+        post_innertube(client, player_api_request(&body, client_kind), config).await?;
+    if client_kind == ClientKind::TvSamsung
+        && needs_page_reload(&response)
+        && let Some(player_url) = player_js_url.as_deref()
+    {
+        match signature_timestamp_fresh(player_url, config).await {
+            Ok(fresh) => {
+                tracing::debug!(
+                    "retrying TvSamsung player request with a fresh signature timestamp"
+                );
+                body["playbackContext"] = playback_context(Some(fresh), None);
+                response =
+                    post_innertube(client, player_api_request(&body, client_kind), config).await?;
+            }
+            Err(error) => tracing::debug!("TvSamsung reload recovery failed: {error}"),
+        }
+    }
     Ok(PlayerFetch {
         response,
         watch_metadata,
+        player_js_url,
+        source_prefetch,
     })
 }
 
@@ -1913,9 +2171,6 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
         return None;
     }
 
-    let needs_challenge = raw.signature_cipher.is_some()
-        || raw.cipher.is_some()
-        || (!url.is_empty() && url_has_n(&url));
     let (container, video_codec, audio_codec, has_video, has_audio) =
         parse_mime_and_codecs(&raw.mime_type);
     let language = raw
@@ -1930,7 +2185,7 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
         .flatten()
         .filter(|bitrate| *bitrate > 0);
 
-    Some(Format {
+    let mut format = Format {
         itag: raw.itag,
         url,
         signature_cipher: raw.signature_cipher,
@@ -1960,9 +2215,11 @@ fn parse_format(raw: RawFormat, client_kind: ClientKind, is_live: bool) -> Optio
             .and_then(|track| track.audio_is_default)
             .unwrap_or(false),
         language,
-        needs_challenge,
+        needs_challenge: false,
         user_agent: client_kind.user_agent(),
-    })
+    };
+    format.needs_challenge = format.needs_challenge();
+    Some(format)
 }
 
 fn clean_caption_language(language: &str) -> String {
@@ -2312,6 +2569,7 @@ fn find_continuation_token_in(value: &Value, active: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn classifies_watch_url() {
@@ -2481,7 +2739,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_tcl_player_variants() {
+    fn normalizes_tcl_and_tcc_player_variants() {
         assert_eq!(
             normalize_player_js_url(
                 "https://www.youtube.com/s/player/abc/player_es6_tcl.vflset/en_US/base.js"
@@ -2491,7 +2749,21 @@ mod tests {
         );
         assert_eq!(
             normalize_player_js_url(
+                "https://www.youtube.com/s/player/abc/player_es6_tcc.vflset/en_US/base.js"
+                    .to_string()
+            ),
+            "https://www.youtube.com/s/player/abc/player_es6.vflset/en_US/base.js"
+        );
+        assert_eq!(
+            normalize_player_js_url(
                 "https://www.youtube.com/s/player/abc/player_ias_tcl.vflset/en_US/base.js"
+                    .to_string()
+            ),
+            "https://www.youtube.com/s/player/abc/player_ias.vflset/en_US/base.js"
+        );
+        assert_eq!(
+            normalize_player_js_url(
+                "https://www.youtube.com/s/player/abc/player_ias_tcc.vflset/en_US/base.js"
                     .to_string()
             ),
             "https://www.youtube.com/s/player/abc/player_ias.vflset/en_US/base.js"
@@ -2519,6 +2791,117 @@ mod tests {
     }
 
     #[test]
+    fn reads_sts_from_ytcfg() {
+        assert_eq!(sts_from_ytcfg(&json!({"STS": 20768})), Some(20768));
+        assert_eq!(sts_from_ytcfg(&json!({"STS": "20768"})), Some(20768));
+        assert_eq!(sts_from_ytcfg(&json!({"STS": 0})), None);
+        assert_eq!(sts_from_ytcfg(&json!({"STS": "0"})), None);
+        assert_eq!(sts_from_ytcfg(&json!({})), None);
+    }
+
+    #[test]
+    fn detects_page_reload_player_error() {
+        let reload: PlayerResponse = serde_json::from_value(json!({
+            "playabilityStatus": {
+                "status": "UNPLAYABLE",
+                "reason": "The page needs to be reloaded."
+            }
+        }))
+        .unwrap();
+        assert!(needs_page_reload(&reload));
+
+        let ok: PlayerResponse = serde_json::from_value(json!({
+            "playabilityStatus": {"status": "OK"}
+        }))
+        .unwrap();
+        assert!(!needs_page_reload(&ok));
+
+        let other: PlayerResponse = serde_json::from_value(json!({
+            "playabilityStatus": {
+                "status": "UNPLAYABLE",
+                "reason": "This video is unavailable"
+            }
+        }))
+        .unwrap();
+        assert!(!needs_page_reload(&other));
+    }
+
+    #[test]
+    fn player_source_cache_seeds_signature_timestamp() {
+        let url = "https://www.youtube.com/s/player/test-source-sts-19369/base.js";
+        remember_player_source(url, "var a={signatureTimestamp:19369};");
+        assert_eq!(cached_sts(url), Some(19369));
+        assert_eq!(
+            cached_player_source(url).as_deref(),
+            Some("var a={signatureTimestamp:19369};")
+        );
+    }
+
+    #[test]
+    fn evicts_only_the_oldest_player_source() {
+        let mut cache = HashMap::new();
+        let base = Instant::now();
+        for index in 0..PLAYER_SOURCE_CACHE_CAPACITY {
+            let cell = AsyncOnceCell::new();
+            let _ = cell.set(Arc::from(format!("source-{index}")));
+            cache.insert(
+                format!("https://www.youtube.com/s/player/lru-{index}/base.js"),
+                PlayerSourceEntry {
+                    cell: Arc::new(cell),
+                    inserted_at: base,
+                    last_used: base + Duration::from_millis(index as u64),
+                },
+            );
+        }
+        evict_player_source(
+            &mut cache,
+            "https://www.youtube.com/s/player/lru-new/base.js",
+        );
+        assert_eq!(cache.len(), PLAYER_SOURCE_CACHE_CAPACITY - 1);
+        assert!(!cache.contains_key("https://www.youtube.com/s/player/lru-0/base.js"));
+        assert!(cache.contains_key("https://www.youtube.com/s/player/lru-7/base.js"));
+    }
+
+    #[tokio::test]
+    async fn shares_in_flight_player_source_fetch() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let url = "https://www.youtube.com/s/player/test-dedup-inflight/base.js";
+        let first = player_source_with(url, || async {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(Arc::from("var a={signatureTimestamp:19369};"))
+        });
+        let second = player_source_with(url, || async {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::from("var a={signatureTimestamp:19369};"))
+        });
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(first.unwrap(), second.unwrap());
+    }
+
+    #[tokio::test]
+    async fn retries_player_source_after_fetch_error() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let url = "https://www.youtube.com/s/player/test-dedup-error/base.js";
+        let failed = player_source_with(url, || async {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(YtrustError::coded(ErrorCode::Network, "boom"))
+        })
+        .await;
+        assert!(failed.is_err());
+        let retried = player_source_with(url, || async {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::from("var a={signatureTimestamp:19370};"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(cached_sts(url), Some(19370));
+        assert_eq!(retried.as_ref(), "var a={signatureTimestamp:19370};");
+    }
+
+    #[test]
     fn parses_audio_bitrate_and_language() {
         let raw: RawFormat = serde_json::from_value(json!({
             "itag": 140,
@@ -2535,6 +2918,18 @@ mod tests {
         assert_eq!(format.language.as_deref(), Some("en-US"));
         assert_eq!(format.content_length, Some(12345));
         assert!(format.audio_is_default);
+    }
+
+    #[test]
+    fn empty_n_query_is_not_a_challenge() {
+        let raw: RawFormat = serde_json::from_value(json!({
+            "itag": 140,
+            "url": "https://rr1.googlevideo.com/videoplayback?n=",
+            "mimeType": "audio/mp4"
+        }))
+        .unwrap();
+        let format = parse_format(raw, ClientKind::VisionOs, false).unwrap();
+        assert!(!format.needs_challenge());
     }
 
     #[test]

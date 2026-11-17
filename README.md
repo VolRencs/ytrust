@@ -36,7 +36,11 @@ toolchain. It bundles yt-dlp's EJS challenge solver so `n`-challenge URLs are
 returned without unresolved signatures. Fresh googlevideo URLs can still hit a
 short CDN cold-start `403`; external downloaders should retry that response
 (for ffmpeg, add `-reconnect_on_http_error 403`) or use
-`resolveAudio(..., { ensurePlayable: true })`. Player JS URLs are cached for 30
+`resolveAudio(..., { ensurePlayable: true })`. Signature timestamps for the
+TVHTML5 player are read from the watch page's `ytcfg`, so resolves no longer
+download the player JS before the player API request. The player JS source is
+fetched only for challenge solving (optionally in parallel with the player API)
+and is cached with in-flight deduplication. Player JS URLs are cached for 30
 minutes, and the preprocessed player is reused across videos to keep subsequent
 resolves fast.
 
@@ -83,6 +87,8 @@ specific binary. `--no-solve` skips challenge solving for `-J`, `-F`,
 `needs_challenge: true` and `playable: false`. Metadata-only modes
 (`--simulate`, `--skip-download` without JSON, `--no-solve`) prefer the JSLess
 client and do not resolve a player JS URL, so `player_js_url` may be `null`.
+Format listings (`-F`, `--list-audio-tracks`) also skip separate player URL
+discovery because they do not solve challenges.
 `--concurrent-fragments N` enables parallel range requests for direct HTTP
 media (1-8, default 1).
 `--download-sections` accepts one range such as `*120-inf` or `*1:00-2:30`. `-j` prints one JSON object per video, while `-J` prints one object
@@ -107,10 +113,10 @@ files and retries only the missing ranges on the next run with the same input.
 It does not delete a partial video on parallel-download errors.
 
 A stale or incompatible state file is preserved as `<file>.part.orphan-*` and
-the download starts fresh instead of deleting the old data. A `<file>.part.lock`
-prevents two processes from writing the same partial file concurrently. To
-force a full reset, remove both the `.part` and `.part.state` files for that
-output.
+the download starts fresh instead of deleting the old data. A lock file under
+the platform cache directory (`ytrust/locks`) prevents two processes from
+writing the same partial file concurrently. To force a full reset, remove both
+the `.part` and `.part.state` files for that output.
 
 ### Progress JSON
 

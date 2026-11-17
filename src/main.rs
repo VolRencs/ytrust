@@ -128,7 +128,8 @@ async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
     let simulate = cli.simulate;
     let skip_media = cli.skip_download;
     let solve_needed = !cli.no_solve
-        && (json_mode != JsonMode::None || (!cli.list_formats && !simulate && !skip_media));
+        && (json_mode != JsonMode::None
+            || (!cli.list_formats && !cli.list_audio_tracks && !simulate && !skip_media));
     let metadata_only = cli.no_solve || (json_mode == JsonMode::None && (simulate || skip_media));
     let cookies = cookies::load(cli.cookies.as_deref(), cli.cookies_from_browser.as_deref())?;
     if cookies.header.is_some() {
@@ -149,7 +150,8 @@ async fn run(mut cli: Cli, events: Option<EventSink>) -> Result<RunReport> {
         sapisid3p: cookies.sapisid3p.clone(),
         timeout,
         prefer_jsless: cli.prefer_jsless() || metadata_only,
-        resolve_player_js: !metadata_only,
+        resolve_player_js: solve_needed && !cli.prefer_jsless(),
+        prefetch_player_source: solve_needed && !cli.prefer_jsless(),
     };
     let retries = cli.fragment_retries.unwrap_or(cli.retries);
     let downloader = Downloader::new(DownloadConfig {
